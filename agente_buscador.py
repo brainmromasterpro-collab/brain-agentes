@@ -63,9 +63,9 @@ def get_onecrm_token() -> str:
         return _onecrm_token
 
     log.info("Obteniendo token 1CRM...")
-    resp = httpx.post(
+   resp = httpx.post(
         f"{ONECRM_BASE}/api.php/auth/user/access_token",
-        data={
+        json={
             "grant_type": "password",
             "client_id": os.environ["ONECRM_CLIENT_ID"],
             "client_secret": os.environ["ONECRM_CLIENT_SECRET"],
@@ -73,6 +73,7 @@ def get_onecrm_token() -> str:
             "password": os.environ["ONECRM_PASSWORD"],
         },
         timeout=15,
+    ),
     )
     resp.raise_for_status()
     data = resp.json()
