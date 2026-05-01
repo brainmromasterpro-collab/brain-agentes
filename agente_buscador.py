@@ -126,12 +126,9 @@ def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
     log.info(f"Buscando en 1CRM productos: {marca} {modelo}")
     try:
         data = onecrm_get("data/Product", {
-            "search_fields": json.dumps({
-                "name": modelo,
-                "mfr_part_no": modelo,
-            }),
-            "fields": "id,name,mfr_part_no,price,currency_id,description,category_id",
-            "max_num": 10,
+    "filters[name]": modelo,
+    "fields": "id,name,mfr_part_no,price,currency_id,description,category_id",
+    "limit": 10,
         })
         records = data.get("records", [])
         resultados = []
