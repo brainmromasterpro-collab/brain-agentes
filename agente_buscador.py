@@ -126,9 +126,9 @@ def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
     log.info(f"Buscando en 1CRM productos: {marca} {modelo}")
     try:
         data = onecrm_get("data/Product", {
-    "filters[name]": modelo,
-    "fields": "id,name,mfr_part_no,price,currency_id,description,category_id",
-    "limit": 10,
+            "filters[name]": modelo,
+            "fields": "id,name,mfr_part_no,price,currency_id,description,category_id",
+            "limit": 10,
         })
         records = data.get("records", [])
         resultados = []
@@ -164,11 +164,10 @@ def buscar_en_crm_proveedores(marca: str, modelo: str) -> list[dict]:
     log.info(f"Buscando en 1CRM proveedores para: {marca}")
     try:
         data = onecrm_get("data/Account", {
-    "filters[account_type]": "Supplier",
-    "filters[name]": marca,
-    "fields": "id,name,account_type,website,phone_office",
-    "limit": 10,
-}),
+            "filters[account_type]": "Supplier",
+            "filters[name]": marca,
+            "fields": "id,name,account_type,website,phone_office",
+            "limit": 10,
         })
         records = data.get("records", [])
         resultados = []
