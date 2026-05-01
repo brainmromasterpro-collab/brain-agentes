@@ -164,12 +164,11 @@ def buscar_en_crm_proveedores(marca: str, modelo: str) -> list[dict]:
     log.info(f"Buscando en 1CRM proveedores para: {marca}")
     try:
         data = onecrm_get("data/Account", {
-            "search_fields": json.dumps({
-                "account_type": "Supplier",
-                "name": marca,
-            }),
-            "fields": "id,name,account_type,website,phone_office",
-            "max_num": 10,
+    "filters[account_type]": "Supplier",
+    "filters[name]": marca,
+    "fields": "id,name,account_type,website,phone_office",
+    "limit": 10,
+}),
         })
         records = data.get("records", [])
         resultados = []
