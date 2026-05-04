@@ -6,7 +6,7 @@ hace búsqueda en 1CRM (productos + proveedores) y Google,
 rankea Top 5 y escribe resultados de vuelta en Supabase.
 
 Dependencias:
-  pip install anthropic supabase httpx python-dotenv
+  pip install anthropic supabase httpx python-dotenv  
 
 Variables de entorno (.env):
   ANTHROPIC_API_KEY=
