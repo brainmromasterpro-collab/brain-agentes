@@ -52,21 +52,41 @@ POLL_INTERVAL = 10  # segundos entre polls
 
 
 # ─────────────────────────────────────────
-# 1CRM — AUTENTICACIÓN Basic Auth
+# 1CRM — AUTENTICACIÓN OAuth 2.0
 # ─────────────────────────────────────────
-import base64
+_onecrm_token: Optional[str] = None
+_onecrm_token_expiry: float = 0
 
-def get_onecrm_auth_header() -> str:
-    username = os.environ["ONECRM_USERNAME"]
-    password = os.environ["ONECRM_PASSWORD"]
-    credentials = f"{username}:{password}"
-    encoded = base64.b64encode(credentials.encode()).decode()
-    return f"Basic {encoded}"
+def get_onecrm_token() -> str:
+    global _onecrm_token, _onecrm_token_expiry
+    if _onecrm_token and time.time() < _onecrm_token_expiry:
+        return _onecrm_token
+
+    log.info("Obteniendo token 1CRM...")
+    resp = httpx.post(
+        f"{ONECRM_BASE}/api.php/auth/user/access_token",
+        data={
+            "grant_type": "password",
+            "client_id": os.environ["ONECRM_CLIENT_ID"],
+            "client_secret": os.environ["ONECRM_CLIENT_SECRET"],
+            "username": os.environ["ONECRM_USERNAME"],
+            "password": os.environ["ONECRM_PASSWORD"],
+        },
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        log.error(f"1CRM OAuth error: {resp.text}")
+    resp.raise_for_status()
+    data = resp.json()
+    _onecrm_token = data["access_token"]
+    _onecrm_token_expiry = time.time() + data.get("expires_in", 3600) - 60
+    log.info("Token 1CRM obtenido OK")
+    return _onecrm_token
 
 
 def onecrm_get(endpoint: str, params: dict = {}) -> dict:
     from urllib.parse import quote
-    auth_header = get_onecrm_auth_header()
+    token = get_onecrm_token()
     query_parts = []
     for key, value in params.items():
         query_parts.append(f"{key}={quote(str(value), safe='')}")
@@ -76,7 +96,7 @@ def onecrm_get(endpoint: str, params: dict = {}) -> dict:
         url = f"{url}?{query_string}"
     resp = httpx.get(
         url,
-        headers={"Authorization": auth_header},
+        headers={"Authorization": f"Bearer {token}"},
         timeout=20,
     )
     if resp.status_code != 200:
