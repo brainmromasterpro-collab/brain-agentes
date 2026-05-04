@@ -6,7 +6,7 @@ hace búsqueda en 1CRM (productos + proveedores) y Google,
 rankea Top 5 y escribe resultados de vuelta en Supabase.
 
 Dependencias:
-  pip install anthropic supabase httpx python-dotenv  
+  pip install anthropic supabase httpx python-dotenv
 
 Variables de entorno (.env):
   ANTHROPIC_API_KEY=
@@ -82,14 +82,11 @@ def get_onecrm_token() -> str:
     return _onecrm_token
 
 
-def onecrm_get(endpoint: str, params: dict = {}, fields: list = []) -> dict:
+def onecrm_get(endpoint: str, params: dict = {}) -> dict:
     token = get_onecrm_token()
-    # Build query string manually to avoid bracket encoding issues
     query_parts = []
     for key, value in params.items():
         query_parts.append(f"{key}={httpx.utils.quote(str(value), safe='')}")
-    for field in fields:
-        query_parts.append(f"fields[]={httpx.utils.quote(field, safe='')}")
     query_string = "&".join(query_parts)
     url = f"{ONECRM_BASE}/api.php/{endpoint}"
     if query_string:
@@ -139,7 +136,7 @@ def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
         data = onecrm_get("data/Product", {
             "filters[name]": modelo,
             "limit": 10,
-        }, fields=["id", "name", "mfr_part_no", "price", "currency_id", "description", "category_id"])
+        })
         records = data.get("records", [])
         resultados = []
         for r in records:
@@ -177,7 +174,7 @@ def buscar_en_crm_proveedores(marca: str, modelo: str) -> list[dict]:
             "filters[account_type]": "Supplier",
             "filters[name]": marca,
             "limit": 10,
-        }, fields=["id", "name", "account_type", "website", "phone_office"])
+        })
         records = data.get("records", [])
         resultados = []
         for r in records:
