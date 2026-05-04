@@ -82,12 +82,14 @@ def get_onecrm_token() -> str:
     return _onecrm_token
 
 
-def onecrm_get(endpoint: str, params: dict = {}) -> dict:
+def onecrm_get(endpoint: str, params: dict = {}, fields: list = []) -> dict:
     token = get_onecrm_token()
     # Build query string manually to avoid bracket encoding issues
     query_parts = []
     for key, value in params.items():
         query_parts.append(f"{key}={httpx.utils.quote(str(value), safe='')}")
+    for field in fields:
+        query_parts.append(f"fields[]={httpx.utils.quote(field, safe='')}")
     query_string = "&".join(query_parts)
     url = f"{ONECRM_BASE}/api.php/{endpoint}"
     if query_string:
@@ -136,9 +138,8 @@ def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
     try:
         data = onecrm_get("data/Product", {
             "filters[name]": modelo,
-            "fields": "id,name,mfr_part_no,price,currency_id,description,category_id",
             "limit": 10,
-        })
+        }, fields=["id", "name", "mfr_part_no", "price", "currency_id", "description", "category_id"])
         records = data.get("records", [])
         resultados = []
         for r in records:
@@ -175,9 +176,8 @@ def buscar_en_crm_proveedores(marca: str, modelo: str) -> list[dict]:
         data = onecrm_get("data/Account", {
             "filters[account_type]": "Supplier",
             "filters[name]": marca,
-            "fields": "id,name,account_type,website,phone_office",
             "limit": 10,
-        })
+        }, fields=["id", "name", "account_type", "website", "phone_office"])
         records = data.get("records", [])
         resultados = []
         for r in records:
