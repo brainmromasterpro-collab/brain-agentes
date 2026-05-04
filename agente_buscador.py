@@ -90,6 +90,8 @@ def onecrm_get(endpoint: str, params: dict = {}) -> dict:
         params=params,
         timeout=20,
     )
+    if resp.status_code != 200:
+        log.error(f"1CRM error body: {resp.text}")
     resp.raise_for_status()
     return resp.json()
 
