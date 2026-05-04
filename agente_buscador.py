@@ -84,10 +84,17 @@ def get_onecrm_token() -> str:
 
 def onecrm_get(endpoint: str, params: dict = {}) -> dict:
     token = get_onecrm_token()
+    # Build query string manually to avoid bracket encoding issues
+    query_parts = []
+    for key, value in params.items():
+        query_parts.append(f"{key}={httpx.utils.quote(str(value), safe='')}")
+    query_string = "&".join(query_parts)
+    url = f"{ONECRM_BASE}/api.php/{endpoint}"
+    if query_string:
+        url = f"{url}?{query_string}"
     resp = httpx.get(
-        f"{ONECRM_BASE}/api.php/{endpoint}",
+        url,
         headers={"Authorization": f"Bearer {token}"},
-        params=params,
         timeout=20,
     )
     if resp.status_code != 200:
