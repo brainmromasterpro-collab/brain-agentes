@@ -86,7 +86,7 @@ def onecrm_get(endpoint: str, params: dict = {}) -> dict:
     token = get_onecrm_token()
     query_parts = []
     for key, value in params.items():
-        query_parts.append(f"{key}={httpx.utils.quote(str(value), safe='')}")
+               query_parts.append(f"{key}={quote(str(value), safe='')}")
     query_string = "&".join(query_parts)
     url = f"{ONECRM_BASE}/api.php/{endpoint}"
     if query_string:
@@ -100,7 +100,7 @@ def onecrm_get(endpoint: str, params: dict = {}) -> dict:
         log.error(f"1CRM error body: {resp.text}")
     resp.raise_for_status()
     return resp.json()
-
+from urllib.parse import quote
 
 # ─────────────────────────────────────────
 # TIPO DE CAMBIO USD/MXN
