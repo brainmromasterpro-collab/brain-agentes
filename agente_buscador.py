@@ -64,8 +64,8 @@ def get_onecrm_token() -> str:
 
     log.info("Obteniendo token 1CRM...")
     resp = httpx.post(
-        f"{ONECRM_BASE}/api.php/auth/user/access_token",
-        json={
+        f"{ONECRM_BASE}/api.php/oauth2/token",
+        data={
             "grant_type": "password",
             "client_id": os.environ["ONECRM_CLIENT_ID"],
             "client_secret": os.environ["ONECRM_CLIENT_SECRET"],
@@ -75,7 +75,7 @@ def get_onecrm_token() -> str:
         timeout=15,
     )
     if resp.status_code != 200:
-        log.error(f"1CRM OAuth error: {resp.text}")
+        log.error(f"1CRM OAuth error {resp.status_code}: {resp.text}")
     resp.raise_for_status()
     data = resp.json()
     _onecrm_token = data["access_token"]
@@ -85,22 +85,15 @@ def get_onecrm_token() -> str:
 
 
 def onecrm_get(endpoint: str, params: dict = {}) -> dict:
-    from urllib.parse import quote
     token = get_onecrm_token()
-    query_parts = []
-    for key, value in params.items():
-        query_parts.append(f"{key}={quote(str(value), safe='')}")
-    query_string = "&".join(query_parts)
-    url = f"{ONECRM_BASE}/api.php/{endpoint}"
-    if query_string:
-        url = f"{url}?{query_string}"
     resp = httpx.get(
-        url,
+        f"{ONECRM_BASE}/api.php/{endpoint}",
         headers={"Authorization": f"Bearer {token}"},
+        params=params,
         timeout=20,
     )
     if resp.status_code != 200:
-        log.error(f"1CRM error body: {resp.text}")
+        log.error(f"1CRM error {resp.status_code}: {resp.text}")
     resp.raise_for_status()
     return resp.json()
 
@@ -503,6 +496,23 @@ def main():
     log.info(f"1CRM: {ONECRM_BASE}")
     log.info(f"Supabase: {os.environ['SUPABASE_URL']}")
     log.info(f"Poll interval: {POLL_INTERVAL}s")
+
+    # Diagnóstico de variables de entorno opcionales
+    google_key = os.environ.get("GOOGLE_API_KEY", "")
+    google_cx = os.environ.get("GOOGLE_CX", "")
+    if google_key and google_cx:
+        log.info(f"Google CSE: OK (key=...{google_key[-4:]}, cx={google_cx[:8]}...)")
+    else:
+        missing = []
+        if not google_key:
+            missing.append("GOOGLE_API_KEY")
+        if not google_cx:
+            missing.append("GOOGLE_CX")
+        log.warning(f"Google CSE desactivado — variables faltantes: {', '.join(missing)}")
+
+    fx_key = os.environ.get("FX_API_KEY", "")
+    if not fx_key:
+        log.warning("FX_API_KEY no configurada — se usará tipo de cambio aproximado 17.50")
 
     while True:
         try:
