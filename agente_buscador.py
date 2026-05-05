@@ -170,8 +170,9 @@ def buscar_en_crm_proveedores(marca: str, modelo: str) -> list[dict]:
 def buscar_en_google(marca: str, modelo: str) -> list[dict]:
     log.info(f"Buscando en Google: {marca} {modelo}")
     try:
-        api_key = os.environ.get("GOOGLE_API_KEY")
-        cx = os.environ.get("GOOGLE_CX")
+        api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
+        cx = os.environ.get("GOOGLE_CX", "").strip()
+        log.info(f"Google vars — KEY existe={('GOOGLE_API_KEY' in os.environ)} len={len(api_key)} | CX existe={('GOOGLE_CX' in os.environ)} len={len(cx)}")
         if not api_key or not cx:
             log.warning("Sin GOOGLE_API_KEY o GOOGLE_CX, saltando búsqueda Google")
             return []
