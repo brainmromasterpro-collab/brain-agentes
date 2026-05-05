@@ -172,7 +172,6 @@ def buscar_en_google(marca: str, modelo: str) -> list[dict]:
     try:
         api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
         cx = os.environ.get("GOOGLE_CX", "").strip()
-        log.info(f"Google vars — KEY existe={('GOOGLE_API_KEY' in os.environ)} len={len(api_key)} | CX existe={('GOOGLE_CX' in os.environ)} len={len(cx)}")
         if not api_key or not cx:
             log.warning("Sin GOOGLE_API_KEY o GOOGLE_CX, saltando búsqueda Google")
             return []
@@ -191,7 +190,7 @@ def buscar_en_google(marca: str, modelo: str) -> list[dict]:
             resultados.append({
                 "proveedor": item.get("displayLink", ""),
                 "nombre_producto": item.get("title", f"{marca} {modelo}"),
-                "precio_orig": None,  # Claude infiere después
+                "precio_orig": None,
                 "moneda": "USD",
                 "disponibilidad": "consultar",
                 "tiempo_entrega": "Ver sitio",
@@ -205,6 +204,49 @@ def buscar_en_google(marca: str, modelo: str) -> list[dict]:
         return resultados
     except Exception as e:
         log.error(f"Error búsqueda Google: {e}")
+        return []
+
+
+# ─────────────────────────────────────────
+# BÚSQUEDA EN BRAVE
+# ─────────────────────────────────────────
+def buscar_en_brave(marca: str, modelo: str) -> list[dict]:
+    log.info(f"Buscando en Brave: {marca} {modelo}")
+    try:
+        api_key = os.environ.get("BRAVE_API_KEY", "").strip()
+        if not api_key:
+            log.warning("Sin BRAVE_API_KEY, saltando búsqueda Brave")
+            return []
+
+        query = f"{marca} {modelo} precio distribuidor México"
+        resp = httpx.get(
+            "https://api.search.brave.com/res/v1/web/search",
+            headers={"Accept": "application/json", "X-Subscription-Token": api_key},
+            params={"q": query, "count": 5, "country": "mx", "search_lang": "es"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        items = resp.json().get("web", {}).get("results", [])
+
+        resultados = []
+        for item in items:
+            resultados.append({
+                "proveedor": item.get("meta_url", {}).get("hostname", ""),
+                "nombre_producto": item.get("title", f"{marca} {modelo}"),
+                "precio_orig": None,
+                "moneda": "USD",
+                "disponibilidad": "consultar",
+                "tiempo_entrega": "Ver sitio",
+                "condicion": "nuevo",
+                "fuente": "brave",
+                "url": item.get("url", ""),
+                "dist_autorizado": False,
+                "notas": item.get("description", ""),
+            })
+        log.info(f"Brave: {len(resultados)} resultados")
+        return resultados
+    except Exception as e:
+        log.error(f"Error búsqueda Brave: {e}")
         return []
 
 
@@ -402,6 +444,11 @@ def procesar_job(job: dict) -> None:
         resultados.extend(res_google)
         agregar_log_job(job_id, "busqueda_google", f"{len(res_google)} resultados")
 
+        agregar_log_job(job_id, "busqueda_brave", "Iniciando búsqueda en Brave")
+        res_brave = buscar_en_brave(marca, modelo)
+        resultados.extend(res_brave)
+        agregar_log_job(job_id, "busqueda_brave", f"{len(res_brave)} resultados")
+
         if not resultados:
             raise Exception("No se encontraron resultados en ninguna fuente")
 
@@ -480,6 +527,12 @@ def main():
         if not google_cx:
             missing.append("GOOGLE_CX")
         log.warning(f"Google CSE desactivado — variables faltantes: {', '.join(missing)}")
+
+    brave_key = os.environ.get("BRAVE_API_KEY", "")
+    if brave_key:
+        log.info("Brave Search: OK")
+    else:
+        log.warning("BRAVE_API_KEY no configurada — búsqueda Brave desactivada")
 
     fx_key = os.environ.get("FX_API_KEY", "")
     if not fx_key:
