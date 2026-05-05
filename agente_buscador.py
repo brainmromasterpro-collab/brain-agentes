@@ -280,7 +280,7 @@ Responde SOLO con un JSON array con máximo 5 objetos, ordenados de mayor a meno
 No incluyas ningún texto fuera del JSON."""
 
     response = claude.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-6",
         max_tokens=2000,
         messages=[{"role": "user", "content": prompt}],
     )
