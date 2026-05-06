@@ -497,6 +497,55 @@ def procesar_job(job: dict) -> None:
 
 
 # ─────────────────────────────────────────
+# AGENTE NOTIFICADOR
+# ─────────────────────────────────────────
+def procesar_job_notificador(job: dict):
+    job_id = job["id"]
+    rfq_uuid = job["rfq_id"]
+    log.info(f"Notificando job {job_id} para rfq {rfq_uuid}")
+
+    try:
+        supabase.table("jobs").update({
+            "estado": "en_proceso",
+            "started_at": datetime.now(datetime.UTC).isoformat() if hasattr(datetime, "UTC") else datetime.utcnow().isoformat(),
+        }).eq("id", job_id).execute()
+
+        # Obtener datos del RFQ
+        rfq_resp = supabase.table("rfqs").select("*").eq("id", rfq_uuid).single().execute()
+        rfq = rfq_resp.data
+        marca = rfq.get("marca", "")
+        modelo = rfq.get("modelo", "")
+
+        # Contar opciones guardadas
+        opts_resp = supabase.table("opciones").select("id").eq("rfq_id", rfq_uuid).execute()
+        n_opciones = len(opts_resp.data)
+
+        # Escribir notificación
+        supabase.table("notificaciones").insert({
+            "tipo": "rfq_listo",
+            "titulo": f"RFQ listo — {marca} {modelo}",
+            "mensaje": f"Se encontraron {n_opciones} opciones. Revisa el RFQ para aprobar.",
+            "rfq_id": rfq_uuid,
+            "leida": False,
+        }).execute()
+
+        log.info(f"Notificación creada para rfq {rfq_uuid}")
+
+        supabase.table("jobs").update({
+            "estado": "completado",
+            "finished_at": datetime.utcnow().isoformat(),
+            "output": {"notificacion": "enviada"},
+        }).eq("id", job_id).execute()
+
+    except Exception as e:
+        log.error(f"Job notificador {job_id} falló: {e}")
+        supabase.table("jobs").update({
+            "estado": "fallido",
+            "finished_at": datetime.utcnow().isoformat(),
+            "error": str(e),
+        }).eq("id", job_id).execute()
+
+
 # LOOP PRINCIPAL — POLLING
 # ─────────────────────────────────────────
 def main():
@@ -520,10 +569,9 @@ def main():
 
     while True:
         try:
-            # Buscar jobs pendientes para el agente buscador
             resp = supabase.table("jobs")\
                 .select("*")\
-                .eq("agente", "buscador")\
+                .in_("agente", ["buscador", "notificador"])\
                 .eq("estado", "pendiente")\
                 .order("created_at")\
                 .limit(1)\
@@ -531,7 +579,11 @@ def main():
 
             jobs = resp.data
             if jobs:
-                procesar_job(jobs[0])
+                job = jobs[0]
+                if job["agente"] == "buscador":
+                    procesar_job(job)
+                elif job["agente"] == "notificador":
+                    procesar_job_notificador(job)
             else:
                 log.debug("Sin jobs pendientes, esperando...")
 
