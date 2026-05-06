@@ -17,8 +17,6 @@ Variables de entorno (.env):
   ONECRM_CLIENT_SECRET=
   ONECRM_USERNAME=
   ONECRM_PASSWORD=
-  GOOGLE_API_KEY=
-  GOOGLE_CX=
   FX_API_KEY=        # opcional — fixer.io o similar
 """
 
@@ -32,6 +30,7 @@ from dotenv import load_dotenv
 import httpx
 import anthropic
 from supabase import create_client, Client
+from duckduckgo_search import DDGS
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -165,45 +164,36 @@ def buscar_en_crm_proveedores(marca: str, modelo: str) -> list[dict]:
 
 
 # ─────────────────────────────────────────
-# BÚSQUEDA EN GOOGLE
+# BÚSQUEDA WEB (DuckDuckGo — sin API key)
 # ─────────────────────────────────────────
 def buscar_en_google(marca: str, modelo: str) -> list[dict]:
-    log.info(f"Buscando en Google: {marca} {modelo}")
+    log.info(f"Buscando en DuckDuckGo: {marca} {modelo}")
     try:
-        api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
-        cx = os.environ.get("GOOGLE_CX", "").strip()
-        if not api_key or not cx:
-            log.warning("Sin GOOGLE_API_KEY o GOOGLE_CX, saltando búsqueda Google")
-            return []
-
         query = f"{marca} {modelo} precio distribuidor México"
-        resp = httpx.get(
-            "https://www.googleapis.com/customsearch/v1",
-            params={"key": api_key, "cx": cx, "q": query, "num": 5},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        items = resp.json().get("items", [])
+        with DDGS() as ddgs:
+            items = list(ddgs.text(query, max_results=5))
 
         resultados = []
         for item in items:
+            url = item.get("href", "")
+            hostname = url.split("/")[2] if url.startswith("http") else url
             resultados.append({
-                "proveedor": item.get("displayLink", ""),
+                "proveedor": hostname,
                 "nombre_producto": item.get("title", f"{marca} {modelo}"),
                 "precio_orig": None,
                 "moneda": "USD",
                 "disponibilidad": "consultar",
                 "tiempo_entrega": "Ver sitio",
                 "condicion": "nuevo",
-                "fuente": "google",
-                "url": item.get("link", ""),
+                "fuente": "web",
+                "url": url,
                 "dist_autorizado": False,
-                "notas": item.get("snippet", ""),
+                "notas": item.get("body", ""),
             })
-        log.info(f"Google: {len(resultados)} resultados")
+        log.info(f"DuckDuckGo: {len(resultados)} resultados")
         return resultados
     except Exception as e:
-        log.error(f"Error búsqueda Google: {e}")
+        log.error(f"Error búsqueda DuckDuckGo: {e}")
         return []
 
 
@@ -516,17 +506,7 @@ def main():
     log.info(f"Poll interval: {POLL_INTERVAL}s")
 
     # Diagnóstico de variables de entorno opcionales
-    google_key = os.environ.get("GOOGLE_API_KEY", "")
-    google_cx = os.environ.get("GOOGLE_CX", "")
-    if google_key and google_cx:
-        log.info(f"Google CSE: OK (key=...{google_key[-4:]}, cx={google_cx[:8]}...)")
-    else:
-        missing = []
-        if not google_key:
-            missing.append("GOOGLE_API_KEY")
-        if not google_cx:
-            missing.append("GOOGLE_CX")
-        log.warning(f"Google CSE desactivado — variables faltantes: {', '.join(missing)}")
+    log.info("Búsqueda web: DuckDuckGo (sin API key)")
 
     brave_key = os.environ.get("BRAVE_API_KEY", "")
     if brave_key:
