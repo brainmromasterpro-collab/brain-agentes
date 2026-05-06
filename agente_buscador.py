@@ -30,7 +30,6 @@ from dotenv import load_dotenv
 import httpx
 import anthropic
 from supabase import create_client, Client
-from duckduckgo_search import DDGS
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -164,18 +163,28 @@ def buscar_en_crm_proveedores(marca: str, modelo: str) -> list[dict]:
 
 
 # ─────────────────────────────────────────
-# BÚSQUEDA WEB (DuckDuckGo — sin API key)
+# BÚSQUEDA WEB (SerpAPI — Google Search)
 # ─────────────────────────────────────────
 def buscar_en_google(marca: str, modelo: str) -> list[dict]:
-    log.info(f"Buscando en DuckDuckGo: {marca} {modelo}")
+    log.info(f"Buscando en SerpAPI: {marca} {modelo}")
     try:
+        api_key = os.environ.get("SERPAPI_KEY", "").strip()
+        if not api_key:
+            log.warning("Sin SERPAPI_KEY, saltando búsqueda web")
+            return []
+
         query = f"{marca} {modelo} precio distribuidor México"
-        with DDGS() as ddgs:
-            items = list(ddgs.text(query, max_results=5))
+        resp = httpx.get(
+            "https://serpapi.com/search.json",
+            params={"q": query, "api_key": api_key, "engine": "google", "num": 5, "gl": "mx", "hl": "es"},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        items = resp.json().get("organic_results", [])
 
         resultados = []
         for item in items:
-            url = item.get("href", "")
+            url = item.get("link", "")
             hostname = url.split("/")[2] if url.startswith("http") else url
             resultados.append({
                 "proveedor": hostname,
@@ -188,12 +197,12 @@ def buscar_en_google(marca: str, modelo: str) -> list[dict]:
                 "fuente": "web",
                 "url": url,
                 "dist_autorizado": False,
-                "notas": item.get("body", ""),
+                "notas": item.get("snippet", ""),
             })
-        log.info(f"DuckDuckGo: {len(resultados)} resultados")
+        log.info(f"SerpAPI: {len(resultados)} resultados")
         return resultados
     except Exception as e:
-        log.error(f"Error búsqueda DuckDuckGo: {e}")
+        log.error(f"Error búsqueda SerpAPI: {e}")
         return []
 
 
@@ -401,8 +410,8 @@ def procesar_job(job: dict) -> None:
         # Obtener datos del RFQ
         rfq_resp = supabase.table("rfqs").select("*").eq("id", rfq_uuid).single().execute()
         rfq = rfq_resp.data
-        marca = rfq["marca"]
-        modelo = rfq["modelo"]
+        marca = rfq["marca"].strip().title()
+        modelo = rfq["modelo"].strip()
         urgente = rfq.get("urgente", False)
 
         agregar_log_job(job_id, "inicio", f"Buscando: {marca} {modelo} | urgente={urgente}")
@@ -555,7 +564,11 @@ def main():
     log.info(f"Poll interval: {POLL_INTERVAL}s")
 
     # Diagnóstico de variables de entorno opcionales
-    log.info("Búsqueda web: DuckDuckGo (sin API key)")
+    serpapi_key = os.environ.get("SERPAPI_KEY", "")
+    if serpapi_key:
+        log.info("SerpAPI: OK")
+    else:
+        log.warning("SERPAPI_KEY no configurada — búsqueda web desactivada")
 
     brave_key = os.environ.get("BRAVE_API_KEY", "")
     if brave_key:
