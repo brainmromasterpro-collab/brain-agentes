@@ -507,7 +507,7 @@ def procesar_job_notificador(job: dict):
     try:
         supabase.table("jobs").update({
             "estado": "en_proceso",
-            "started_at": datetime.now(datetime.UTC).isoformat() if hasattr(datetime, "UTC") else datetime.utcnow().isoformat(),
+            "started_at": datetime.utcnow().isoformat(),
         }).eq("id", job_id).execute()
 
         # Obtener datos del RFQ
