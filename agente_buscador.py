@@ -97,11 +97,11 @@ def get_fx_usd_mxn() -> float:
 def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
     log.info(f"Buscando en 1CRM productos: {marca} {modelo}")
     try:
-        # Buscar con 3 estrategias: modelo solo, marca+modelo, búsqueda por texto
+        # Buscar con múltiples estrategias
         queries = [
-            {"filters[name]": modelo, "limit": 10},
-            {"filters[name]": f"{marca} {modelo}", "limit": 10},
-            {"search": modelo, "limit": 10},
+            {"filters[name]": f"%{modelo}%", "limit": 20},
+            {"filters[product_code]": modelo, "limit": 20},
+            {"search": modelo, "limit": 50},
         ]
         vistos = set()
         resultados = []
