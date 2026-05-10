@@ -108,6 +108,7 @@ def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
         for params in queries:
             try:
                 data = onecrm_get("data/Product", params)
+                log.info(f"1CRM raw ({params}): total={data.get('total_count',0)} records={[r.get('name') for r in data.get('records',[])[:3]]}")
             except Exception:
                 continue
             for r in data.get("records", []):
