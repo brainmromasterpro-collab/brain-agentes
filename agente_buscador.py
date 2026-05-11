@@ -258,15 +258,15 @@ def buscar_en_sitio_propio(marca: str, modelo: str) -> list[dict]:
                 "disponibilidad":  "en_stock",
                 "tiempo_entrega":  "Inmediato",
                 "condicion":       "nuevo",
-                "fuente":          "1crm_productos",   # ← ya publicado en nuestro sistema
+                "fuente":          "sitio_propio",     # ← en nuestro website, pero NO confirma 1CRM
                 "url":             url,
                 "dist_autorizado": True,
                 "notas":           item.get("snippet", ""),
             })
         if resultados:
-            log.info(f"Sitio propio: {len(resultados)} resultado(s) — producto YA publicado")
+            log.info(f"Sitio propio: {len(resultados)} resultado(s) en website (verificar si está en 1CRM)")
         else:
-            log.info(f"Sitio propio: sin resultados — producto no publicado aún")
+            log.info(f"Sitio propio: sin resultados en website")
         return resultados
     except Exception as e:
         log.error(f"Error buscando en sitio propio: {e}")
@@ -306,7 +306,7 @@ def buscar_en_google(marca: str, modelo: str) -> list[dict]:
                 "disponibilidad":  "en_stock" if es_propio else "consultar",
                 "tiempo_entrega":  "Inmediato" if es_propio else "Ver sitio",
                 "condicion":       "nuevo",
-                "fuente":          "1crm_productos" if es_propio else "web",
+                "fuente":          "sitio_propio" if es_propio else "web",
                 "url":             url,
                 "dist_autorizado": es_propio,
                 "notas":           item.get("snippet", ""),
@@ -423,11 +423,11 @@ Tu tarea:
    - Disponibilidad: en_stock=100, 1-5días=75, 1-2semanas=50, bajo_pedido=25, importación=10
    - Score final = (precio_pts * {0.3 if urgente else 0.6}) + (disponibilidad_pts * {0.7 if urgente else 0.4})
 6. Score de confianza (1-5):
-   - 5: producto en catálogo 1CRM (fuente=1crm_productos)
-   - 4: proveedor en 1CRM con historial
-   - 3: resultado Google con precio y datos claros
-   - 2: datos incompletos o precio estimado
-   - 1: fuente no verificada
+   - 5: producto en catálogo interno 1CRM (fuente=1crm_productos) — API directa
+   - 4: proveedor en 1CRM con historial (fuente=1crm_proveedores)
+   - 3: encontrado en website propio mromasterpro.com (fuente=sitio_propio) — visible pero NO confirmado en 1CRM
+   - 2: resultado Google con precio y datos claros (fuente=web)
+   - 1: fuente no verificada o datos incompletos
 
 Responde SOLO con un JSON array con máximo 5 objetos, ordenados de mayor a menor score_ranking:
 [
@@ -441,7 +441,7 @@ Responde SOLO con un JSON array con máximo 5 objetos, ordenados de mayor a meno
     "disponibilidad": "en_stock|dias_N|bajo_pedido|importacion",
     "tiempo_entrega": "texto",
     "condicion": "nuevo|reacondicionado|usado",
-    "fuente": "1crm_productos|1crm_proveedores|web",
+    "fuente": "1crm_productos|1crm_proveedores|sitio_propio|web",
     "url": "https://...",
     "score_confianza": 1-5,
     "score_ranking": 0.00,
