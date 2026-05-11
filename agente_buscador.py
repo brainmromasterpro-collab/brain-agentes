@@ -120,23 +120,21 @@ def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
                 if rid in vistos:
                     continue
                 vistos.add(rid)
-                nombre = (r.get("name") or "").lower()
-                desc = (r.get("description") or "").lower()
-                # Incluir si modelo o marca aparecen en el nombre/descripción
-                if modelo.lower() in nombre or marca.lower() in nombre or modelo.lower() in desc:
-                    resultados.append({
-                        "proveedor": "1CRM Catálogo",
-                        "nombre_producto": r.get("name"),
-                        "precio_orig": float(r.get("price") or 0) or None,
-                        "moneda": "USD",
-                        "disponibilidad": "en_stock",
-                        "tiempo_entrega": "Inmediato",
-                        "condicion": "nuevo",
-                        "fuente": "1crm_productos",
-                        "url": f"{ONECRM_BASE}/index.php?module=Products&record={r.get('id')}",
-                        "dist_autorizado": True,
-                        "notas": r.get("description", ""),
-                    })
+                # NO filtrar aquí — si 1CRM lo devolvió via filter_text, es relevante.
+                # El filtro previo descartaba productos con formato diferente (guiones, espacios).
+                resultados.append({
+                    "proveedor": "1CRM Catálogo",
+                    "nombre_producto": r.get("name"),
+                    "precio_orig": float(r.get("price") or 0) or None,
+                    "moneda": "USD",
+                    "disponibilidad": "en_stock",
+                    "tiempo_entrega": "Inmediato",
+                    "condicion": "nuevo",
+                    "fuente": "1crm_productos",
+                    "url": f"{ONECRM_BASE}/index.php?module=Products&record={r.get('id')}",
+                    "dist_autorizado": True,
+                    "notas": r.get("description", ""),
+                })
         log.info(f"1CRM productos: {len(resultados)} resultados")
         return resultados
     except Exception as e:
