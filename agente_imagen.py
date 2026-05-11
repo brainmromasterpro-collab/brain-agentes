@@ -442,6 +442,40 @@ def procesar_job_imagen(job: dict) -> None:
 # ─────────────────────────────────────────
 # LOOP PRINCIPAL — POLLING
 # ─────────────────────────────────────────
+def resetear_jobs_huerfanos():
+    """
+    Al arrancar, resetea jobs de imagen que quedaron en 'corriendo'
+    por un redeploy anterior. Los vuelve a 'pendiente' para que
+    sean reintentados, y también resetea el rfq a 'procesando_imagen'.
+    """
+    try:
+        huerfanos = (
+            supabase.table("jobs")
+            .select("id, rfq_id")
+            .eq("agente", "imagen")
+            .eq("estado", "corriendo")
+            .execute()
+            .data or []
+        )
+        if huerfanos:
+            log.warning(f"⚠ {len(huerfanos)} job(s) de imagen huérfanos — reseteando a pendiente")
+            for job in huerfanos:
+                supabase.table("jobs").update({
+                    "estado":     "pendiente",
+                    "started_at": None,
+                    "error":      "Reseteado por reinicio del agente (redeploy)",
+                }).eq("id", job["id"]).execute()
+                # Asegurar que el rfq esté en procesando_imagen (no busqueda_completa)
+                supabase.table("rfqs").update({
+                    "estado": "procesando_imagen",
+                }).eq("id", job["rfq_id"]).execute()
+                log.info(f"  Job {job['id']} (rfq {job['rfq_id']}) reseteado a pendiente")
+        else:
+            log.info("Sin jobs huérfanos de imagen al arrancar")
+    except Exception as e:
+        log.error(f"Error reseteando jobs huérfanos: {e}")
+
+
 def main():
     log.info("Agente Imagen iniciado — escuchando jobs...")
     log.info(f"Supabase: {os.environ['SUPABASE_URL']}")
@@ -453,6 +487,9 @@ def main():
 
     log.info(f"Google Images:  {'OK' if google_key and google_cx else '⚠ NO CONFIGURADO'}")
     log.info(f"Remove.bg:      {'OK' if removebg else '⚠ NO CONFIGURADO (se omitirá)'}")
+
+    # Resetear jobs que quedaron colgados por redeploy anterior
+    resetear_jobs_huerfanos()
 
     while True:
         try:

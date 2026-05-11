@@ -315,10 +315,40 @@ def procesar_job_publicador(job: dict) -> None:
 # ─────────────────────────────────────────
 # LOOP PRINCIPAL — POLLING
 # ─────────────────────────────────────────
+def resetear_jobs_huerfanos():
+    """Resetea jobs de publicador que quedaron en 'corriendo' por redeploy."""
+    try:
+        huerfanos = (
+            supabase.table("jobs")
+            .select("id, rfq_id")
+            .eq("agente", "publicador")
+            .eq("estado", "corriendo")
+            .execute()
+            .data or []
+        )
+        if huerfanos:
+            log.warning(f"⚠ {len(huerfanos)} job(s) de publicador huérfanos — reseteando")
+            for job in huerfanos:
+                supabase.table("jobs").update({
+                    "estado":     "pendiente",
+                    "started_at": None,
+                    "error":      "Reseteado por reinicio del agente (redeploy)",
+                }).eq("id", job["id"]).execute()
+                supabase.table("rfqs").update({
+                    "estado": "foto_lista",
+                }).eq("id", job["rfq_id"]).execute()
+                log.info(f"  Job publicador {job['id']} reseteado")
+        else:
+            log.info("Sin jobs huérfanos de publicador al arrancar")
+    except Exception as e:
+        log.error(f"Error reseteando jobs huérfanos publicador: {e}")
+
+
 def main():
     log.info("Agente Publicador iniciado — escuchando jobs...")
     log.info(f"1CRM: {ONECRM_BASE}")
     log.info(f"Supabase: {os.environ['SUPABASE_URL']}")
+    resetear_jobs_huerfanos()
 
     while True:
         try:
