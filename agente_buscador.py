@@ -97,14 +97,12 @@ def get_fx_usd_mxn() -> float:
 def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
     log.info(f"Buscando en 1CRM productos: {marca} {modelo}")
     try:
-        # Probar múltiples endpoints y estrategias de búsqueda
-        # Módulo correcto según docs oficiales 1CRM: ProductCatalog
+        # Endpoint confirmado: data/Product con filter_text
+        # filter_text = búsqueda de texto general (docs oficiales 1CRM)
         busquedas = [
-            ("data/ProductCatalog", {"filter_text": modelo, "limit": 20}),
-            ("data/ProductCatalog", {"filters[name]": modelo, "limit": 20}),
-            ("data/ProductCatalog", {"filters[product_code]": modelo, "limit": 20}),
-            ("data/AOS_Products", {"filter_text": modelo, "limit": 20}),
             ("data/Product", {"filter_text": modelo, "limit": 20}),
+            ("data/Product", {"filters[product_code]": modelo, "limit": 20}),
+            ("data/Product", {"filter_text": f"{marca} {modelo}", "limit": 20}),
         ]
         vistos = set()
         resultados = []
