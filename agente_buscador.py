@@ -98,11 +98,10 @@ def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
     log.info(f"Buscando en 1CRM productos: {marca} {modelo}")
     try:
         # Endpoint confirmado: data/Product con filter_text
-        # filter_text = búsqueda de texto general (docs oficiales 1CRM)
+        # filters[product_code] NO funciona (devuelve todos los registros) — NO usar
         busquedas = [
             ("data/Product", {"filter_text": modelo, "limit": 20}),
-            ("data/Product", {"filters[product_code]": modelo, "limit": 20}),
-            ("data/Product", {"filter_text": f"{marca} {modelo}", "limit": 20}),
+            ("data/Product", {"filter_text": modelo.replace("-", " "), "limit": 20}),
         ]
         vistos = set()
         resultados = []
