@@ -175,6 +175,64 @@ def buscar_en_crm_proveedores(marca: str, modelo: str) -> list[dict]:
         return []
 
 
+# Dominio propio del cliente — resultados de este dominio se tratan
+# como productos ya publicados en el catálogo (equivalente a 1CRM)
+DOMINIO_PROPIO = os.environ.get("DOMINIO_PROPIO", "mromasterpro.com")
+
+
+def _es_dominio_propio(url: str) -> bool:
+    return DOMINIO_PROPIO in url
+
+
+# ─────────────────────────────────────────
+# BÚSQUEDA EN SITIO PROPIO (site:mromasterpro.com)
+# ─────────────────────────────────────────
+def buscar_en_sitio_propio(marca: str, modelo: str) -> list[dict]:
+    """
+    Busca el producto específicamente en el sitio propio usando SerpAPI.
+    Si aparece → el producto YA está publicado (equivale a estar en 1CRM).
+    """
+    log.info(f"Buscando en sitio propio ({DOMINIO_PROPIO}): {modelo}")
+    try:
+        api_key = os.environ.get("SERPAPI_KEY", "").strip()
+        if not api_key:
+            return []
+
+        query = f"site:{DOMINIO_PROPIO} {modelo}"
+        resp = httpx.get(
+            "https://serpapi.com/search.json",
+            params={"q": query, "api_key": api_key, "engine": "google", "num": 5},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        items = resp.json().get("organic_results", [])
+
+        resultados = []
+        for item in items:
+            url = item.get("link", "")
+            resultados.append({
+                "proveedor":       f"Catálogo {DOMINIO_PROPIO}",
+                "nombre_producto": item.get("title", f"{marca} {modelo}"),
+                "precio_orig":     None,
+                "moneda":          "USD",
+                "disponibilidad":  "en_stock",
+                "tiempo_entrega":  "Inmediato",
+                "condicion":       "nuevo",
+                "fuente":          "1crm_productos",   # ← ya publicado en nuestro sistema
+                "url":             url,
+                "dist_autorizado": True,
+                "notas":           item.get("snippet", ""),
+            })
+        if resultados:
+            log.info(f"Sitio propio: {len(resultados)} resultado(s) — producto YA publicado")
+        else:
+            log.info(f"Sitio propio: sin resultados — producto no publicado aún")
+        return resultados
+    except Exception as e:
+        log.error(f"Error buscando en sitio propio: {e}")
+        return []
+
+
 # ─────────────────────────────────────────
 # BÚSQUEDA WEB (SerpAPI — Google Search)
 # ─────────────────────────────────────────
@@ -199,19 +257,22 @@ def buscar_en_google(marca: str, modelo: str) -> list[dict]:
         for item in items:
             url = item.get("link", "")
             hostname = url.split("/")[2] if url.startswith("http") else url
+            es_propio = _es_dominio_propio(url)
             resultados.append({
-                "proveedor": hostname,
+                "proveedor":       f"Catálogo {DOMINIO_PROPIO}" if es_propio else hostname,
                 "nombre_producto": item.get("title", f"{marca} {modelo}"),
-                "precio_orig": None,
-                "moneda": "USD",
-                "disponibilidad": "consultar",
-                "tiempo_entrega": "Ver sitio",
-                "condicion": "nuevo",
-                "fuente": "web",
-                "url": url,
-                "dist_autorizado": False,
-                "notas": item.get("snippet", ""),
+                "precio_orig":     None,
+                "moneda":          "USD",
+                "disponibilidad":  "en_stock" if es_propio else "consultar",
+                "tiempo_entrega":  "Inmediato" if es_propio else "Ver sitio",
+                "condicion":       "nuevo",
+                "fuente":          "1crm_productos" if es_propio else "web",
+                "url":             url,
+                "dist_autorizado": es_propio,
+                "notas":           item.get("snippet", ""),
             })
+            if es_propio:
+                log.info(f"  ★ Resultado propio detectado: {url[:80]}")
         log.info(f"SerpAPI: {len(resultados)} resultados")
         return resultados
     except Exception as e:
@@ -457,6 +518,12 @@ def procesar_job(job: dict) -> None:
 
         # 3 búsquedas
         resultados = []
+
+        # Primero buscar en sitio propio (detecta si ya está publicado)
+        agregar_log_job(job_id, "busqueda_sitio_propio", f"Buscando en {DOMINIO_PROPIO}")
+        res_sitio = buscar_en_sitio_propio(marca, modelo)
+        resultados.extend(res_sitio)
+        agregar_log_job(job_id, "busqueda_sitio_propio", f"{len(res_sitio)} resultados")
 
         agregar_log_job(job_id, "busqueda_1crm_productos", "Iniciando búsqueda en 1CRM productos")
         res_productos = buscar_en_crm_productos(marca, modelo)
