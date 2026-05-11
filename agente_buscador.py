@@ -21,6 +21,7 @@ Variables de entorno (.env):
 """
 
 import os
+import re
 import time
 import json
 import logging
@@ -94,47 +95,86 @@ def get_fx_usd_mxn() -> float:
 # ─────────────────────────────────────────
 # BÚSQUEDA EN 1CRM — PRODUCTOS
 # ─────────────────────────────────────────
+def _variantes_modelo(modelo: str) -> list[str]:
+    """
+    Genera variantes del número de parte para cubrir diferencias de formato.
+    Ej: '3RH2911-1HA11' → ['3RH2911-1HA11', '3RH29111HA11', '3RH2911 1HA11', '3RH2911']
+    """
+    variantes = [modelo]
+    sin_sep   = re.sub(r'[\s\-\./]', '', modelo)          # sin separadores
+    con_esp   = re.sub(r'[\-\./]',   ' ', modelo)         # con espacios
+    con_guion = re.sub(r'[\s\./]',   '-', modelo)         # con guiones
+    primera   = re.split(r'[\s\-\./]', modelo)[0]         # primer bloque
+    for v in [sin_sep, con_esp, con_guion, primera]:
+        if v and v not in variantes and len(v) >= 3:
+            variantes.append(v)
+    return variantes
+
+
+def _coincide_modelo(modelo_buscado: str, texto_crm: str) -> bool:
+    """
+    Compara sin importar separadores ni mayúsculas.
+    '3RH2911-1HA11' coincide con '3RH29111HA11', '3rh2911 1ha11', etc.
+    """
+    norm = lambda s: re.sub(r'[\s\-\./]', '', s).lower()
+    m = norm(modelo_buscado)
+    t = norm(texto_crm)
+    return m in t or t in m
+
+
 def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
     log.info(f"Buscando en 1CRM productos: {marca} {modelo}")
     try:
-        # Endpoint confirmado: data/Product con filter_text
-        # filters[product_code] NO funciona (devuelve todos los registros) — NO usar
-        busquedas = [
-            ("data/Product", {"filter_text": modelo, "limit": 20}),
-            ("data/Product", {"filter_text": modelo.replace("-", " "), "limit": 20}),
-        ]
+        variantes = _variantes_modelo(modelo)
+        log.info(f"Variantes de búsqueda: {variantes}")
+
+        # Estrategias: variantes del modelo + búsqueda por marca (filtrado client-side)
+        busquedas = [{"filter_text": v, "limit": 20} for v in variantes]
+        busquedas.append({"filter_text": marca, "limit": 50})  # todos los productos de la marca
+
         vistos = set()
         resultados = []
-        for endpoint, params in busquedas:
+
+        for params in busquedas:
             try:
-                data = onecrm_get(endpoint, params)
+                data    = onecrm_get("data/Product", params)
                 records = data.get("records", [])
-                total = data.get("total_count", len(records))
-                log.info(f"1CRM {endpoint} ({list(params.keys())[0]}={list(params.values())[0]}): total={total} names={[r.get('name','?') for r in records[:3]]}")
+                total   = data.get("total_count", len(records))
+                log.info(f"1CRM filter_text='{params['filter_text']}': total={total} names={[r.get('name','?')[:40] for r in records[:3]]}")
             except Exception as e:
-                log.warning(f"1CRM {endpoint} falló: {e}")
+                log.warning(f"1CRM falló con {params}: {e}")
                 continue
-            for r in data.get("records", []):
+
+            for r in records:
                 rid = r.get("id")
                 if rid in vistos:
                     continue
+
+                nombre = r.get("name") or ""
+                codigo = r.get("product_code") or ""
+                desc   = r.get("description") or ""
+
+                # Para búsqueda por marca (limit=50), filtrar client-side por modelo
+                if params["filter_text"].lower() == marca.lower():
+                    if not (_coincide_modelo(modelo, nombre) or _coincide_modelo(modelo, codigo)):
+                        continue
+
                 vistos.add(rid)
-                # NO filtrar aquí — si 1CRM lo devolvió via filter_text, es relevante.
-                # El filtro previo descartaba productos con formato diferente (guiones, espacios).
                 resultados.append({
-                    "proveedor": "1CRM Catálogo",
-                    "nombre_producto": r.get("name"),
-                    "precio_orig": float(r.get("price") or 0) or None,
-                    "moneda": "USD",
-                    "disponibilidad": "en_stock",
-                    "tiempo_entrega": "Inmediato",
-                    "condicion": "nuevo",
-                    "fuente": "1crm_productos",
-                    "url": f"{ONECRM_BASE}/index.php?module=Products&record={r.get('id')}",
-                    "dist_autorizado": True,
-                    "notas": r.get("description", ""),
+                    "proveedor":        "1CRM Catálogo",
+                    "nombre_producto":  nombre,
+                    "precio_orig":      float(r.get("price") or 0) or None,
+                    "moneda":           "USD",
+                    "disponibilidad":   "en_stock",
+                    "tiempo_entrega":   "Inmediato",
+                    "condicion":        "nuevo",
+                    "fuente":           "1crm_productos",
+                    "url":              f"{ONECRM_BASE}/index.php?module=Products&record={rid}",
+                    "dist_autorizado":  True,
+                    "notas":            desc,
                 })
-        log.info(f"1CRM productos: {len(resultados)} resultados")
+
+        log.info(f"1CRM productos: {len(resultados)} resultados (variantes probadas: {len(busquedas)})")
         return resultados
     except Exception as e:
         log.error(f"Error búsqueda 1CRM productos: {e}")
