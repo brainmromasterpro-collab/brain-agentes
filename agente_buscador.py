@@ -289,6 +289,22 @@ def rankear_con_claude(
         "ver_sitio": 20,
     }
 
+    # Separar productos del catálogo 1CRM para destacarlos en el prompt
+    crm_productos = [r for r in resultados_raw if r.get("fuente") == "1crm_productos"]
+    otros = [r for r in resultados_raw if r.get("fuente") != "1crm_productos"]
+
+    crm_seccion = ""
+    if crm_productos:
+        crm_seccion = f"""
+⚠️ CATÁLOGO INTERNO 1CRM — PRIORIDAD MÁXIMA:
+{json.dumps(crm_productos, ensure_ascii=False, indent=2)}
+
+REGLA OBLIGATORIA: Los resultados anteriores son del catálogo propio del cliente.
+DEBES incluir AL MENOS UNO en el Top 5, en el rank 1, con score_confianza=5.
+Aunque no tengan precio, su presencia en el catálogo interno es la señal más fuerte.
+
+"""
+
     prompt = f"""Eres un agente especializado en búsqueda de productos industriales para MRO Master Pro.
 
 Tienes estos resultados de búsqueda para: **{marca} {modelo}**
@@ -296,19 +312,20 @@ Modo: {"URGENTE" if urgente else "Normal"}
 Ponderación: {ponderacion}
 Tipo de cambio USD/MXN: {fx}
 
-RESULTADOS ENCONTRADOS:
-{json.dumps(resultados_raw, ensure_ascii=False, indent=2)}
+{crm_seccion}OTROS RESULTADOS:
+{json.dumps(otros, ensure_ascii=False, indent=2)}
 
 Tu tarea:
-1. Selecciona los mejores 5 resultados (puede ser menos si no hay suficientes)
-2. Para cada uno infiere o estima el precio si no está explícito (basado en el snippet/notas)
-3. Verifica si es distribuidor autorizado de {marca} (busca indicios en el nombre o URL)
-4. Calcula el score de ranking con esta fórmula:
+1. {f"OBLIGATORIO: incluye primero los {len(crm_productos)} resultado(s) del catálogo 1CRM (fuente=1crm_productos) en rank 1." if crm_productos else "Selecciona los mejores 5 resultados."}
+2. Completa el Top 5 con los mejores resultados restantes
+3. Para cada uno infiere o estima el precio si no está explícito (basado en snippet/notas)
+4. Verifica si es distribuidor autorizado de {marca} (indicios en nombre o URL)
+5. Calcula el score de ranking:
    - Normaliza precios: el más barato = 100 puntos, los demás proporcional
-   - Disponibilidad en puntos: en_stock=100, 1-5días=75, 1-2semanas=50, bajo_pedido=25, importación=10
+   - Disponibilidad: en_stock=100, 1-5días=75, 1-2semanas=50, bajo_pedido=25, importación=10
    - Score final = (precio_pts * {0.3 if urgente else 0.6}) + (disponibilidad_pts * {0.7 if urgente else 0.4})
-5. Asigna score de confianza (1-5):
-   - 5: distribuidor oficial verificado
+6. Score de confianza (1-5):
+   - 5: producto en catálogo 1CRM (fuente=1crm_productos)
    - 4: proveedor en 1CRM con historial
    - 3: resultado Google con precio y datos claros
    - 2: datos incompletos o precio estimado
@@ -326,7 +343,7 @@ Responde SOLO con un JSON array con máximo 5 objetos, ordenados de mayor a meno
     "disponibilidad": "en_stock|dias_N|bajo_pedido|importacion",
     "tiempo_entrega": "texto",
     "condicion": "nuevo|reacondicionado|usado",
-    "fuente": "1crm_productos|1crm_proveedores|google",
+    "fuente": "1crm_productos|1crm_proveedores|web",
     "url": "https://...",
     "score_confianza": 1-5,
     "score_ranking": 0.00,
@@ -473,6 +490,41 @@ def procesar_job(job: dict) -> None:
 
         if not top5:
             raise Exception("Claude no pudo generar el ranking")
+
+        # ── Garantizar que 1CRM catálogo siempre aparezca en el Top 5 ──
+        # Si Claude no incluyó ningún resultado del catálogo, los inyectamos
+        tiene_crm_producto = any(r.get("fuente") == "1crm_productos" for r in top5)
+        if not tiene_crm_producto and res_productos:
+            log.info(f"Claude omitió {len(res_productos)} producto(s) 1CRM — inyectando al Top 5")
+            insertar = []
+            for prod in res_productos[:2]:  # máximo 2 del catálogo
+                precio = float(prod.get("precio_orig") or 0) or None
+                insertar.append({
+                    "rank": 1,
+                    "proveedor": prod["proveedor"],
+                    "dist_autorizado": True,
+                    "precio_orig": precio,
+                    "moneda": prod.get("moneda", "USD"),
+                    "precio_mxn": round((precio or 0) * fx, 2),
+                    "disponibilidad": prod.get("disponibilidad", "en_stock"),
+                    "tiempo_entrega": prod.get("tiempo_entrega", "Inmediato"),
+                    "condicion": prod.get("condicion", "nuevo"),
+                    "fuente": "1crm_productos",
+                    "url": prod.get("url", ""),
+                    "score_confianza": 5,
+                    "score_ranking": 95.0,
+                    "notas": prod.get("notas", ""),
+                })
+            # Renumerar: insertar al inicio, desplazar los últimos
+            for i, item in enumerate(insertar):
+                item["rank"] = i + 1
+            restantes = top5[:5 - len(insertar)]
+            for i, item in enumerate(restantes):
+                item["rank"] = len(insertar) + i + 1
+            top5 = insertar + restantes
+            log.info(f"Top 5 actualizado con productos 1CRM: {len(top5)} opciones")
+        else:
+            log.info(f"1CRM catálogo presente en Top 5: {tiene_crm_producto}")
 
         # Guardar en Supabase
         guardar_opciones(rfq_uuid, top5, fx)
