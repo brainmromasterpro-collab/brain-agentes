@@ -416,6 +416,28 @@ def procesar_job_imagen(job: dict) -> None:
             "error":       str(e),
         }).eq("id", job_id).execute()
 
+        # ── IMPORTANTE: resetear rfq.estado para que el usuario pueda reintentar ──
+        # Si no se hace esto, el RFQ queda atascado en 'procesando_imagen' para siempre
+        try:
+            supabase.table("rfqs").update({
+                "estado": "busqueda_completa",   # vuelve al paso previo para poder reintentar
+            }).eq("id", rfq_uuid).execute()
+
+            supabase.table("notificaciones").insert({
+                "tipo":    "imagen_fallida",
+                "titulo":  f"Error procesando imagen — revisar",
+                "mensaje": (
+                    f"El agente de imágenes no pudo obtener una foto válida.\n"
+                    f"Error: {str(e)}\n"
+                    f"Puedes subir una foto manualmente o intentar publicar de nuevo."
+                ),
+                "rfq_id":  rfq_uuid,
+                "leida":   False,
+            }).execute()
+            log.info(f"RFQ {rfq_uuid} reseteado a busqueda_completa tras fallo de imagen")
+        except Exception as e2:
+            log.error(f"Error reseteando rfq tras fallo: {e2}")
+
 
 # ─────────────────────────────────────────
 # LOOP PRINCIPAL — POLLING
