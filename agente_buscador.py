@@ -115,11 +115,16 @@ def _coincide_modelo(modelo_buscado: str, texto_crm: str) -> bool:
     """
     Compara sin importar separadores ni mayúsculas.
     '3RH2911-1HA11' coincide con '3RH29111HA11', '3rh2911 1ha11', etc.
+    Solo acepta si el modelo buscado aparece DENTRO del texto CRM (no al revés),
+    y requiere mínimo 5 caracteres normalizados para evitar falsos positivos.
     """
     norm = lambda s: re.sub(r'[\s\-\./]', '', s).lower()
     m = norm(modelo_buscado)
     t = norm(texto_crm)
-    return m in t or t in m
+    # Requerir mínimo 5 chars y solo dirección m→t (modelo en texto CRM)
+    if len(m) < 5:
+        return False
+    return m in t
 
 
 def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
@@ -154,10 +159,12 @@ def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
                 codigo = r.get("product_code") or ""
                 desc   = r.get("description") or ""
 
-                # Para búsqueda por marca (limit=50), filtrar client-side por modelo
-                if params["filter_text"].lower() == marca.lower():
-                    if not (_coincide_modelo(modelo, nombre) or _coincide_modelo(modelo, codigo)):
-                        continue
+                # Siempre validar client-side que el modelo realmente coincide,
+                # tanto en búsqueda por marca como en búsqueda por variante
+                # (1CRM filter_text puede hacer fuzzy match y devolver productos no relacionados)
+                if not (_coincide_modelo(modelo, nombre) or _coincide_modelo(modelo, codigo)):
+                    log.debug(f"Descartado por _coincide_modelo: '{nombre}' / '{codigo}' vs '{modelo}'")
+                    continue
 
                 vistos.add(rid)
                 resultados.append({
