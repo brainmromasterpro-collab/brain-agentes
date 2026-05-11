@@ -97,19 +97,23 @@ def get_fx_usd_mxn() -> float:
 def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
     log.info(f"Buscando en 1CRM productos: {marca} {modelo}")
     try:
-        # Buscar con múltiples estrategias
-        queries = [
-            {"filters[name]": f"%{modelo}%", "limit": 20},
-            {"filters[product_code]": modelo, "limit": 20},
-            {"search": modelo, "limit": 50},
+        # Probar múltiples endpoints y estrategias de búsqueda
+        busquedas = [
+            ("data/AOS_Products", {"search": modelo, "limit": 20}),
+            ("data/AOS_Products", {"filters[name]": modelo, "limit": 20}),
+            ("data/AOS_Products", {"filters[product_code]": modelo, "limit": 20}),
+            ("data/Product", {"search": modelo, "limit": 20}),
         ]
         vistos = set()
         resultados = []
-        for params in queries:
+        for endpoint, params in busquedas:
             try:
-                data = onecrm_get("data/Product", params)
-                log.info(f"1CRM raw ({params}): total={data.get('total_count',0)} records={[r.get('name') for r in data.get('records',[])[:3]]}")
-            except Exception:
+                data = onecrm_get(endpoint, params)
+                records = data.get("records", [])
+                total = data.get("total_count", len(records))
+                log.info(f"1CRM {endpoint} ({list(params.keys())[0]}={list(params.values())[0]}): total={total} names={[r.get('name','?') for r in records[:3]]}")
+            except Exception as e:
+                log.warning(f"1CRM {endpoint} falló: {e}")
                 continue
             for r in data.get("records", []):
                 rid = r.get("id")
