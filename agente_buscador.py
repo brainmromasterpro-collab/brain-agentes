@@ -98,11 +98,13 @@ def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
     log.info(f"Buscando en 1CRM productos: {marca} {modelo}")
     try:
         # Probar múltiples endpoints y estrategias de búsqueda
+        # Módulo correcto según docs oficiales 1CRM: ProductCatalog
         busquedas = [
-            ("data/AOS_Products", {"search": modelo, "limit": 20}),
-            ("data/AOS_Products", {"filters[name]": modelo, "limit": 20}),
-            ("data/AOS_Products", {"filters[product_code]": modelo, "limit": 20}),
-            ("data/Product", {"search": modelo, "limit": 20}),
+            ("data/ProductCatalog", {"filter_text": modelo, "limit": 20}),
+            ("data/ProductCatalog", {"filters[name]": modelo, "limit": 20}),
+            ("data/ProductCatalog", {"filters[product_code]": modelo, "limit": 20}),
+            ("data/AOS_Products", {"filter_text": modelo, "limit": 20}),
+            ("data/Product", {"filter_text": modelo, "limit": 20}),
         ]
         vistos = set()
         resultados = []
