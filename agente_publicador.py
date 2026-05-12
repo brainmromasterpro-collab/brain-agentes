@@ -278,16 +278,28 @@ def crear_producto_en_crm(ficha: dict, modelo: str) -> str:
     """
     log.info(f"Creando producto en 1CRM: {ficha['nombre']}")
     precio = round(float(ficha.get("precio_referencia") or 0), 2)
+    precio_str = str(precio)
     payload: dict = {
-        "name":                 ficha["nombre"],
-        "product_code":         modelo,
-        "manufacturers_part_no": modelo,   # MySQL 1364 — required in this instance
-        "description":          ficha["descripcion"],
-        "price":                str(precio),
-        "unit_price":           str(precio),
-        "cost":                 "0.00",
-        "status":               "Active",
-        "tax_class_id":         "0",
+        "name":                  ficha["nombre"],
+        "product_code":          modelo,
+        "manufacturers_part_no": modelo,    # MySQL 1364 — required in this instance
+        "description":           ficha["descripcion"],
+        # All standard price/cost fields (avoid MySQL 1364 on any of these)
+        "price":                 precio_str,
+        "unit_price":            precio_str,
+        "list_price":            precio_str,
+        "discount_price":        precio_str,
+        "wholesale_price":       precio_str,
+        "cost":                  "0.00",
+        # USD-equivalent columns (same value — no FX conversion needed for catalog)
+        "currency_price":        precio_str,
+        "price_usdollar":        precio_str,
+        "unit_price_usdollar":   precio_str,
+        "list_price_usdollar":   precio_str,
+        "discount_usdollar":     precio_str,
+        "wholesale_price_usdollar": precio_str,
+        "cost_usdollar":         "0.00",
+        "status":                "Active",
     }
     # Attach real currency UUID if available (avoid "-99" which fails DB INSERT)
     currency_id = get_crm_currency_id()
