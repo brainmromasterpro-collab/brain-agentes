@@ -279,12 +279,15 @@ def crear_producto_en_crm(ficha: dict, modelo: str) -> str:
     log.info(f"Creando producto en 1CRM: {ficha['nombre']}")
     precio = round(float(ficha.get("precio_referencia") or 0), 2)
     payload: dict = {
-        "name":         ficha["nombre"],
-        "product_code": modelo,
-        "description":  ficha["descripcion"],
-        "price":        str(precio),
-        "unit_price":   str(precio),
-        "cost":         "0.00",
+        "name":                 ficha["nombre"],
+        "product_code":         modelo,
+        "manufacturers_part_no": modelo,   # MySQL 1364 — required in this instance
+        "description":          ficha["descripcion"],
+        "price":                str(precio),
+        "unit_price":           str(precio),
+        "cost":                 "0.00",
+        "status":               "Active",
+        "tax_class_id":         "0",
     }
     # Attach real currency UUID if available (avoid "-99" which fails DB INSERT)
     currency_id = get_crm_currency_id()
