@@ -57,37 +57,53 @@ BUCKET = "product-images"
 # PASO 1 — BUSCAR IMÁGENES EN GOOGLE
 # ─────────────────────────────────────────
 def buscar_imagenes_google(marca: str, modelo: str) -> list[str]:
-    """Devuelve hasta 5 URLs de imágenes del producto."""
-    log.info(f"Google Images: buscando {marca} {modelo}")
-    try:
-        api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
-        cx = os.environ.get("GOOGLE_CX", "").strip()
-        if not api_key or not cx:
-            log.warning("Sin GOOGLE_API_KEY o GOOGLE_CX — búsqueda de imágenes desactivada")
-            return []
-
-        query = f"{marca} {modelo} product image white background"
-        resp = httpx.get(
-            "https://www.googleapis.com/customsearch/v1",
-            params={
-                "key": api_key,
-                "cx": cx,
-                "q": query,
-                "searchType": "image",
-                "num": 5,
-                "imgSize": "medium",
-                "safe": "active",
-            },
-            timeout=15,
-        )
-        resp.raise_for_status()
-        items = resp.json().get("items", [])
-        urls = [item["link"] for item in items if "link" in item]
-        log.info(f"Google Images: {len(urls)} URLs encontradas")
-        return urls
-    except Exception as e:
-        log.error(f"Error buscando imágenes en Google: {e}")
+    """
+    Devuelve hasta 5 URLs de imágenes del producto.
+    Intenta múltiples queries en orden de especificidad si la primera no devuelve resultados.
+    """
+    api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
+    cx = os.environ.get("GOOGLE_CX", "").strip()
+    if not api_key or not cx:
+        log.warning("Sin GOOGLE_API_KEY o GOOGLE_CX — búsqueda de imágenes desactivada")
         return []
+
+    # Queries en orden: más específico → más genérico
+    queries = [
+        f"{marca} {modelo} product image white background",
+        f"{marca} {modelo} datasheet",
+        f"{marca} {modelo}",
+        f"{marca} {modelo} industrial",
+        f"{marca} {modelo} catalog",
+    ]
+
+    for query in queries:
+        log.info(f"Google Images: probando query → '{query}'")
+        try:
+            resp = httpx.get(
+                "https://www.googleapis.com/customsearch/v1",
+                params={
+                    "key": api_key,
+                    "cx": cx,
+                    "q": query,
+                    "searchType": "image",
+                    "num": 5,
+                    "imgSize": "medium",
+                    "safe": "active",
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            items = resp.json().get("items", [])
+            urls = [item["link"] for item in items if "link" in item]
+            if urls:
+                log.info(f"Google Images: {len(urls)} URLs encontradas con query '{query}'")
+                return urls
+            log.info(f"Google Images: sin resultados para '{query}', intentando siguiente...")
+        except Exception as e:
+            log.error(f"Error buscando con query '{query}': {e}")
+
+    log.warning(f"Google Images: sin resultados tras {len(queries)} intentos")
+    return []
 
 
 # ─────────────────────────────────────────
@@ -416,11 +432,12 @@ def procesar_job_imagen(job: dict) -> None:
             "error":       str(e),
         }).eq("id", job_id).execute()
 
-        # ── IMPORTANTE: resetear rfq.estado para que el usuario pueda reintentar ──
-        # Si no se hace esto, el RFQ queda atascado en 'procesando_imagen' para siempre
+        # ── IMPORTANTE: poner rfq.estado = 'foto_pendiente' para que el UI muestre ──
+        # el widget de reintento / upload manual. NO usar 'busqueda_completa' porque
+        # el polling del frontend busca 'foto_pendiente' para mostrar el widget correcto.
         try:
             supabase.table("rfqs").update({
-                "estado": "busqueda_completa",   # vuelve al paso previo para poder reintentar
+                "estado": "foto_pendiente",   # UI detecta esto y muestra retry / upload manual
             }).eq("id", rfq_uuid).execute()
 
             supabase.table("notificaciones").insert({
@@ -434,7 +451,7 @@ def procesar_job_imagen(job: dict) -> None:
                 "rfq_id":  rfq_uuid,
                 "leida":   False,
             }).execute()
-            log.info(f"RFQ {rfq_uuid} reseteado a busqueda_completa tras fallo de imagen")
+            log.info(f"RFQ {rfq_uuid} → foto_pendiente tras fallo de imagen")
         except Exception as e2:
             log.error(f"Error reseteando rfq tras fallo: {e2}")
 
