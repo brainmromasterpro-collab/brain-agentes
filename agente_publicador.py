@@ -284,22 +284,39 @@ def crear_producto_en_crm(ficha: dict, modelo: str) -> str:
         "product_code":          modelo,
         "manufacturers_part_no": modelo,    # MySQL 1364 — required in this instance
         "description":           ficha["descripcion"],
-        # All standard price/cost fields (avoid MySQL 1364 on any of these)
-        "price":                 precio_str,
-        "unit_price":            precio_str,
-        "list_price":            precio_str,
-        "discount_price":        precio_str,
-        "wholesale_price":       precio_str,
-        "cost":                  "0.00",
-        # USD-equivalent columns (same value — no FX conversion needed for catalog)
-        "currency_price":        precio_str,
-        "price_usdollar":        precio_str,
-        "unit_price_usdollar":   precio_str,
-        "list_price_usdollar":   precio_str,
-        "discount_usdollar":     precio_str,
-        "wholesale_price_usdollar": precio_str,
-        "cost_usdollar":         "0.00",
+        # All known price/cost fields (MySQL 1364 — NOT NULL w/o defaults)
+        "price":                          precio_str,
+        "unit_price":                     precio_str,
+        "list_price":                     precio_str,
+        "discount_price":                 precio_str,
+        "wholesale_price":                precio_str,
+        "purchase_price":                 "0.00",
+        "cost":                           "0.00",
+        "mft_suggested_retail_price":     precio_str,
+        "msrp_price":                     precio_str,
+        "suggested_retail_price":         precio_str,
+        # USD-equivalent columns
+        "price_usdollar":                 precio_str,
+        "unit_price_usdollar":            precio_str,
+        "list_price_usdollar":            precio_str,
+        "discount_usdollar":              precio_str,
+        "wholesale_price_usdollar":       precio_str,
+        "purchase_price_usdollar":        "0.00",
+        "cost_usdollar":                  "0.00",
+        "mft_suggested_retail_price_usdollar": precio_str,
+        # Support/maintenance price fields (visible in 1CRM INSERT SQL)
+        "support_cost":                   "0.00",
+        "support_cost_usdollar":          "0.00",
+        "support_list_price":             precio_str,
+        "support_list_usdollar":          precio_str,
+        "support_selling_price":          precio_str,
+        "support_selling_usdollar":       precio_str,
+        "support_discount_price":         precio_str,
+        "support_discount_usdollar":      precio_str,
+        # Other common fields
         "status":                "Active",
+        "is_available":          "1",
+        "track_inventory":       "0",
     }
     # Attach real currency UUID if available (avoid "-99" which fails DB INSERT)
     currency_id = get_crm_currency_id()
