@@ -153,46 +153,49 @@ Devuelve SOLO este JSON (sin texto extra):
 # ─────────────────────────────────────────
 # CREAR PRODUCTO EN 1CRM
 # ─────────────────────────────────────────
-def buscar_producto_por_codigo(modelo: str) -> str | None:
+def buscar_producto_por_codigo(modelo: str) -> tuple[str | None, list[str]]:
     """
     Busca un producto existente en 1CRM por product_code.
-    Devuelve el ID si lo encuentra, None en caso contrario.
-    Intenta primero con search param, luego sin filtro (lista todos y filtra local).
+    Devuelve (id_o_None, lista_de_diagnósticos).
+    Intenta múltiples endpoints y estrategias para máxima cobertura.
     """
-    # Intento 1: búsqueda por product_code con parámetro search
-    try:
-        result = onecrm_get("data/Product", {
-            "search[product_code]": modelo,
-            "fields": "id,name,product_code",
-            "max_num": 5,
-        })
-        log.info(f"GET data/Product search → {str(result)[:300]}")
-        records = result.get("records") or []
-        for rec in records:
-            if rec.get("product_code") == modelo or rec.get("id"):
-                pid = rec.get("id")
-                log.info(f"Producto encontrado (search): id={pid}")
-                return pid
-    except Exception as e:
-        log.warning(f"GET search falló: {e}")
+    diags: list[str] = []
 
-    # Intento 2: listar todos y filtrar client-side (por si search params no funcionan)
-    try:
-        result = onecrm_get("data/Product", {
-            "fields": "id,name,product_code",
-            "max_num": 50,
-        })
-        log.info(f"GET data/Product list → {str(result)[:300]}")
-        records = result.get("records") or []
-        for rec in records:
-            if rec.get("product_code") == modelo:
-                pid = rec.get("id")
-                log.info(f"Producto encontrado (list filter): id={pid}")
-                return pid
-    except Exception as e:
-        log.warning(f"GET list falló: {e}")
+    # Candidatos de endpoints a probar
+    endpoints = ["data/Product", "data/Products"]
 
-    return None
+    for ep in endpoints:
+        # Intento A: con search param
+        try:
+            result = onecrm_get(ep, {
+                "search[product_code]": modelo,
+                "max_num": 5,
+            })
+            diags.append(f"GET {ep} search → {str(result)[:200]}")
+            records = result.get("records") or []
+            for rec in records:
+                if rec.get("product_code") == modelo:
+                    pid = rec.get("id")
+                    log.info(f"Producto encontrado ({ep} search): id={pid}")
+                    return pid, diags
+        except Exception as e:
+            diags.append(f"GET {ep} search ERR: {str(e)[:100]}")
+
+        # Intento B: sin parámetros (lista todo) y filtra client-side
+        try:
+            result = onecrm_get(ep, {"max_num": 100})
+            diags.append(f"GET {ep} list → {str(result)[:200]}")
+            records = result.get("records") or []
+            for rec in records:
+                if rec.get("product_code") == modelo:
+                    pid = rec.get("id")
+                    log.info(f"Producto encontrado ({ep} list): id={pid}")
+                    return pid, diags
+        except Exception as e:
+            diags.append(f"GET {ep} list ERR: {str(e)[:100]}")
+
+    log.warning(f"Producto no encontrado. Diagnóstico: {diags}")
+    return None, diags
 
 
 def crear_producto_en_crm(ficha: dict, modelo: str) -> str:
@@ -215,7 +218,7 @@ def crear_producto_en_crm(ficha: dict, modelo: str) -> str:
     }
 
     # Check if product already exists before POST (avoids 500 duplicate constraint)
-    existing_id = buscar_producto_por_codigo(modelo)
+    existing_id, pre_diags = buscar_producto_por_codigo(modelo)
     if existing_id:
         log.info(f"Producto ya existe en 1CRM (id={existing_id}) — reutilizando")
         return existing_id
@@ -240,24 +243,28 @@ def crear_producto_en_crm(ficha: dict, modelo: str) -> str:
 
         # POST succeeded (2xx) but no ID in response — try GET fallback
         log.warning("POST exitoso pero sin ID en respuesta — buscando producto por código")
-        existing_id = buscar_producto_por_codigo(modelo)
+        existing_id, post_diags = buscar_producto_por_codigo(modelo)
         if existing_id:
             return existing_id
 
-        resp_snippet = str(result)[:500]
-        raise RuntimeError(f"1CRM no devolvió ID. Respuesta: {resp_snippet}")
+        resp_snippet = str(result)[:400]
+        raise RuntimeError(f"POST OK sin ID. Resp={resp_snippet}. GET_diags={post_diags}")
 
     except RuntimeError:
         raise
     except Exception as post_err:
         # Could be 500 (duplicate product_code), network error, etc.
         log.warning(f"POST falló ({post_err}) — buscando producto existente por código")
-        existing_id = buscar_producto_por_codigo(modelo)
+        existing_id, err_diags = buscar_producto_por_codigo(modelo)
         if existing_id:
             log.info(f"Reutilizando producto existente id={existing_id}")
             return existing_id
-        # Re-raise with original error details
-        raise RuntimeError(f"POST 1CRM falló y no se encontró producto existente. Error: {post_err}")
+        # Include full diagnostics in error for Supabase visibility
+        raise RuntimeError(
+            f"POST={str(post_err)[:200]} | "
+            f"PRE_GET={pre_diags} | "
+            f"ERR_GET={err_diags}"
+        )
 
 
 # ─────────────────────────────────────────
