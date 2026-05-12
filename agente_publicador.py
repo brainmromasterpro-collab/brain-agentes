@@ -169,11 +169,23 @@ def crear_producto_en_crm(ficha: dict, modelo: str) -> str | None:
             "currency_id":  "-99",   # moneda del sistema (ajustar si se necesita USD específico)
         }
         result = onecrm_post("data/Product", payload)
-        product_id = result.get("id")
+
+        # Log full response for debugging — 1CRM can return ID under different keys
+        log.info(f"1CRM POST data/Product → keys: {list(result.keys())}")
+        log.info(f"1CRM response snippet: {str(result)[:400]}")
+
+        # Try multiple possible response formats
+        product_id = (
+            result.get("id")
+            or result.get("record_id")
+            or (result.get("record") or {}).get("id")
+            or (result.get("data") or {}).get("id") if isinstance(result.get("data"), dict) else None
+        )
+
         if product_id:
             log.info(f"Producto creado en 1CRM: id={product_id}")
         else:
-            log.warning(f"1CRM no devolvió ID. Respuesta: {result}")
+            log.warning(f"1CRM no devolvió ID. Respuesta completa: {result}")
         return product_id
     except Exception as e:
         log.error(f"Error creando producto en 1CRM: {e}")
