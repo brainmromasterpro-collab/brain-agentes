@@ -153,45 +153,83 @@ Devuelve SOLO este JSON (sin texto extra):
 # ─────────────────────────────────────────
 # CREAR PRODUCTO EN 1CRM
 # ─────────────────────────────────────────
-def crear_producto_en_crm(ficha: dict, modelo: str) -> str | None:
+def buscar_producto_por_codigo(modelo: str) -> str | None:
+    """
+    Busca un producto existente en 1CRM por product_code.
+    Devuelve el ID si lo encuentra, None en caso contrario.
+    """
+    try:
+        result = onecrm_get("data/Product", {
+            "search[product_code]": modelo,
+            "fields": "id,name,product_code",
+            "max_num": 1,
+        })
+        records = result.get("records") or []
+        if records:
+            pid = records[0].get("id")
+            log.info(f"Producto existente encontrado en 1CRM: id={pid} para código {modelo}")
+            return pid
+    except Exception as e:
+        log.warning(f"Búsqueda de producto existente falló: {e}")
+    return None
+
+
+def crear_producto_en_crm(ficha: dict, modelo: str) -> str:
     """
     Crea el producto en 1CRM vía POST data/Product.
-    Devuelve el ID del producto creado, o None si falla.
-    Raises RuntimeError con el response body si 1CRM no devuelve ID
-    (para que el error quede almacenado en el job y sea visible desde Supabase).
+    Si ya existe (500 por duplicate key), intenta recuperar el ID existente.
+    Devuelve el ID del producto.
+    Raises RuntimeError con el response body si falla definitivamente.
     """
     log.info(f"Creando producto en 1CRM: {ficha['nombre']}")
+    precio = round(float(ficha.get("precio_referencia") or 0), 2)
     payload = {
         "name":         ficha["nombre"],
         "product_code": modelo,
         "description":  ficha["descripcion"],
-        "price":        str(round(float(ficha.get("precio_referencia") or 0), 2)),
-        "unit_price":   str(round(float(ficha.get("precio_referencia") or 0), 2)),
-        "currency_id":  "-99",   # moneda del sistema (ajustar si se necesita USD específico)
+        "unit_price":   str(precio),
+        # currency_id omitted — 1CRM uses system default; "-99" causes 500 in some versions
     }
-    result = onecrm_post("data/Product", payload)
 
-    # Log full response for debugging — 1CRM can return ID under different keys
-    log.info(f"1CRM POST data/Product → keys: {list(result.keys())}")
-    log.info(f"1CRM response snippet: {str(result)[:500]}")
+    try:
+        result = onecrm_post("data/Product", payload)
 
-    # Try multiple possible response formats
-    product_id = (
-        result.get("id")
-        or result.get("record_id")
-        or (result.get("record") or {}).get("id")
-        or ((result.get("data") or {}).get("id") if isinstance(result.get("data"), dict) else None)
-    )
+        # Log full response for debugging — 1CRM can return ID under different keys
+        log.info(f"1CRM POST data/Product → keys: {list(result.keys())}")
+        log.info(f"1CRM response snippet: {str(result)[:500]}")
 
-    if product_id:
-        log.info(f"Producto creado en 1CRM: id={product_id}")
-        return product_id
-    else:
-        # Include full response in the error so it's stored in jobs.error and visible via SQL
+        # Try multiple possible response formats
+        product_id = (
+            result.get("id")
+            or result.get("record_id")
+            or (result.get("record") or {}).get("id")
+            or ((result.get("data") or {}).get("id") if isinstance(result.get("data"), dict) else None)
+        )
+
+        if product_id:
+            log.info(f"Producto creado en 1CRM: id={product_id}")
+            return product_id
+
+        # POST succeeded (2xx) but no ID in response — try GET fallback
+        log.warning("POST exitoso pero sin ID en respuesta — buscando producto por código")
+        existing_id = buscar_producto_por_codigo(modelo)
+        if existing_id:
+            return existing_id
+
         resp_snippet = str(result)[:500]
-        msg = f"1CRM no devolvió ID. Respuesta: {resp_snippet}"
-        log.error(msg)
-        raise RuntimeError(msg)
+        raise RuntimeError(f"1CRM no devolvió ID. Respuesta: {resp_snippet}")
+
+    except RuntimeError:
+        raise
+    except Exception as post_err:
+        # Could be 500 (duplicate product_code), network error, etc.
+        log.warning(f"POST falló ({post_err}) — buscando producto existente por código")
+        existing_id = buscar_producto_por_codigo(modelo)
+        if existing_id:
+            log.info(f"Reutilizando producto existente id={existing_id}")
+            return existing_id
+        # Re-raise with original error details
+        raise RuntimeError(f"POST 1CRM falló y no se encontró producto existente. Error: {post_err}")
 
 
 # ─────────────────────────────────────────
