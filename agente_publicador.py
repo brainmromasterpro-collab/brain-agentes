@@ -80,6 +80,34 @@ def onecrm_post(endpoint: str, data: dict) -> dict:
     return resp.json()
 
 
+_crm_currency_id: str | None = None  # module-level cache
+
+
+def get_crm_currency_id() -> str | None:
+    """
+    Fetch the default/first active currency UUID from 1CRM.
+    Caches the result for the process lifetime.
+    Returns None if the endpoint is unavailable (1CRM will use its own default).
+    """
+    global _crm_currency_id
+    if _crm_currency_id is not None:
+        return _crm_currency_id
+    for ep in ("data/Currency", "data/Currencies"):
+        try:
+            result = onecrm_get(ep, {"max_num": 5})
+            records = result.get("records") or []
+            for rec in records:
+                cid = rec.get("id")
+                if cid:
+                    log.info(f"Currency ID obtenido de {ep}: {cid} ({rec.get('name', '?')})")
+                    _crm_currency_id = cid
+                    return cid
+        except Exception as e:
+            log.warning(f"No se pudo obtener currency de {ep}: {e}")
+    log.warning("Currency ID no disponible — se omitirá del payload")
+    return None
+
+
 def onecrm_patch(endpoint: str, data: dict) -> dict:
     resp = httpx.patch(
         f"{ONECRM_BASE}/api.php/{endpoint}",
@@ -222,14 +250,19 @@ def crear_producto_en_crm(ficha: dict, modelo: str) -> str:
     """
     log.info(f"Creando producto en 1CRM: {ficha['nombre']}")
     precio = round(float(ficha.get("precio_referencia") or 0), 2)
-    payload = {
+    payload: dict = {
         "name":         ficha["nombre"],
         "product_code": modelo,
         "description":  ficha["descripcion"],
         "price":        str(precio),
         "unit_price":   str(precio),
-        "currency_id":  "-99",  # Required in this 1CRM instance — omitting causes HTTP 500
+        "cost":         "0.00",
     }
+    # Attach real currency UUID if available (avoid "-99" which fails DB INSERT)
+    currency_id = get_crm_currency_id()
+    if currency_id:
+        payload["currency_id"] = currency_id
+    log.info(f"POST payload currency_id={currency_id or '(omitted)'}")
 
     # Check if product already exists before POST (avoids 500 duplicate constraint)
     existing_id, pre_diags = buscar_producto_por_codigo(modelo)
