@@ -56,36 +56,33 @@ BUCKET = "product-images"
 # ─────────────────────────────────────────
 # PASO 1 — BUSCAR IMÁGENES EN GOOGLE
 # ─────────────────────────────────────────
+def _build_queries(marca: str, modelo: str) -> list[str]:
+    """Genera lista de queries degradando el modelo de específico a genérico."""
+    partes = modelo.split("-")
+    modelo_base  = partes[0]                                             # "3RT2028"
+    modelo_corto = "-".join(partes[:2]) if len(partes) > 1 else modelo  # "3RT2028-1AK60"
+    queries = [
+        f"{marca} {modelo} product image",
+        f"{marca} {modelo_corto} product image",
+        f"{marca} {modelo_base} product image white background",
+        f"{marca} {modelo_base}",
+        f"{marca} {modelo_base} industrial catalog",
+    ]
+    return list(dict.fromkeys(queries))  # eliminar duplicados
+
+
 def buscar_imagenes_google(marca: str, modelo: str) -> list[str]:
     """
-    Devuelve hasta 5 URLs de imágenes del producto.
-    Intenta múltiples queries en orden de especificidad si la primera no devuelve resultados.
+    Intenta Google Custom Search (hasta 5 queries degradadas).
+    Devuelve URLs de imágenes o [] si no hay resultados / cuota agotada.
     """
     api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
-    cx = os.environ.get("GOOGLE_CX", "").strip()
+    cx      = os.environ.get("GOOGLE_CX",      "").strip()
     if not api_key or not cx:
-        log.warning("Sin GOOGLE_API_KEY o GOOGLE_CX — búsqueda de imágenes desactivada")
+        log.warning("Sin GOOGLE_API_KEY o GOOGLE_CX — Google Images desactivado")
         return []
 
-    # Degradar el modelo para queries más genéricas:
-    # Los part numbers industriales tienen sufijos de variante (ej. "3RT2028-1AK60-0XB0")
-    # Separar por guion y tomar partes progresivamente más cortas
-    partes = modelo.split("-")
-    modelo_base = partes[0]                        # "3RT2028"
-    modelo_corto = "-".join(partes[:2]) if len(partes) > 1 else modelo  # "3RT2028-1AK60"
-
-    # Queries en orden: más específico → más genérico
-    queries = [
-        f"{marca} {modelo} product image",                    # full + context
-        f"{marca} {modelo_corto} product image",              # sin último sufijo
-        f"{marca} {modelo_base} product image white background",  # solo base model
-        f"{marca} {modelo_base}",                             # base model sin contexto
-        f"{marca} {modelo_base} industrial catalog",          # base model + categoría
-    ]
-    # Eliminar duplicados si el modelo no tiene guiones (ya son iguales)
-    queries = list(dict.fromkeys(queries))
-
-    for query in queries:
+    for query in _build_queries(marca, modelo):
         log.info(f"Google Images: probando query → '{query}'")
         try:
             resp = httpx.get(
@@ -105,14 +102,65 @@ def buscar_imagenes_google(marca: str, modelo: str) -> list[str]:
             items = resp.json().get("items", [])
             urls = [item["link"] for item in items if "link" in item]
             if urls:
-                log.info(f"Google Images: {len(urls)} URLs encontradas con query '{query}'")
+                log.info(f"Google Images: {len(urls)} URLs con query '{query}'")
                 return urls
-            log.info(f"Google Images: sin resultados para '{query}', intentando siguiente...")
+            log.info(f"Google Images: sin resultados para '{query}', probando siguiente...")
         except Exception as e:
-            log.error(f"Error buscando con query '{query}': {e}")
+            log.error(f"Google Images error '{query}': {e}")
 
-    log.warning(f"Google Images: sin resultados tras {len(queries)} intentos")
+    log.warning("Google Images: sin resultados tras todos los intentos")
     return []
+
+
+def buscar_imagenes_serpapi(marca: str, modelo: str) -> list[str]:
+    """
+    Fallback: SerpAPI Google Images. Se usa cuando Google Custom Search falla o
+    agota cuota. SerpAPI tiene cuota independiente y suele tener mejores resultados
+    para part-numbers industriales poco conocidos.
+    """
+    serpapi_key = os.environ.get("SERPAPI_KEY", "").strip()
+    if not serpapi_key:
+        log.warning("Sin SERPAPI_KEY — SerpAPI Images desactivado")
+        return []
+
+    for query in _build_queries(marca, modelo):
+        log.info(f"SerpAPI Images: probando query → '{query}'")
+        try:
+            resp = httpx.get(
+                "https://serpapi.com/search",
+                params={
+                    "engine":  "google_images",
+                    "q":       query,
+                    "api_key": serpapi_key,
+                    "num":     5,
+                },
+                timeout=20,
+            )
+            resp.raise_for_status()
+            images = resp.json().get("images_results", [])
+            urls = [img["original"] for img in images[:5] if img.get("original")]
+            if urls:
+                log.info(f"SerpAPI Images: {len(urls)} URLs con query '{query}'")
+                return urls
+            log.info(f"SerpAPI Images: sin resultados para '{query}', probando siguiente...")
+        except Exception as e:
+            log.error(f"SerpAPI Images error '{query}': {e}")
+
+    log.warning("SerpAPI Images: sin resultados tras todos los intentos")
+    return []
+
+
+def buscar_imagenes(marca: str, modelo: str) -> list[str]:
+    """
+    Busca imágenes con Google Custom Search; si falla o da 0 resultados,
+    usa SerpAPI como fallback.
+    """
+    urls = buscar_imagenes_google(marca, modelo)
+    if urls:
+        return urls
+    log.info("Google Images no devolvió resultados — intentando SerpAPI como fallback")
+    return buscar_imagenes_serpapi(marca, modelo)
+
 
 
 # ─────────────────────────────────────────
@@ -358,9 +406,10 @@ def procesar_job_imagen(job: dict) -> None:
         modelo = rfq["modelo"].strip()
 
         # ── Paso 1: Buscar ──────────────────────────────────────────────
-        urls = buscar_imagenes_google(marca, modelo)
+        # Intenta Google Custom Search primero; si falla/cuota agotada, usa SerpAPI
+        urls = buscar_imagenes(marca, modelo)
         if not urls:
-            raise Exception("Google Images: sin resultados de búsqueda")
+            raise Exception("Sin resultados de imagen — Google Images y SerpAPI fallaron")
 
         # ── Paso 2: Descargar ───────────────────────────────────────────
         candidatas = descargar_candidatas(urls)
