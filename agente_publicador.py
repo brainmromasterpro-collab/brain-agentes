@@ -165,7 +165,8 @@ def buscar_producto_por_codigo(modelo: str) -> tuple[str | None, list[str]]:
     endpoints = ["data/Product", "data/Products"]
 
     for ep in endpoints:
-        # Intento A: con search param
+        # Intento A: search por product_code — confiamos en el filtro de 1CRM,
+        # tomamos el primer resultado sin re-verificar product_code (puede variar el formato)
         try:
             result = onecrm_get(ep, {
                 "search[product_code]": modelo,
@@ -173,24 +174,26 @@ def buscar_producto_por_codigo(modelo: str) -> tuple[str | None, list[str]]:
             })
             diags.append(f"GET {ep} search → {str(result)[:200]}")
             records = result.get("records") or []
-            for rec in records:
-                if rec.get("product_code") == modelo:
-                    pid = rec.get("id")
+            if records:
+                pid = records[0].get("id")
+                if pid:
                     log.info(f"Producto encontrado ({ep} search): id={pid}")
                     return pid, diags
         except Exception as e:
             diags.append(f"GET {ep} search ERR: {str(e)[:100]}")
 
-        # Intento B: sin parámetros (lista todo) y filtra client-side
+        # Intento B: lista todos y filtra client-side (case-insensitive)
         try:
             result = onecrm_get(ep, {"max_num": 100})
             diags.append(f"GET {ep} list → {str(result)[:200]}")
             records = result.get("records") or []
             for rec in records:
-                if rec.get("product_code") == modelo:
+                stored_code = (rec.get("product_code") or "").strip().upper()
+                if stored_code == modelo.strip().upper():
                     pid = rec.get("id")
-                    log.info(f"Producto encontrado ({ep} list): id={pid}")
-                    return pid, diags
+                    if pid:
+                        log.info(f"Producto encontrado ({ep} list): id={pid}")
+                        return pid, diags
         except Exception as e:
             diags.append(f"GET {ep} list ERR: {str(e)[:100]}")
 
