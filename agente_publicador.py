@@ -165,8 +165,9 @@ def buscar_producto_por_codigo(modelo: str) -> tuple[str | None, list[str]]:
     endpoints = ["data/Product", "data/Products"]
 
     for ep in endpoints:
-        # Intento A: search por product_code — confiamos en el filtro de 1CRM,
-        # tomamos el primer resultado sin re-verificar product_code (puede variar el formato)
+        # Intento A: search por product_code — verificamos que el código devuelto
+        # coincida (case-insensitive) para evitar falsos positivos cuando 1CRM
+        # no filtra correctamente y devuelve todos los productos.
         try:
             result = onecrm_get(ep, {
                 "search[product_code]": modelo,
@@ -174,11 +175,19 @@ def buscar_producto_por_codigo(modelo: str) -> tuple[str | None, list[str]]:
             })
             diags.append(f"GET {ep} search → {str(result)[:200]}")
             records = result.get("records") or []
+            target = modelo.strip().upper()
+            for rec in records:
+                stored = (rec.get("product_code") or "").strip().upper()
+                if stored == target:
+                    pid = rec.get("id")
+                    if pid:
+                        log.info(f"Producto encontrado ({ep} search, code match): id={pid}")
+                        return pid, diags
             if records:
-                pid = records[0].get("id")
-                if pid:
-                    log.info(f"Producto encontrado ({ep} search): id={pid}")
-                    return pid, diags
+                diags.append(
+                    f"GET {ep} search: {len(records)} registros pero ninguno con "
+                    f"product_code={modelo} (1CRM no filtra correctamente)"
+                )
         except Exception as e:
             diags.append(f"GET {ep} search ERR: {str(e)[:100]}")
 
