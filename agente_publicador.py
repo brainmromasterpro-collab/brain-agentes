@@ -157,20 +157,41 @@ def buscar_producto_por_codigo(modelo: str) -> str | None:
     """
     Busca un producto existente en 1CRM por product_code.
     Devuelve el ID si lo encuentra, None en caso contrario.
+    Intenta primero con search param, luego sin filtro (lista todos y filtra local).
     """
+    # Intento 1: búsqueda por product_code con parámetro search
     try:
         result = onecrm_get("data/Product", {
             "search[product_code]": modelo,
             "fields": "id,name,product_code",
-            "max_num": 1,
+            "max_num": 5,
         })
+        log.info(f"GET data/Product search → {str(result)[:300]}")
         records = result.get("records") or []
-        if records:
-            pid = records[0].get("id")
-            log.info(f"Producto existente encontrado en 1CRM: id={pid} para código {modelo}")
-            return pid
+        for rec in records:
+            if rec.get("product_code") == modelo or rec.get("id"):
+                pid = rec.get("id")
+                log.info(f"Producto encontrado (search): id={pid}")
+                return pid
     except Exception as e:
-        log.warning(f"Búsqueda de producto existente falló: {e}")
+        log.warning(f"GET search falló: {e}")
+
+    # Intento 2: listar todos y filtrar client-side (por si search params no funcionan)
+    try:
+        result = onecrm_get("data/Product", {
+            "fields": "id,name,product_code",
+            "max_num": 50,
+        })
+        log.info(f"GET data/Product list → {str(result)[:300]}")
+        records = result.get("records") or []
+        for rec in records:
+            if rec.get("product_code") == modelo:
+                pid = rec.get("id")
+                log.info(f"Producto encontrado (list filter): id={pid}")
+                return pid
+    except Exception as e:
+        log.warning(f"GET list falló: {e}")
+
     return None
 
 
@@ -188,8 +209,9 @@ def crear_producto_en_crm(ficha: dict, modelo: str) -> str:
         "name":         ficha["nombre"],
         "product_code": modelo,
         "description":  ficha["descripcion"],
+        "price":        str(precio),
         "unit_price":   str(precio),
-        # currency_id omitted — 1CRM uses system default; "-99" causes 500 in some versions
+        "currency_id":  "-99",  # Required in this 1CRM instance — omitting causes HTTP 500
     }
 
     # Check if product already exists before POST (avoids 500 duplicate constraint)
@@ -202,8 +224,7 @@ def crear_producto_en_crm(ficha: dict, modelo: str) -> str:
         result = onecrm_post("data/Product", payload)
 
         # Log full response for debugging — 1CRM can return ID under different keys
-        log.info(f"1CRM POST data/Product → keys: {list(result.keys())}")
-        log.info(f"1CRM response snippet: {str(result)[:500]}")
+        log.info(f"1CRM POST data/Product → full response: {str(result)[:1000]}")
 
         # Try multiple possible response formats
         product_id = (
