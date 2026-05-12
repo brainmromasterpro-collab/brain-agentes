@@ -67,14 +67,23 @@ def buscar_imagenes_google(marca: str, modelo: str) -> list[str]:
         log.warning("Sin GOOGLE_API_KEY o GOOGLE_CX — búsqueda de imágenes desactivada")
         return []
 
+    # Degradar el modelo para queries más genéricas:
+    # Los part numbers industriales tienen sufijos de variante (ej. "3RT2028-1AK60-0XB0")
+    # Separar por guion y tomar partes progresivamente más cortas
+    partes = modelo.split("-")
+    modelo_base = partes[0]                        # "3RT2028"
+    modelo_corto = "-".join(partes[:2]) if len(partes) > 1 else modelo  # "3RT2028-1AK60"
+
     # Queries en orden: más específico → más genérico
     queries = [
-        f"{marca} {modelo} product image white background",
-        f"{marca} {modelo} datasheet",
-        f"{marca} {modelo}",
-        f"{marca} {modelo} industrial",
-        f"{marca} {modelo} catalog",
+        f"{marca} {modelo} product image",                    # full + context
+        f"{marca} {modelo_corto} product image",              # sin último sufijo
+        f"{marca} {modelo_base} product image white background",  # solo base model
+        f"{marca} {modelo_base}",                             # base model sin contexto
+        f"{marca} {modelo_base} industrial catalog",          # base model + categoría
     ]
+    # Eliminar duplicados si el modelo no tiene guiones (ya son iguales)
+    queries = list(dict.fromkeys(queries))
 
     for query in queries:
         log.info(f"Google Images: probando query → '{query}'")
