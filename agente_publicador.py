@@ -159,7 +159,7 @@ def buscar_producto_por_codigo(modelo: str) -> str | None:
     Devuelve el ID si lo encuentra, None en caso contrario.
     """
     try:
-        result = onecrm_get("data/AOS_Products", {
+        result = onecrm_get("data/Product", {
             "search[product_code]": modelo,
             "fields": "id,name,product_code",
             "max_num": 1,
@@ -176,8 +176,9 @@ def buscar_producto_por_codigo(modelo: str) -> str | None:
 
 def crear_producto_en_crm(ficha: dict, modelo: str) -> str:
     """
-    Crea el producto en 1CRM vía POST data/AOS_Products.
-    Si ya existe (500 por duplicate key), intenta recuperar el ID existente.
+    Crea el producto en 1CRM vía POST data/Product.
+    Primero busca si ya existe por product_code para evitar duplicados (500).
+    Si ya existe, reutiliza el ID existente.
     Devuelve el ID del producto.
     Raises RuntimeError con el response body si falla definitivamente.
     """
@@ -191,11 +192,17 @@ def crear_producto_en_crm(ficha: dict, modelo: str) -> str:
         # currency_id omitted — 1CRM uses system default; "-99" causes 500 in some versions
     }
 
+    # Check if product already exists before POST (avoids 500 duplicate constraint)
+    existing_id = buscar_producto_por_codigo(modelo)
+    if existing_id:
+        log.info(f"Producto ya existe en 1CRM (id={existing_id}) — reutilizando")
+        return existing_id
+
     try:
-        result = onecrm_post("data/AOS_Products", payload)
+        result = onecrm_post("data/Product", payload)
 
         # Log full response for debugging — 1CRM can return ID under different keys
-        log.info(f"1CRM POST data/AOS_Products → keys: {list(result.keys())}")
+        log.info(f"1CRM POST data/Product → keys: {list(result.keys())}")
         log.info(f"1CRM response snippet: {str(result)[:500]}")
 
         # Try multiple possible response formats
@@ -246,7 +253,7 @@ def subir_imagen_a_crm(product_id: str, foto_url: str) -> bool:
 
     # Estrategia 1: PATCH con campo picture (URL)
     try:
-        onecrm_patch(f"data/AOS_Products/{product_id}", {"picture": foto_url})
+        onecrm_patch(f"data/Product/{product_id}", {"picture": foto_url})
         log.info("Imagen vinculada via PATCH picture OK")
         return True
     except Exception as e:
@@ -263,7 +270,7 @@ def subir_imagen_a_crm(product_id: str, foto_url: str) -> bool:
             auth=(os.environ["ONECRM_USERNAME"], os.environ["ONECRM_PASSWORD"]),
             files={"file": ("product.png", img_bytes, "image/png")},
             data={
-                "parent_type": "AOS_Products",
+                "parent_type": "Product",
                 "parent_id":   product_id,
                 "field":       "picture",
             },
@@ -327,7 +334,7 @@ def procesar_job_publicador(job: dict) -> None:
         }).eq("id", rfq_uuid).execute()
 
         # ── Notificar ────────────────────────────────────────────────────
-        crm_url = f"{ONECRM_BASE}/index.php?module=AOS_Products&record={product_id}"
+        crm_url = f"{ONECRM_BASE}/index.php?module=Products&record={product_id}"
         supabase.table("notificaciones").insert({
             "tipo":    "producto_publicado",
             "titulo":  f"Publicado en 1CRM — {marca} {modelo}",
