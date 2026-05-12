@@ -73,7 +73,7 @@ def onecrm_post(endpoint: str, data: dict) -> dict:
         timeout=20,
     )
     if resp.status_code not in (200, 201):
-        body = resp.text[:600]
+        body = resp.text[:2000]
         log.error(f"1CRM POST error {resp.status_code}: {body}")
         # Raise with body so it propagates to Supabase error column
         raise RuntimeError(f"1CRM POST {resp.status_code} on {endpoint}: {body}")
