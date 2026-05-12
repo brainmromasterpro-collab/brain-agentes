@@ -157,39 +157,41 @@ def crear_producto_en_crm(ficha: dict, modelo: str) -> str | None:
     """
     Crea el producto en 1CRM vía POST data/Product.
     Devuelve el ID del producto creado, o None si falla.
+    Raises RuntimeError con el response body si 1CRM no devuelve ID
+    (para que el error quede almacenado en el job y sea visible desde Supabase).
     """
     log.info(f"Creando producto en 1CRM: {ficha['nombre']}")
-    try:
-        payload = {
-            "name":         ficha["nombre"],
-            "product_code": modelo,
-            "description":  ficha["descripcion"],
-            "price":        str(round(float(ficha.get("precio_referencia") or 0), 2)),
-            "unit_price":   str(round(float(ficha.get("precio_referencia") or 0), 2)),
-            "currency_id":  "-99",   # moneda del sistema (ajustar si se necesita USD específico)
-        }
-        result = onecrm_post("data/Product", payload)
+    payload = {
+        "name":         ficha["nombre"],
+        "product_code": modelo,
+        "description":  ficha["descripcion"],
+        "price":        str(round(float(ficha.get("precio_referencia") or 0), 2)),
+        "unit_price":   str(round(float(ficha.get("precio_referencia") or 0), 2)),
+        "currency_id":  "-99",   # moneda del sistema (ajustar si se necesita USD específico)
+    }
+    result = onecrm_post("data/Product", payload)
 
-        # Log full response for debugging — 1CRM can return ID under different keys
-        log.info(f"1CRM POST data/Product → keys: {list(result.keys())}")
-        log.info(f"1CRM response snippet: {str(result)[:400]}")
+    # Log full response for debugging — 1CRM can return ID under different keys
+    log.info(f"1CRM POST data/Product → keys: {list(result.keys())}")
+    log.info(f"1CRM response snippet: {str(result)[:500]}")
 
-        # Try multiple possible response formats
-        product_id = (
-            result.get("id")
-            or result.get("record_id")
-            or (result.get("record") or {}).get("id")
-            or (result.get("data") or {}).get("id") if isinstance(result.get("data"), dict) else None
-        )
+    # Try multiple possible response formats
+    product_id = (
+        result.get("id")
+        or result.get("record_id")
+        or (result.get("record") or {}).get("id")
+        or ((result.get("data") or {}).get("id") if isinstance(result.get("data"), dict) else None)
+    )
 
-        if product_id:
-            log.info(f"Producto creado en 1CRM: id={product_id}")
-        else:
-            log.warning(f"1CRM no devolvió ID. Respuesta completa: {result}")
+    if product_id:
+        log.info(f"Producto creado en 1CRM: id={product_id}")
         return product_id
-    except Exception as e:
-        log.error(f"Error creando producto en 1CRM: {e}")
-        return None
+    else:
+        # Include full response in the error so it's stored in jobs.error and visible via SQL
+        resp_snippet = str(result)[:500]
+        msg = f"1CRM no devolvió ID. Respuesta: {resp_snippet}"
+        log.error(msg)
+        raise RuntimeError(msg)
 
 
 # ─────────────────────────────────────────
@@ -270,9 +272,8 @@ def procesar_job_publicador(job: dict) -> None:
         ficha = generar_ficha_producto(marca, modelo, opts)
 
         # ── Crear producto en 1CRM ───────────────────────────────────────
+        # crear_producto_en_crm raises RuntimeError with full response if 1CRM fails
         product_id = crear_producto_en_crm(ficha, modelo)
-        if not product_id:
-            raise Exception("1CRM no creó el producto — sin ID devuelto")
 
         # ── Subir imagen (si existe) ─────────────────────────────────────
         imagen_subida = False
