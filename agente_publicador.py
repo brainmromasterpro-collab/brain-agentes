@@ -220,7 +220,7 @@ def buscar_producto_por_codigo(modelo: str) -> tuple[str | None, list[str]]:
     diags: list[str] = []
 
     # Candidatos de endpoints a probar
-    endpoints = ["data/Product", "data/Products"]
+    endpoints = ["data/ProductCatalog", "data/Product", "data/Products"]
 
     for ep in endpoints:
         # Intento A: search por product_code — verificamos que el código devuelto
@@ -337,10 +337,10 @@ def crear_producto_en_crm(ficha: dict, modelo: str) -> str:
         return existing_id
 
     try:
-        result = onecrm_post("data/Product", payload)
+        result = onecrm_post("data/ProductCatalog", payload)
 
         # Log full response for debugging — 1CRM can return ID under different keys
-        log.info(f"1CRM POST data/Product → full response: {str(result)[:1000]}")
+        log.info(f"1CRM POST data/ProductCatalog → full response: {str(result)[:1000]}")
 
         # Try multiple possible response formats
         product_id = (
@@ -394,7 +394,7 @@ def subir_imagen_a_crm(product_id: str, foto_url: str) -> bool:
 
     # Estrategia 1: PATCH con campo picture (URL)
     try:
-        onecrm_patch(f"data/Product/{product_id}", {"picture": foto_url})
+        onecrm_patch(f"data/ProductCatalog/{product_id}", {"picture": foto_url})
         log.info("Imagen vinculada via PATCH picture OK")
         return True
     except Exception as e:
@@ -475,7 +475,7 @@ def procesar_job_publicador(job: dict) -> None:
         }).eq("id", rfq_uuid).execute()
 
         # ── Notificar ────────────────────────────────────────────────────
-        crm_url = f"{ONECRM_BASE}/index.php?module=Products&record={product_id}"
+        crm_url = f"{ONECRM_BASE}/index.php?module=ProductCatalog&record={product_id}"
         supabase.table("notificaciones").insert({
             "tipo":    "producto_publicado",
             "titulo":  f"Publicado en 1CRM — {marca} {modelo}",
