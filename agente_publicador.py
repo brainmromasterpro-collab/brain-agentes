@@ -556,10 +556,48 @@ def procesar_job_publicador(job: dict) -> None:
             "error":       str(e),
         }).eq("id", job_id).execute()
 
+        # Resetear rfq para que el gerente pueda reintentar publicar
+        try:
+            supabase.table("rfqs").update({"estado": "foto_lista"}).eq("id", rfq_uuid).execute()
+            log.info(f"RFQ {rfq_uuid} reseteado a 'foto_lista' tras fallo")
+        except Exception as reset_err:
+            log.error(f"No se pudo resetear rfq {rfq_uuid}: {reset_err}")
+
 
 # ─────────────────────────────────────────
 # LOOP PRINCIPAL — POLLING
 # ─────────────────────────────────────────
+def resetear_rfqs_publicando():
+    """
+    Detecta rfqs atascados en estado 'publicando' sin job activo y los resetea a 'foto_lista'.
+    Ocurre cuando el job de publicador falla pero el rfq nunca se actualiza.
+    """
+    try:
+        rfqs = (
+            supabase.table("rfqs")
+            .select("id")
+            .eq("estado", "publicando")
+            .execute()
+            .data or []
+        )
+        for rfq in rfqs:
+            rfq_id = rfq["id"]
+            activos = (
+                supabase.table("jobs")
+                .select("id")
+                .eq("rfq_id", rfq_id)
+                .eq("agente", "publicador")
+                .in_("estado", ["pendiente", "corriendo"])
+                .execute()
+                .data or []
+            )
+            if not activos:
+                log.warning(f"RFQ {rfq_id} atascado en 'publicando' sin job activo — reseteando a 'foto_lista'")
+                supabase.table("rfqs").update({"estado": "foto_lista"}).eq("id", rfq_id).execute()
+    except Exception as e:
+        log.error(f"Error reseteando rfqs publicando: {e}")
+
+
 def resetear_jobs_huerfanos():
     """Resetea jobs de publicador que quedaron en 'corriendo' por redeploy."""
     try:
@@ -598,6 +636,7 @@ def main():
     discover_product_module()
 
     resetear_jobs_huerfanos()
+    resetear_rfqs_publicando()
 
     while True:
         try:
