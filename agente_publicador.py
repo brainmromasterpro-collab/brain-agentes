@@ -82,6 +82,49 @@ def onecrm_post(endpoint: str, data: dict) -> dict:
 
 _crm_currency_id: str | None = None  # module-level cache
 
+# Nombre del módulo de productos en 1CRM — se descubre en runtime
+_crm_product_module: str | None = None
+_PRODUCT_MODULE_CANDIDATES = [
+    "ProductCatalog",
+    "AOS_Products",
+    "AOS_Products_Quotes",
+    "Product",
+    "Products",
+]
+
+
+def discover_product_module() -> str:
+    """
+    Prueba cada candidato de módulo de productos en 1CRM y devuelve el primero
+    que responda con 200 OK. Guarda el resultado en _crm_product_module.
+    """
+    global _crm_product_module
+    if _crm_product_module:
+        return _crm_product_module
+
+    log.info("Descubriendo módulo de productos en 1CRM API...")
+    for mod in _PRODUCT_MODULE_CANDIDATES:
+        ep = f"data/{mod}"
+        try:
+            resp = httpx.get(
+                f"{ONECRM_BASE}/api.php/{ep}",
+                auth=(os.environ["ONECRM_USERNAME"], os.environ["ONECRM_PASSWORD"]),
+                params={"max_num": 1},
+                timeout=10,
+            )
+            log.info(f"  {ep} → HTTP {resp.status_code} | {resp.text[:120]}")
+            if resp.status_code == 200:
+                _crm_product_module = mod
+                log.info(f"✓ Módulo de productos 1CRM: {mod}")
+                return mod
+        except Exception as e:
+            log.warning(f"  {ep} → ERROR: {e}")
+
+    # Fallback — si no se descubrió nada usar ProductCatalog y ver qué pasa
+    _crm_product_module = "ProductCatalog"
+    log.error(f"No se pudo descubrir módulo de productos. Usando fallback: {_crm_product_module}")
+    return _crm_product_module
+
 
 def get_crm_currency_id() -> str | None:
     """
@@ -219,8 +262,9 @@ def buscar_producto_por_codigo(modelo: str) -> tuple[str | None, list[str]]:
     """
     diags: list[str] = []
 
-    # Candidatos de endpoints a probar
-    endpoints = ["data/ProductCatalog", "data/Product", "data/Products"]
+    # Usar el módulo descubierto en runtime (ya probado con GET 200)
+    mod = discover_product_module()
+    endpoints = [f"data/{mod}"]
 
     for ep in endpoints:
         # Intento A: search por product_code — verificamos que el código devuelto
@@ -337,10 +381,11 @@ def crear_producto_en_crm(ficha: dict, modelo: str) -> str:
         return existing_id
 
     try:
-        result = onecrm_post("data/ProductCatalog", payload)
+        mod = discover_product_module()
+        result = onecrm_post(f"data/{mod}", payload)
 
         # Log full response for debugging — 1CRM can return ID under different keys
-        log.info(f"1CRM POST data/ProductCatalog → full response: {str(result)[:1000]}")
+        log.info(f"1CRM POST data/{mod} → full response: {str(result)[:1000]}")
 
         # Try multiple possible response formats
         product_id = (
@@ -394,7 +439,8 @@ def subir_imagen_a_crm(product_id: str, foto_url: str) -> bool:
 
     # Estrategia 1: PATCH con campo picture (URL)
     try:
-        onecrm_patch(f"data/ProductCatalog/{product_id}", {"picture": foto_url})
+        mod = discover_product_module()
+        onecrm_patch(f"data/{mod}/{product_id}", {"picture": foto_url})
         log.info("Imagen vinculada via PATCH picture OK")
         return True
     except Exception as e:
@@ -547,6 +593,10 @@ def main():
     log.info("Agente Publicador iniciado — escuchando jobs...")
     log.info(f"1CRM: {ONECRM_BASE}")
     log.info(f"Supabase: {os.environ['SUPABASE_URL']}")
+
+    # Descubrir módulo de productos al arrancar (log visible en Railway)
+    discover_product_module()
+
     resetear_jobs_huerfanos()
 
     while True:
