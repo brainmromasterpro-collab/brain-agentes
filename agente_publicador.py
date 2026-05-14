@@ -85,10 +85,10 @@ _crm_currency_id: str | None = None  # module-level cache
 # Nombre del módulo de productos en 1CRM — se descubre en runtime
 _crm_product_module: str | None = None
 _PRODUCT_MODULE_CANDIDATES = [
-    "ProductCatalog",
+    "Product",           # ← confirmado HTTP 200 en esta instancia de 1CRM
     "AOS_Products",
+    "ProductCatalog",
     "AOS_Products_Quotes",
-    "Product",
     "Products",
 ]
 
@@ -120,8 +120,8 @@ def discover_product_module() -> str:
         except Exception as e:
             log.warning(f"  {ep} → ERROR: {e}")
 
-    # Fallback — si no se descubrió nada usar ProductCatalog y ver qué pasa
-    _crm_product_module = "ProductCatalog"
+    # Fallback — usar Product (confirmado como correcto en esta instancia)
+    _crm_product_module = "Product"
     log.error(f"No se pudo descubrir módulo de productos. Usando fallback: {_crm_product_module}")
     return _crm_product_module
 
