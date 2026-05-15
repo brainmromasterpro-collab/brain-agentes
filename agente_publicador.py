@@ -103,6 +103,15 @@ def discover_product_module() -> str:
         return _crm_product_module
 
     log.info("Descubriendo módulo de productos en 1CRM API...")
+
+    # Intentar obtener lista completa de módulos vía metadata
+    try:
+        meta = onecrm_get("meta/modules", {})
+        mods = meta.get("modules") or {}
+        product_mods = [m for m in mods if any(x in m.lower() for x in ["product", "catalog", "aos_p"])]
+        log.info(f"Módulos de 1CRM totales: {len(mods)} | Relacionados con producto: {product_mods}")
+    except Exception as e:
+        log.warning(f"Metadata endpoint no disponible: {e}")
     for mod in _PRODUCT_MODULE_CANDIDATES:
         ep = f"data/{mod}"
         try:
