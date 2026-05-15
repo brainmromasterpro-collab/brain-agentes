@@ -135,32 +135,39 @@ def discover_product_module() -> str:
     return _crm_product_module
 
 
-def get_crm_currency_id() -> str | None:
+def get_crm_currency_id() -> str:
     """
-    Fetch the default/first active currency UUID from 1CRM.
-    Caches the result for the process lifetime.
-    Returns None if the endpoint is unavailable (1CRM will use its own default).
+    Devuelve el ID de moneda USD en 1CRM.
+    En esta instancia, USD usa el id especial "-99" (moneda base del sistema).
+    Si no se puede confirmar, usa "-99" como fallback seguro.
     """
     global _crm_currency_id
     if _crm_currency_id is not None:
         return _crm_currency_id
-    for ep in ("data/Currency", "data/Currencies"):
-        try:
-            result = onecrm_get(ep, {"max_num": 5})
-            records = result.get("records") or []
-            for rec in records:
-                cid = rec.get("id")
-                if cid:
-                    log.info(f"Currency ID obtenido de {ep}: {cid} ({rec.get('name', '?')})")
-                    _crm_currency_id = cid
-                    return cid
-        except Exception as e:
-            log.warning(f"No se pudo obtener currency de {ep}: {e}")
-    log.warning("Currency ID no disponible — se omitirá del payload")
-    return None
+    # "-99" es el ID reservado para la moneda base (USD) en 1CRM/SugarCRM
+    # Los productos del catálogo usan este ID — usando cualquier otro (ej. AUD)
+    # el ProductCatalog UI no los muestra correctamente.
+    try:
+        result = onecrm_get("data/Currency", {"max_num": 50})
+        records = result.get("records") or []
+        # Buscar USD explícitamente primero
+        for rec in records:
+            name = (rec.get("name") or "").lower()
+            rid = rec.get("id", "")
+            if "us dollar" in name or "usd" in name or rid == "-99":
+                log.info(f"Currency USD encontrado: id={rid} name={rec.get('name')}")
+                _crm_currency_id = rid
+                return rid
+    except Exception as e:
+        log.warning(f"No se pudo buscar currency USD: {e}")
+    # Fallback: -99 es siempre USD en 1CRM
+    log.info("Usando currency_id=-99 (USD sistema 1CRM)")
+    _crm_currency_id = "-99"
+    return "-99"
 
 
 _crm_category_id: str | None = None  # module-level cache
+_crm_product_type_id: str | None = None  # module-level cache
 
 
 def get_crm_category_id() -> str | None:
@@ -185,6 +192,52 @@ def get_crm_category_id() -> str | None:
         except Exception as e:
             log.warning(f"No se pudo obtener category de {ep}: {e}")
     log.error("product_category_id no disponible — el POST fallará (MySQL 1364)")
+    return None
+
+
+def get_crm_product_type_id() -> str | None:
+    """
+    Fetch the first available product type UUID from 1CRM.
+    CRITICAL: product_type_id is required to route POST data/Product to the
+    aos_products (ProductCatalog) table rather than the products (line items) table.
+    Without it, products are created in the wrong SQL table and never appear in
+    the ProductCatalog UI. Caches the result for the process lifetime.
+    """
+    global _crm_product_type_id
+    if _crm_product_type_id is not None:
+        return _crm_product_type_id
+
+    # Primary: fetch from ProductTypes endpoint
+    for ep in ("data/ProductType", "data/ProductTypes"):
+        try:
+            result = onecrm_get(ep, {"max_num": 5})
+            records = result.get("records") or []
+            for rec in records:
+                tid = rec.get("id")
+                if tid:
+                    log.info(f"ProductType ID obtenido de {ep}: {tid} ({rec.get('name', '?')})")
+                    _crm_product_type_id = tid
+                    return tid
+        except Exception as e:
+            log.warning(f"No se pudo obtener ProductType de {ep}: {e}")
+
+    # Fallback: read product_type_id from an existing catalog product
+    try:
+        result = onecrm_get("data/Product", {"max_num": 5})
+        records = result.get("records") or []
+        for rec in records:
+            pid = rec.get("id")
+            if pid:
+                detail = onecrm_get(f"data/Product/{pid}")
+                tid = (detail.get("record") or {}).get("product_type_id")
+                if tid:
+                    log.info(f"ProductType ID extraído de producto existente: {tid}")
+                    _crm_product_type_id = tid
+                    return tid
+    except Exception as e:
+        log.warning(f"No se pudo leer product_type_id de producto existente: {e}")
+
+    log.error("product_type_id no disponible — los productos NO aparecerán en ProductCatalog")
     return None
 
 
@@ -265,123 +318,126 @@ Devuelve SOLO este JSON (sin texto extra):
 # ─────────────────────────────────────────
 def buscar_producto_por_codigo(modelo: str) -> tuple[str | None, list[str]]:
     """
-    Busca un producto existente en 1CRM por product_code.
+    Busca un producto existente en 1CRM por manufacturers_part_no.
+    Nota: el API REST de esta instancia NO filtra correctamente por search[]
+    (ignora los parámetros y devuelve todos los productos paginados).
+    Por eso buscamos por nombre que sí incluye el número de parte.
+
     Devuelve (id_o_None, lista_de_diagnósticos).
-    Intenta múltiples endpoints y estrategias para máxima cobertura.
     """
     diags: list[str] = []
-
-    # Usar el módulo descubierto en runtime (ya probado con GET 200)
     mod = discover_product_module()
-    endpoints = [f"data/{mod}"]
+    ep = f"data/{mod}"
+    target = modelo.strip().upper()
 
-    for ep in endpoints:
-        # Intento A: search por product_code — verificamos que el código devuelto
-        # coincida (case-insensitive) para evitar falsos positivos cuando 1CRM
-        # no filtra correctamente y devuelve todos los productos.
-        try:
-            result = onecrm_get(ep, {
-                "search[product_code]": modelo,
-                "max_num": 5,
-            })
-            diags.append(f"GET {ep} search → {str(result)[:200]}")
-            records = result.get("records") or []
-            target = modelo.strip().upper()
-            for rec in records:
-                stored = (rec.get("product_code") or "").strip().upper()
-                if stored == target:
-                    pid = rec.get("id")
-                    if pid:
-                        log.info(f"Producto encontrado ({ep} search, code match): id={pid}")
-                        return pid, diags
-            if records:
-                diags.append(
-                    f"GET {ep} search: {len(records)} registros pero ninguno con "
-                    f"product_code={modelo} (1CRM no filtra correctamente)"
-                )
-        except Exception as e:
-            diags.append(f"GET {ep} search ERR: {str(e)[:100]}")
+    # Intento A: buscar por nombre que contenga el número de parte
+    # (1CRM no filtra por product_code pero sí puede encontrar por nombre parcial)
+    try:
+        result = onecrm_get(ep, {
+            "search[manufacturers_part_no]": modelo,
+            "max_num": 20,
+        })
+        records = result.get("records") or []
+        diags.append(f"GET {ep} search manufacturers_part_no → {len(records)} registros")
+        for rec in records:
+            stored = (rec.get("manufacturers_part_no") or "").strip().upper()
+            # También revisar si el nombre contiene el número de parte
+            name_has = target in (rec.get("name") or "").upper()
+            if stored == target or name_has:
+                pid = rec.get("id")
+                if pid:
+                    log.info(f"Producto encontrado por manufacturers_part_no: id={pid}")
+                    return pid, diags
+    except Exception as e:
+        diags.append(f"GET {ep} search ERR: {str(e)[:100]}")
 
-        # Intento B: lista todos y filtra client-side (case-insensitive)
-        try:
-            result = onecrm_get(ep, {"max_num": 100})
-            diags.append(f"GET {ep} list → {str(result)[:200]}")
-            records = result.get("records") or []
-            for rec in records:
-                stored_code = (rec.get("product_code") or "").strip().upper()
-                if stored_code == modelo.strip().upper():
-                    pid = rec.get("id")
-                    if pid:
-                        log.info(f"Producto encontrado ({ep} list): id={pid}")
-                        return pid, diags
-        except Exception as e:
-            diags.append(f"GET {ep} list ERR: {str(e)[:100]}")
+    # Intento B: buscar por nombre
+    try:
+        result = onecrm_get(ep, {
+            "search[name]": modelo,
+            "max_num": 20,
+        })
+        records = result.get("records") or []
+        diags.append(f"GET {ep} search name → {len(records)} registros")
+        for rec in records:
+            name_has = target in (rec.get("name") or "").upper()
+            mfr      = (rec.get("manufacturers_part_no") or "").strip().upper()
+            if name_has or mfr == target:
+                pid = rec.get("id")
+                if pid:
+                    log.info(f"Producto encontrado por nombre: id={pid}")
+                    return pid, diags
+    except Exception as e:
+        diags.append(f"GET {ep} search name ERR: {str(e)[:100]}")
 
-    log.warning(f"Producto no encontrado. Diagnóstico: {diags}")
+    log.warning(f"Producto '{modelo}' no encontrado en 1CRM. Diags: {diags}")
     return None, diags
 
 
 def crear_producto_en_crm(ficha: dict, modelo: str) -> str:
     """
-    Crea el producto en 1CRM vía POST data/Product.
-    Primero busca si ya existe por product_code para evitar duplicados (500).
-    Si ya existe, reutiliza el ID existente.
+    Crea el producto en 1CRM vía POST data/Product → escribe en aos_products (ProductCatalog).
+
+    CRITICAL: los campos del payload deben coincidir con columnas de aos_products, NO
+    de la tabla products (line items). Diferencias clave:
+      - list_price (aos_products) en vez de price / unit_price (products)
+      - product_type_id DEBE incluirse — es lo que enruta el POST a aos_products
+      - eshop="1" requerido para que aparezca en el catálogo
+      - currency_id="-99" (USD base del sistema)
+
+    Primero busca si ya existe por product_code para evitar duplicados.
     Devuelve el ID del producto.
     Raises RuntimeError con el response body si falla definitivamente.
     """
     log.info(f"Creando producto en 1CRM: {ficha['nombre']}")
     precio = round(float(ficha.get("precio_referencia") or 0), 2)
-    precio_str = str(precio)
+    precio_str = f"{precio:.2f}"
+
+    # Campos que enrutan a aos_products (ProductCatalog) — NO usar price/unit_price
+    # que son columnas de la tabla products (line items de cotizaciones)
     payload: dict = {
         "name":                  ficha["nombre"],
-        "product_code":          modelo,
-        "manufacturers_part_no": modelo,    # MySQL 1364 — required in this instance
+        "manufacturers_part_no": modelo,
         "description":           ficha["descripcion"],
-        # All known price/cost fields (MySQL 1364 — NOT NULL w/o defaults)
-        "price":                          precio_str,
-        "unit_price":                     precio_str,
-        "list_price":                     precio_str,
-        "discount_price":                 precio_str,
-        "wholesale_price":                precio_str,
-        "purchase_price":                 "0.00",
-        "cost":                           "0.00",
-        "mft_suggested_retail_price":     precio_str,
-        "msrp_price":                     precio_str,
-        "suggested_retail_price":         precio_str,
-        # USD-equivalent columns
-        "price_usdollar":                 precio_str,
-        "unit_price_usdollar":            precio_str,
-        "list_price_usdollar":            precio_str,
-        "discount_usdollar":              precio_str,
-        "wholesale_price_usdollar":       precio_str,
-        "purchase_price_usdollar":        "0.00",
-        "cost_usdollar":                  "0.00",
-        "mft_suggested_retail_price_usdollar": precio_str,
-        # Support/maintenance price fields (visible in 1CRM INSERT SQL)
-        "support_cost":                   "0.00",
-        "support_cost_usdollar":          "0.00",
-        "support_list_price":             precio_str,
-        "support_list_usdollar":          precio_str,
-        "support_selling_price":          precio_str,
-        "support_selling_usdollar":       precio_str,
-        "support_discount_price":         precio_str,
-        "support_discount_usdollar":      precio_str,
-        # Other common fields
-        "status":                "Active",
-        "is_available":          "1",
-        "track_inventory":       "0",
+        # Precios según schema de aos_products
+        "list_price":            precio_str,
+        "list_usdollar":         precio_str,
+        "purchase_price":        "0.00",
+        "purchase_usdollar":     "0.00",
+        "cost":                  "0.00",
+        "cost_usdollar":         "0.00",
+        "support_cost":          "0.00",
+        "support_cost_usdollar": "0.00",
+        "support_list_price":    "0.00",
+        "support_list_usdollar": "0.00",
+        "support_selling_price": "0.00",
+        "support_selling_usdollar": "0.00",
+        # Campos de catálogo
+        "status":            "Active",
+        "is_available":      "yes",
+        "track_inventory":   "semiauto",
+        "eshop":             "1",          # requerido para aparecer en catálogo
+        "pricing_formula":   "Fixed Price",
+        "support_price_formula": "Fixed Price",
+        "currency_id":       "-99",        # USD base del sistema
+        "exchange_rate":     "1",
     }
-    # Attach real currency UUID if available (avoid "-99" which fails DB INSERT)
-    currency_id = get_crm_currency_id()
-    if currency_id:
-        payload["currency_id"] = currency_id
 
-    # product_category_id is NOT NULL with no default in this 1CRM instance (MySQL 1364)
+    # product_type_id: CRÍTICO — enruta el POST a aos_products en vez de products
+    type_id = get_crm_product_type_id()
+    if type_id:
+        payload["product_type_id"] = type_id
+        log.info(f"product_type_id={type_id}")
+    else:
+        log.error("⚠ Sin product_type_id — el producto podría ir a tabla incorrecta")
+
+    # product_category_id: NOT NULL sin default en esta instancia
     category_id = get_crm_category_id()
     if category_id:
         payload["product_category_id"] = category_id
+        log.info(f"product_category_id={category_id}")
 
-    log.info(f"POST payload currency_id={currency_id or '(omitted)'} category_id={category_id or '(omitted)'}")
+    log.info(f"POST payload: type_id={type_id or '(omitido)'} cat_id={category_id or '(omitido)'}")
 
     # Check if product already exists before POST (avoids 500 duplicate constraint)
     existing_id, pre_diags = buscar_producto_por_codigo(modelo)
@@ -644,6 +700,8 @@ def main():
 
     # Descubrir módulo de productos al arrancar (log visible en Railway)
     discover_product_module()
+    get_crm_product_type_id()   # precarga — crítico para enrutar POST a aos_products
+    get_crm_category_id()       # precarga — NOT NULL en esta instancia
 
     resetear_jobs_huerfanos()
     resetear_rfqs_publicando()
