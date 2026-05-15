@@ -85,8 +85,8 @@ _crm_currency_id: str | None = None  # module-level cache
 # Nombre del módulo de productos en 1CRM — se descubre en runtime
 _crm_product_module: str | None = None
 _PRODUCT_MODULE_CANDIDATES = [
-    "Product",           # ← confirmado HTTP 200 en esta instancia de 1CRM
-    "AOS_Products",
+    "AOS_Products",      # ← módulo estándar 1CRM para ProductCatalog UI
+    "Product",           # ← confirmado HTTP 200, pero puede ser módulo diferente
     "ProductCatalog",
     "AOS_Products_Quotes",
     "Products",
@@ -461,12 +461,13 @@ def subir_imagen_a_crm(product_id: str, foto_url: str) -> bool:
         img_resp.raise_for_status()
         img_bytes = img_resp.content
 
+        mod = discover_product_module()
         resp = httpx.post(
             f"{ONECRM_BASE}/api.php/files",
             auth=(os.environ["ONECRM_USERNAME"], os.environ["ONECRM_PASSWORD"]),
             files={"file": ("product.png", img_bytes, "image/png")},
             data={
-                "parent_type": "Product",
+                "parent_type": mod,
                 "parent_id":   product_id,
                 "field":       "picture",
             },
