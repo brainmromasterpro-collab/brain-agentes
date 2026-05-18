@@ -27,6 +27,7 @@ import os
 import re
 import time
 import json
+import uuid
 import base64
 import logging
 from datetime import datetime
@@ -63,18 +64,19 @@ Analiza esta imagen. Contiene una tabla o lista de productos industriales/MRO.
 Extrae TODOS los productos que aparecen y devuelve ÚNICAMENTE un JSON array con este formato:
 
 [
-  {"modelo": "XA2EVB4LC", "marca": "Schneider"},
-  {"modelo": "1756-PA72", "marca": "Allen Bradley"},
-  {"modelo": "BTL5-E10-M0460-K-SR32", "marca": "Balluff"}
+  {"modelo": "XA2EVB4LC", "marca": "Schneider", "urgente": false},
+  {"modelo": "1756-PA72", "marca": "Allen Bradley", "urgente": false},
+  {"modelo": "1756-L61", "marca": "Allen Bradley", "urgente": true}
 ]
 
 Reglas estrictas:
 - Copia el número de modelo/parte EXACTAMENTE como aparece en la imagen (mayúsculas, guiones, espacios)
 - Si hay columna de marca/fabricante, inclúyela; si no es visible, usa cadena vacía ""
-- Ignora encabezados de columna (p. ej. "Modelo", "Marca", "Cantidad")
+- urgente: true SOLO si la fila tiene fondo ROJO. Fondo amarillo o verde = false
+- Ignora encabezados de columna (p. ej. "Modelo", "Marca", "Cantidad", "Descripción")
 - Ignora totales, fechas, nombres de empresa y texto que NO sea un código de parte
-- Los colores de fila (rojo/amarillo/verde) son indicadores de urgencia, no afectan la extracción
 - Si el mismo modelo aparece varias veces, inclúyelo solo una vez
+- Extrae TODOS los productos, incluso los que estén al final o con formato diferente
 - Devuelve SOLO el JSON array, sin texto previo ni bloques markdown (sin ``` ni explicaciones)
 """
 
@@ -129,8 +131,9 @@ def extraer_productos_con_claude(imagen_bytes: bytes, media_type: str) -> list[d
     for p in productos:
         if isinstance(p, dict) and p.get("modelo", "").strip():
             resultado.append({
-                "modelo": p["modelo"].strip(),
-                "marca":  p.get("marca", "").strip(),
+                "modelo":   p["modelo"].strip(),
+                "marca":    p.get("marca", "").strip(),
+                "urgente":  bool(p.get("urgente", False)),
             })
     return resultado
 
@@ -138,16 +141,20 @@ def extraer_productos_con_claude(imagen_bytes: bytes, media_type: str) -> list[d
 # ─────────────────────────────────────────
 # CREACIÓN DE RFQs EN SUPABASE
 # ─────────────────────────────────────────
-def crear_rfq_y_job(stream_id: str, modelo: str, marca: str) -> str:
+def crear_rfq_y_job(stream_id: str, modelo: str, marca: str,
+                    urgente: bool = False, bulk_id: str | None = None) -> str:
     """Inserta un rfq + job buscador. Retorna el rfq_id creado."""
-    rfq_resp = supabase.table("rfqs").insert({
+    payload = {
         "stream_id": stream_id,
         "modelo":    modelo,
         "marca":     marca,
         "estado":    "recibido",
-        "urgente":   False,
-    }).execute()
+        "urgente":   urgente,
+    }
+    if bulk_id:
+        payload["bulk_id"] = bulk_id
 
+    rfq_resp = supabase.table("rfqs").insert(payload).execute()
     rfq_id = rfq_resp.data[0]["id"]
 
     supabase.table("jobs").insert({
@@ -178,6 +185,7 @@ def procesar_job_extractor(job: dict) -> None:
 
     rfq_ids: list[str] = []
     productos: list[dict] = []
+    bulk_id = str(uuid.uuid4())   # agrupa todos los RFQs de este screenshot
 
     try:
         if not imagen_url:
@@ -198,22 +206,28 @@ def procesar_job_extractor(job: dict) -> None:
         if not productos:
             raise ValueError("Claude no encontró ningún producto en la imagen")
 
-        # 3 — Crear rfq + job buscador por cada producto
+        # 3 — Crear rfq + job buscador por cada producto (todos con el mismo bulk_id)
         for p in productos:
-            rfq_id = crear_rfq_y_job(stream_id, p["modelo"], p["marca"])
+            rfq_id = crear_rfq_y_job(
+                stream_id,
+                p["modelo"],
+                p["marca"],
+                urgente=p.get("urgente", False),
+                bulk_id=bulk_id,
+            )
             rfq_ids.append(rfq_id)
-            log.info(f"  → RFQ {rfq_id}: {p['modelo']} | {p['marca']}")
+            log.info(f"  → RFQ {rfq_id}: {p['modelo']} | {p['marca']} | urgente={p.get('urgente')}")
 
-        # 4 — Notificación resumen en el stream
+        # 4 — Notificación resumen con bulk_id para que el frontend abra el panel
         lista_txt = "\n".join(
             f"• {p['modelo']}" + (f"  [{p['marca']}]" if p["marca"] else "")
             for p in productos
         )
         supabase.table("notificaciones").insert({
-            "rfq_id":  rfq_ids[0],   # primer rfq para que quede en el stream
-            "tipo":    "info",
-            "titulo":  f"📋 {len(productos)} productos extraídos del screenshot",
-            "mensaje": f"Iniciando búsquedas automáticas:\n{lista_txt}",
+            "rfq_id":  rfq_ids[0],
+            "tipo":    "bulk",
+            "titulo":  f"📋 {len(productos)} productos extraídos — búsqueda en curso",
+            "mensaje": json.dumps({"bulk_id": bulk_id, "lista": lista_txt}),
             "leida":   False,
         }).execute()
 
@@ -222,9 +236,10 @@ def procesar_job_extractor(job: dict) -> None:
             "estado":      "completado",
             "finished_at": datetime.utcnow().isoformat(),
             "output": {
+                "bulk_id":           bulk_id,
                 "productos_extraidos": len(productos),
-                "rfq_ids":  rfq_ids,
-                "productos": productos,
+                "rfq_ids":           rfq_ids,
+                "productos":         productos,
             },
         }).eq("id", job_id).execute()
 
