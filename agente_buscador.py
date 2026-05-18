@@ -593,14 +593,43 @@ def procesar_job(job: dict) -> None:
         agregar_log_job(job_id, "busqueda_brave", f"{len(res_brave)} resultados")
 
         if not resultados:
-            raise Exception("No se encontraron resultados en ninguna fuente")
+            log.warning(f"Sin resultados en ninguna fuente para '{marca} {modelo}' — marcando sin_resultado")
+            agregar_log_job(job_id, "sin_resultado", "Ninguna fuente devolvió resultados")
+            supabase.table("rfqs").update({"estado": "sin_resultado"}).eq("id", rfq_uuid).execute()
+            supabase.table("jobs").update({
+                "estado": "completado",
+                "finished_at": datetime.utcnow().isoformat(),
+                "output": {"opciones_encontradas": 0, "razon": "sin_resultados"},
+            }).eq("id", job_id).execute()
+            # Crear job notificador para que el frontend reciba rfq_listo
+            supabase.table("jobs").insert({
+                "rfq_id": rfq_uuid,
+                "agente": "notificador",
+                "estado": "pendiente",
+            }).execute()
+            log.info(f"Job {job_id} cerrado como sin_resultado — notificador encolado")
+            return
 
         # Claude rankea
         agregar_log_job(job_id, "ranking", f"Claude rankeando {len(resultados)} resultados")
         top5 = rankear_con_claude(marca, modelo, urgente, resultados, fx)
 
         if not top5:
-            raise Exception("Claude no pudo generar el ranking")
+            log.warning(f"Claude no generó ranking para '{marca} {modelo}' — marcando sin_resultado")
+            agregar_log_job(job_id, "sin_resultado", "Claude no pudo generar ranking")
+            supabase.table("rfqs").update({"estado": "sin_resultado"}).eq("id", rfq_uuid).execute()
+            supabase.table("jobs").update({
+                "estado": "completado",
+                "finished_at": datetime.utcnow().isoformat(),
+                "output": {"opciones_encontradas": 0, "razon": "ranking_vacio"},
+            }).eq("id", job_id).execute()
+            supabase.table("jobs").insert({
+                "rfq_id": rfq_uuid,
+                "agente": "notificador",
+                "estado": "pendiente",
+            }).execute()
+            log.info(f"Job {job_id} cerrado como sin_resultado (ranking vacío) — notificador encolado")
+            return
 
         # ── Garantizar que 1CRM catálogo siempre aparezca en el Top 5 ──
         # Si Claude no incluyó ningún resultado del catálogo, los inyectamos
