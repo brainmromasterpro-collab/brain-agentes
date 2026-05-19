@@ -423,17 +423,21 @@ Tipo de cambio USD/MXN: {fx}
 Tu tarea:
 1. {f"OBLIGATORIO: incluye primero los {len(crm_productos)} resultado(s) del catálogo 1CRM (fuente=1crm_productos) en rank 1." if crm_productos else "Selecciona los mejores 5 resultados."}
 2. Completa el Top 5 con los mejores resultados restantes
-3. Para cada uno infiere o estima el precio si no está explícito (basado en snippet/notas)
+3. PRECIOS — regla estricta:
+   - USA ÚNICAMENTE el precio que viene explícitamente en el campo "precio_orig" de cada resultado
+   - Si precio_orig es null, 0 o no existe: devuelve precio_orig=null y precio_mxn=null (NO inventes ni estimes precios)
+   - Si precio_orig tiene un valor real > 0: precio_mxn = precio_orig * {fx} (tipo de cambio)
+   - Nunca extraigas precios de snippets, títulos o descripciones
 4. Verifica si es distribuidor autorizado de {marca} (indicios en nombre o URL)
 5. Calcula el score de ranking:
-   - Normaliza precios: el más barato = 100 puntos, los demás proporcional
-   - Disponibilidad: en_stock=100, 1-5días=75, 1-2semanas=50, bajo_pedido=25, importación=10
+   - Si hay precios reales: el más barato = 100 puntos, los demás proporcional. Sin precio = 50 puntos base
+   - Disponibilidad: en_stock=100, 1-5días=75, 1-2semanas=50, bajo_pedido=25, importación=10, consultar=30
    - Score final = (precio_pts * {0.3 if urgente else 0.6}) + (disponibilidad_pts * {0.7 if urgente else 0.4})
 6. Score de confianza (1-5):
    - 5: producto en catálogo interno 1CRM (fuente=1crm_productos) — API directa
    - 4: proveedor en 1CRM con historial (fuente=1crm_proveedores)
    - 3: encontrado en website propio mromasterpro.com (fuente=sitio_propio) — visible pero NO confirmado en 1CRM
-   - 2: resultado Google con precio y datos claros (fuente=web)
+   - 2: resultado Google con precio explícito y datos claros (fuente=web)
    - 1: fuente no verificada o datos incompletos
 
 Responde SOLO con un JSON array con máximo 5 objetos, ordenados de mayor a menor score_ranking:
@@ -452,7 +456,7 @@ Responde SOLO con un JSON array con máximo 5 objetos, ordenados de mayor a meno
     "url": "https://...",
     "score_confianza": 1-5,
     "score_ranking": 0.00,
-    "notas": "observaciones"
+    "notas": "observaciones — si sin precio, indica 'Precio no disponible, consultar sitio'"
   }}
 ]
 
@@ -487,9 +491,14 @@ def guardar_opciones(rfq_uuid: str, opciones: list[dict], fx: float) -> None:
     supabase.table("opciones").delete().eq("rfq_id", rfq_uuid).execute()
 
     for op in opciones:
-        precio_orig = op.get("precio_orig") or 0
+        precio_orig_raw = op.get("precio_orig")
+        # Solo usar precio si es un número real > 0; null/0/None → None
+        precio_orig = float(precio_orig_raw) if precio_orig_raw and float(precio_orig_raw) > 0 else None
         moneda = op.get("moneda", "USD")
-        precio_mxn = (precio_orig * fx) if moneda == "USD" else precio_orig
+        if precio_orig is not None:
+            precio_mxn = round(precio_orig * fx, 2) if moneda == "USD" else round(precio_orig, 2)
+        else:
+            precio_mxn = None
 
         supabase.table("opciones").insert({
             "rfq_id": rfq_uuid,
@@ -498,7 +507,7 @@ def guardar_opciones(rfq_uuid: str, opciones: list[dict], fx: float) -> None:
             "dist_autorizado": op.get("dist_autorizado", False),
             "precio_orig": precio_orig,
             "moneda": moneda,
-            "precio_mxn": round(precio_mxn, 2),
+            "precio_mxn": precio_mxn,
             "disponibilidad": op.get("disponibilidad"),
             "tiempo_entrega": op.get("tiempo_entrega"),
             "condicion": op.get("condicion", "nuevo"),
@@ -638,14 +647,16 @@ def procesar_job(job: dict) -> None:
             log.info(f"Claude omitió {len(res_productos)} producto(s) 1CRM — inyectando al Top 5")
             insertar = []
             for prod in res_productos[:2]:  # máximo 2 del catálogo
-                precio = float(prod.get("precio_orig") or 0) or None
+                precio_raw = prod.get("precio_orig")
+                precio = float(precio_raw) if precio_raw and float(precio_raw) > 0 else None
+                precio_mxn_iny = round(precio * fx, 2) if precio else None
                 insertar.append({
                     "rank": 1,
                     "proveedor": prod["proveedor"],
                     "dist_autorizado": True,
                     "precio_orig": precio,
                     "moneda": prod.get("moneda", "USD"),
-                    "precio_mxn": round((precio or 0) * fx, 2),
+                    "precio_mxn": precio_mxn_iny,
                     "disponibilidad": prod.get("disponibilidad", "en_stock"),
                     "tiempo_entrega": prod.get("tiempo_entrega", "Inmediato"),
                     "condicion": prod.get("condicion", "nuevo"),
