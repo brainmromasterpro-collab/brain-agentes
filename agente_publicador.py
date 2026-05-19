@@ -589,15 +589,16 @@ def procesar_job_publicador(job: dict) -> None:
         # ── Notificar ────────────────────────────────────────────────────
         crm_url = f"{ONECRM_BASE}/index.php?module=ProductCatalog&record={product_id}"
         supabase.table("notificaciones").insert({
-            "tipo":    "producto_publicado",
-            "titulo":  f"Publicado en 1CRM — {marca} {modelo}",
-            "mensaje": (
+            "tipo":      "producto_publicado",
+            "titulo":    f"Publicado en 1CRM — {marca} {modelo}",
+            "mensaje":   (
                 f"Producto creado exitosamente en el catálogo de 1CRM.\n"
                 f"Imagen: {'subida ✓' if imagen_subida else 'pendiente ⚠'}\n"
                 f"Ver en 1CRM: {crm_url}"
             ),
-            "rfq_id":  rfq_uuid,
-            "leida":   False,
+            "rfq_id":    rfq_uuid,
+            "stream_id": rfq.get("stream_id"),
+            "leida":     False,
         }).execute()
 
         # ── Cerrar job ───────────────────────────────────────────────────
