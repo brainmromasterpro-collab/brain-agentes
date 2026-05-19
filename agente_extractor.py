@@ -224,11 +224,12 @@ def procesar_job_extractor(job: dict) -> None:
             for p in productos
         )
         supabase.table("notificaciones").insert({
-            "rfq_id":  rfq_ids[0],
-            "tipo":    "bulk",
-            "titulo":  f"📋 {len(productos)} productos extraídos — búsqueda en curso",
-            "mensaje": json.dumps({"bulk_id": bulk_id, "lista": lista_txt}),
-            "leida":   False,
+            "rfq_id":   rfq_ids[0],
+            "stream_id": stream_id,   # necesario para que StreamArea lo filtre correctamente
+            "tipo":     "bulk",
+            "titulo":   f"📋 {len(productos)} productos extraídos — búsqueda en curso",
+            "mensaje":  json.dumps({"bulk_id": bulk_id, "lista": lista_txt, "total": len(productos)}),
+            "leida":    False,
         }).execute()
 
         # 5 — Cerrar job
