@@ -639,8 +639,9 @@ def procesar_job_publicador(job: dict) -> None:
 # ─────────────────────────────────────────
 def resetear_rfqs_publicando():
     """
-    Detecta rfqs atascados en estado 'publicando' sin job activo y los resetea a 'foto_lista'.
-    Ocurre cuando el job de publicador falla pero el rfq nunca se actualiza.
+    Detecta rfqs atascados en estado 'publicando' sin job activo y los marca como
+    'publicacion_fallida'. Ocurre cuando el worker crashea o se redeploya mid-job.
+    NO resetea a 'foto_lista' para evitar el loop infinito de publicación.
     """
     try:
         rfqs = (
@@ -662,8 +663,11 @@ def resetear_rfqs_publicando():
                 .data or []
             )
             if not activos:
-                log.warning(f"RFQ {rfq_id} atascado en 'publicando' sin job activo — reseteando a 'foto_lista'")
-                supabase.table("rfqs").update({"estado": "foto_lista"}).eq("id", rfq_id).execute()
+                log.warning(f"RFQ {rfq_id} atascado en 'publicando' sin job activo — marcando publicacion_fallida")
+                supabase.table("rfqs").update({
+                    "estado": "publicacion_fallida",
+                    "publish_error": "Publicación interrumpida (redeploy del agente)",
+                }).eq("id", rfq_id).execute()
     except Exception as e:
         log.error(f"Error reseteando rfqs publicando: {e}")
 
