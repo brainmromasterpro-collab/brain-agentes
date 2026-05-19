@@ -454,9 +454,16 @@ def rankear_con_claude(
         "ver_sitio": 20,
     }
 
-    # Separar productos del catálogo 1CRM para destacarlos en el prompt
-    crm_productos = [r for r in resultados_raw if r.get("fuente") == "1crm_productos"]
-    otros = [r for r in resultados_raw if r.get("fuente") != "1crm_productos"]
+    # Separar fuentes para el prompt
+    crm_productos   = [r for r in resultados_raw if r.get("fuente") == "1crm_productos"]
+    crm_proveedores = [r for r in resultados_raw if r.get("fuente") == "1crm_proveedores"][:2]  # máx 2
+    shopping        = [r for r in resultados_raw if r.get("fuente") == "google_shopping"]
+    otros           = [r for r in resultados_raw if r.get("fuente") not in ("1crm_productos", "1crm_proveedores")]
+
+    # Reconstruir lista limitando proveedores CRM para no desplazar fuentes con precio
+    resultados_filtrados = crm_productos + crm_proveedores + [
+        r for r in otros if r not in crm_proveedores
+    ]
 
     crm_seccion = ""
     if crm_productos:
@@ -464,9 +471,8 @@ def rankear_con_claude(
 ⚠️ CATÁLOGO INTERNO 1CRM — PRIORIDAD MÁXIMA:
 {json.dumps(crm_productos, ensure_ascii=False, indent=2)}
 
-REGLA OBLIGATORIA: Los resultados anteriores son del catálogo propio del cliente.
-DEBES incluir AL MENOS UNO en el Top 5, en el rank 1, con score_confianza=5.
-Aunque no tengan precio, su presencia en el catálogo interno es la señal más fuerte.
+REGLA: Incluye este resultado en rank 1 (score_confianza=5). Ocupa UN solo slot del Top 5.
+Los slots restantes deben llenarse con las mejores fuentes externas (preferir google_shopping con precio real).
 
 """
 
@@ -477,11 +483,11 @@ Modo: {"URGENTE" if urgente else "Normal"}
 Ponderación: {ponderacion}
 Tipo de cambio USD/MXN: {fx}
 
-{crm_seccion}OTROS RESULTADOS:
-{json.dumps(otros, ensure_ascii=False, indent=2)}
+{crm_seccion}RESULTADOS EXTERNOS (Google Shopping, Web, Proveedores CRM):
+{json.dumps([r for r in resultados_filtrados if r.get("fuente") != "1crm_productos"], ensure_ascii=False, indent=2)}
 
 Tu tarea:
-1. {f"OBLIGATORIO: incluye primero los {len(crm_productos)} resultado(s) del catálogo 1CRM (fuente=1crm_productos) en rank 1." if crm_productos else "Selecciona los mejores 5 resultados."}
+1. {f"Incluye el resultado de 1CRM catálogo en rank 1 (ocupa 1 slot). Completa los 4 slots restantes con los mejores resultados externos — prioriza google_shopping (tienen precio real)." if crm_productos else "Selecciona los mejores 5 resultados priorizando google_shopping (precio real)."}
 2. Completa el Top 5 con los mejores resultados restantes
 3. PRECIOS — regla estricta:
    - USA ÚNICAMENTE el precio que viene explícitamente en el campo "precio_orig" de cada resultado
