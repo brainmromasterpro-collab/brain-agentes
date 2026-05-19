@@ -71,25 +71,47 @@ def onecrm_get(endpoint: str, params: dict = {}) -> dict:
 # TIPO DE CAMBIO USD/MXN
 # ─────────────────────────────────────────
 def get_fx_usd_mxn() -> float:
-    """Obtiene tipo de cambio USD/MXN. Usa fixer.io si hay API key, si no usa Banxico."""
+    """Obtiene tipo de cambio USD/MXN.
+    Fuentes en orden de prioridad:
+    1. frankfurter.app (BCE, gratuito, sin API key)
+    2. Fixer.io (si hay FX_API_KEY configurada)
+    3. Hardcoded 17.50 como último recurso
+    """
+    # 1. frankfurter.app — gratuito, sin API key, datos del Banco Central Europeo
+    try:
+        resp = httpx.get(
+            "https://api.frankfurter.app/latest",
+            params={"from": "USD", "to": "MXN"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        rate = resp.json()["rates"]["MXN"]
+        log.info(f"FX USD/MXN via frankfurter.app: {rate}")
+        return float(rate)
+    except Exception as e:
+        log.warning(f"frankfurter.app falló: {e} — intentando siguiente fuente")
+
+    # 2. Fixer.io (requiere API key, base EUR en plan gratis)
     try:
         fx_key = os.environ.get("FX_API_KEY")
         if fx_key:
             resp = httpx.get(
-                f"http://data.fixer.io/api/latest",
-                params={"access_key": fx_key, "base": "USD", "symbols": "MXN"},
+                "http://data.fixer.io/api/latest",
+                params={"access_key": fx_key, "base": "EUR", "symbols": "USD,MXN"},
                 timeout=10,
             )
             data = resp.json()
-            return data["rates"]["MXN"]
-        else:
-            # Fallback: tipo de cambio aproximado hardcoded si no hay API
-            # TODO: conectar Banxico cuando se tenga acceso
-            log.warning("Sin FX_API_KEY, usando tipo de cambio aproximado 17.50")
-            return 17.50
+            usd = data["rates"]["USD"]
+            mxn = data["rates"]["MXN"]
+            rate = mxn / usd  # convertir EUR base a USD base
+            log.info(f"FX USD/MXN via fixer.io: {rate}")
+            return float(rate)
     except Exception as e:
-        log.warning(f"Error obteniendo FX: {e}, usando 17.50")
-        return 17.50
+        log.warning(f"Fixer.io falló: {e}")
+
+    # 3. Hardcoded como último recurso
+    log.warning("Todas las fuentes FX fallaron — usando tipo de cambio aproximado 17.50")
+    return 17.50
 
 
 # ─────────────────────────────────────────
@@ -327,48 +349,6 @@ def buscar_en_google(marca: str, modelo: str) -> list[dict]:
         return []
 
 
-# ─────────────────────────────────────────
-# BÚSQUEDA EN BRAVE
-# ─────────────────────────────────────────
-def buscar_en_brave(marca: str, modelo: str) -> list[dict]:
-    log.info(f"Buscando en Brave: {marca} {modelo}")
-    try:
-        api_key = os.environ.get("BRAVE_API_KEY", "").strip()
-        if not api_key:
-            log.warning("Sin BRAVE_API_KEY, saltando búsqueda Brave")
-            return []
-
-        query = f"{marca} {modelo} precio distribuidor México"
-        resp = httpx.get(
-            "https://api.search.brave.com/res/v1/web/search",
-            headers={"Accept": "application/json", "X-Subscription-Token": api_key},
-            params={"q": query, "count": 5, "country": "mx", "search_lang": "es"},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        items = resp.json().get("web", {}).get("results", [])
-
-        resultados = []
-        for item in items:
-            resultados.append({
-                "proveedor": item.get("meta_url", {}).get("hostname", ""),
-                "nombre_producto": item.get("title", f"{marca} {modelo}"),
-                "precio_orig": None,
-                "moneda": "USD",
-                "disponibilidad": "consultar",
-                "tiempo_entrega": "Ver sitio",
-                "condicion": "nuevo",
-                "fuente": "brave",
-                "url": item.get("url", ""),
-                "dist_autorizado": False,
-                "notas": item.get("description", ""),
-            })
-        log.info(f"Brave: {len(resultados)} resultados")
-        return resultados
-    except Exception as e:
-        log.error(f"Error búsqueda Brave: {e}")
-        return []
-
 
 # ─────────────────────────────────────────
 # CLAUDE — ANALIZA Y RANKEA TOP 5
@@ -596,11 +576,6 @@ def procesar_job(job: dict) -> None:
         resultados.extend(res_google)
         agregar_log_job(job_id, "busqueda_google", f"{len(res_google)} resultados")
 
-        agregar_log_job(job_id, "busqueda_brave", "Iniciando búsqueda en Brave")
-        res_brave = buscar_en_brave(marca, modelo)
-        resultados.extend(res_brave)
-        agregar_log_job(job_id, "busqueda_brave", f"{len(res_brave)} resultados")
-
         if not resultados:
             log.warning(f"Sin resultados en ninguna fuente para '{marca} {modelo}' — marcando sin_resultado")
             agregar_log_job(job_id, "sin_resultado", "Ninguna fuente devolvió resultados")
@@ -789,15 +764,7 @@ def main():
     else:
         log.warning("SERPAPI_KEY no configurada — búsqueda web desactivada")
 
-    brave_key = os.environ.get("BRAVE_API_KEY", "")
-    if brave_key:
-        log.info("Brave Search: OK")
-    else:
-        log.warning("BRAVE_API_KEY no configurada — búsqueda Brave desactivada")
-
-    fx_key = os.environ.get("FX_API_KEY", "")
-    if not fx_key:
-        log.warning("FX_API_KEY no configurada — se usará tipo de cambio aproximado 17.50")
+    log.info("FX: frankfurter.app (gratuito, sin API key) con fallback a 17.50")
 
     while True:
         try:
