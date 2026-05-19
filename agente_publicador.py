@@ -691,10 +691,9 @@ def resetear_jobs_huerfanos():
                     "started_at": None,
                     "error":      "Reseteado por reinicio del agente (redeploy)",
                 }).eq("id", job["id"]).execute()
-                supabase.table("rfqs").update({
-                    "estado": "foto_lista",
-                }).eq("id", job["rfq_id"]).execute()
-                log.info(f"  Job publicador {job['id']} reseteado")
+                # NO tocar el rfq — queda en 'publicando' para que el job
+                # recién reseteado lo retome sin mostrar el botón Publicar otra vez
+                log.info(f"  Job publicador {job['id']} reseteado a pendiente (rfq sin cambios)")
         else:
             log.info("Sin jobs huérfanos de publicador al arrancar")
     except Exception as e:
