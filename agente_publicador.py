@@ -623,12 +623,15 @@ def procesar_job_publicador(job: dict) -> None:
             "error":       str(e),
         }).eq("id", job_id).execute()
 
-        # Resetear rfq para que el gerente pueda reintentar publicar
+        # Marcar como fallido con mensaje — NO volver a foto_lista (causa loop infinito)
         try:
-            supabase.table("rfqs").update({"estado": "foto_lista"}).eq("id", rfq_uuid).execute()
-            log.info(f"RFQ {rfq_uuid} reseteado a 'foto_lista' tras fallo")
+            supabase.table("rfqs").update({
+                "estado":          "publicacion_fallida",
+                "publish_error":   str(e)[:500],
+            }).eq("id", rfq_uuid).execute()
+            log.info(f"RFQ {rfq_uuid} → publicacion_fallida tras error del publicador")
         except Exception as reset_err:
-            log.error(f"No se pudo resetear rfq {rfq_uuid}: {reset_err}")
+            log.error(f"No se pudo marcar rfq {rfq_uuid} como fallido: {reset_err}")
 
 
 # ─────────────────────────────────────────
