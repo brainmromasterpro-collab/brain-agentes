@@ -349,6 +349,86 @@ def buscar_en_google(marca: str, modelo: str) -> list[dict]:
         return []
 
 
+# ─────────────────────────────────────────
+# BÚSQUEDA EN GOOGLE SHOPPING (precios reales)
+# ─────────────────────────────────────────
+def buscar_en_google_shopping(marca: str, modelo: str) -> list[dict]:
+    """
+    Usa SerpAPI Google Shopping para obtener precios reales de vendedores.
+    A diferencia de la búsqueda web orgánica, Shopping devuelve
+    extracted_price (precio estructurado, no estimado).
+    """
+    log.info(f"Buscando en Google Shopping: {marca} {modelo}")
+    try:
+        api_key = os.environ.get("SERPAPI_KEY", "").strip()
+        if not api_key:
+            return []
+
+        query = f"{marca} {modelo}"
+        resp = httpx.get(
+            "https://serpapi.com/search.json",
+            params={
+                "engine":  "google_shopping",
+                "q":       query,
+                "api_key": api_key,
+                "hl":      "es",
+                "gl":      "mx",
+                "num":     10,
+            },
+            timeout=25,
+        )
+        resp.raise_for_status()
+        items = resp.json().get("shopping_results", [])
+
+        resultados = []
+        for item in items:
+            precio_raw = item.get("extracted_price")
+            if precio_raw is None:
+                # Intentar parsear el string de precio como fallback
+                price_str = item.get("price", "")
+                try:
+                    precio_raw = float(
+                        price_str.replace("$", "").replace(",", "").replace("MXN", "").strip()
+                    )
+                except (ValueError, AttributeError):
+                    precio_raw = None
+
+            # Detectar moneda: MX$ o MXN → MXN, resto → USD
+            currency_raw = item.get("currency", "")
+            price_str_raw = item.get("price", "")
+            if "MXN" in currency_raw or "MX$" in price_str_raw or "MXN" in price_str_raw:
+                moneda = "MXN"
+            else:
+                moneda = "USD"
+
+            proveedor = (
+                item.get("source")
+                or item.get("merchant", {}).get("name", "")
+                or (item.get("link", "").split("/")[2] if item.get("link", "").startswith("http") else "")
+            )
+
+            resultados.append({
+                "proveedor":       proveedor,
+                "nombre_producto": item.get("title", f"{marca} {modelo}"),
+                "precio_orig":     float(precio_raw) if precio_raw and float(precio_raw) > 0 else None,
+                "moneda":          moneda,
+                "disponibilidad":  "consultar",
+                "tiempo_entrega":  "Ver sitio",
+                "condicion":       "reacondicionado" if item.get("second_hand_condition") else "nuevo",
+                "fuente":          "google_shopping",
+                "url":             item.get("link", ""),
+                "dist_autorizado": False,
+                "notas":           item.get("snippet", ""),
+            })
+
+        con_precio = sum(1 for r in resultados if r["precio_orig"] is not None)
+        log.info(f"Google Shopping: {len(resultados)} resultados, {con_precio} con precio real")
+        return resultados
+
+    except Exception as e:
+        log.error(f"Error Google Shopping: {e}")
+        return []
+
 
 # ─────────────────────────────────────────
 # CLAUDE — ANALIZA Y RANKEA TOP 5
@@ -416,8 +496,9 @@ Tu tarea:
 6. Score de confianza (1-5):
    - 5: producto en catálogo interno 1CRM (fuente=1crm_productos) — API directa
    - 4: proveedor en 1CRM con historial (fuente=1crm_proveedores)
+   - 3: Google Shopping con precio real (fuente=google_shopping) — precio verificado del vendedor
    - 3: encontrado en website propio mromasterpro.com (fuente=sitio_propio) — visible pero NO confirmado en 1CRM
-   - 2: resultado Google con precio explícito y datos claros (fuente=web)
+   - 2: resultado Google web con datos claros (fuente=web)
    - 1: fuente no verificada o datos incompletos
 
 Responde SOLO con un JSON array con máximo 5 objetos, ordenados de mayor a menor score_ranking:
@@ -432,7 +513,7 @@ Responde SOLO con un JSON array con máximo 5 objetos, ordenados de mayor a meno
     "disponibilidad": "en_stock|dias_N|bajo_pedido|importacion",
     "tiempo_entrega": "texto",
     "condicion": "nuevo|reacondicionado|usado",
-    "fuente": "1crm_productos|1crm_proveedores|sitio_propio|web",
+    "fuente": "1crm_productos|1crm_proveedores|sitio_propio|google_shopping|web",
     "url": "https://...",
     "score_confianza": 1-5,
     "score_ranking": 0.00,
@@ -571,10 +652,16 @@ def procesar_job(job: dict) -> None:
         resultados.extend(res_proveedores)
         agregar_log_job(job_id, "busqueda_1crm_proveedores", f"{len(res_proveedores)} resultados")
 
-        agregar_log_job(job_id, "busqueda_google", "Iniciando búsqueda en Google")
+        agregar_log_job(job_id, "busqueda_google", "Iniciando búsqueda en Google Web")
         res_google = buscar_en_google(marca, modelo)
         resultados.extend(res_google)
         agregar_log_job(job_id, "busqueda_google", f"{len(res_google)} resultados")
+
+        agregar_log_job(job_id, "busqueda_shopping", "Iniciando búsqueda en Google Shopping")
+        res_shopping = buscar_en_google_shopping(marca, modelo)
+        resultados.extend(res_shopping)
+        con_precio_shopping = sum(1 for r in res_shopping if r.get("precio_orig"))
+        agregar_log_job(job_id, "busqueda_shopping", f"{len(res_shopping)} resultados, {con_precio_shopping} con precio real")
 
         if not resultados:
             log.warning(f"Sin resultados en ninguna fuente para '{marca} {modelo}' — marcando sin_resultado")
