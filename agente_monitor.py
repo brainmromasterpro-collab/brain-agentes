@@ -479,6 +479,49 @@ def check_github() -> None:
 
 
 # ─────────────────────────────────────────────────────────────
+# 8. 1CRM — productos y proveedores
+# ─────────────────────────────────────────────────────────────
+def check_1crm() -> None:
+    base = os.environ.get("ONECRM_URL", "").rstrip("/")
+    user = os.environ.get("ONECRM_USERNAME", "").strip()
+    pwd  = os.environ.get("ONECRM_PASSWORD",  "").strip()
+    if not base or not user or not pwd:
+        log.debug("1CRM: credenciales no configuradas, omitiendo")
+        return
+    try:
+        # Total de productos en catálogo
+        resp_prod = httpx.get(
+            f"{base}/api.php/data/Product",
+            auth=(user, pwd),
+            params={"limit": 1},
+            timeout=15,
+        )
+        resp_prod.raise_for_status()
+        total_productos = int(resp_prod.json().get("total_count", 0))
+
+        # Total de proveedores (cuentas tipo Supplier)
+        resp_prov = httpx.get(
+            f"{base}/api.php/data/Account",
+            auth=(user, pwd),
+            params={"filters[account_type]": "Supplier", "limit": 1},
+            timeout=15,
+        )
+        resp_prov.raise_for_status()
+        total_proveedores = int(resp_prov.json().get("total_count", 0))
+
+        upsert("1crm", "productos_total",
+               valor=total_productos, unidad="productos", estado="ok")
+        upsert("1crm", "proveedores_total",
+               valor=total_proveedores, unidad="proveedores", estado="ok")
+
+        log.info(f"1CRM: {total_productos} productos | {total_proveedores} proveedores")
+    except Exception as e:
+        log.error(f"1CRM check falló: {e}")
+        upsert("1crm", "productos_total", estado="critical",
+               valor_texto=f"Error: {str(e)[:80]}")
+
+
+# ─────────────────────────────────────────────────────────────
 # LOOP PRINCIPAL
 # ─────────────────────────────────────────────────────────────
 def run_all_checks() -> None:
@@ -490,6 +533,7 @@ def run_all_checks() -> None:
     check_supabase()
     check_railway()
     check_github()
+    check_1crm()
     log.info("✓ Monitor: chequeo completo")
 
 
