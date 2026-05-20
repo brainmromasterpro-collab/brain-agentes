@@ -80,16 +80,17 @@ def get_fx_usd_mxn() -> float:
     # 1. frankfurter.app — gratuito, sin API key, datos del Banco Central Europeo
     try:
         resp = httpx.get(
-            "https://api.frankfurter.app/latest",
+            "https://api.frankfurter.dev/v1/latest",
             params={"from": "USD", "to": "MXN"},
             timeout=10,
+            follow_redirects=True,
         )
         resp.raise_for_status()
         rate = resp.json()["rates"]["MXN"]
-        log.info(f"FX USD/MXN via frankfurter.app: {rate}")
+        log.info(f"FX USD/MXN via frankfurter.dev: {rate}")
         return float(rate)
     except Exception as e:
-        log.warning(f"frankfurter.app falló: {e} — intentando siguiente fuente")
+        log.warning(f"frankfurter.dev falló: {e} — intentando siguiente fuente")
 
     # 2. Fixer.io (requiere API key, base EUR en plan gratis)
     try:
@@ -857,7 +858,7 @@ def main():
     else:
         log.warning("SERPAPI_KEY no configurada — búsqueda web desactivada")
 
-    log.info("FX: frankfurter.app (gratuito, sin API key) con fallback a 17.50")
+    log.info("FX: frankfurter.dev/v1 (gratuito, sin API key) con fallback a 17.50")
 
     while True:
         try:
