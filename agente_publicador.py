@@ -626,8 +626,7 @@ def procesar_job_publicador(job: dict) -> None:
         # Marcar como fallido con mensaje — NO volver a foto_lista (causa loop infinito)
         try:
             supabase.table("rfqs").update({
-                "estado":          "publicacion_fallida",
-                "publish_error":   str(e)[:500],
+                "estado": "publicacion_fallida",
             }).eq("id", rfq_uuid).execute()
             log.info(f"RFQ {rfq_uuid} → publicacion_fallida tras error del publicador")
         except Exception as reset_err:
@@ -666,7 +665,6 @@ def resetear_rfqs_publicando():
                 log.warning(f"RFQ {rfq_id} atascado en 'publicando' sin job activo — marcando publicacion_fallida")
                 supabase.table("rfqs").update({
                     "estado": "publicacion_fallida",
-                    "publish_error": "Publicación interrumpida (redeploy del agente)",
                 }).eq("id", rfq_id).execute()
     except Exception as e:
         log.error(f"Error reseteando rfqs publicando: {e}")

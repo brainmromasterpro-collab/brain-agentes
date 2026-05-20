@@ -538,17 +538,34 @@ def resetear_jobs_huerfanos():
         )
         if huerfanos:
             log.warning(f"⚠ {len(huerfanos)} job(s) de imagen huérfanos — reseteando a pendiente")
+            # Estados donde tiene sentido retomar el procesamiento de imagen
+            ESTADOS_IMAGEN = {"busqueda_completa", "procesando_imagen"}
             for job in huerfanos:
                 supabase.table("jobs").update({
                     "estado":     "pendiente",
                     "started_at": None,
                     "error":      "Reseteado por reinicio del agente (redeploy)",
                 }).eq("id", job["id"]).execute()
-                # Asegurar que el rfq esté en procesando_imagen (no busqueda_completa)
-                supabase.table("rfqs").update({
-                    "estado": "procesando_imagen",
-                }).eq("id", job["rfq_id"]).execute()
-                log.info(f"  Job {job['id']} (rfq {job['rfq_id']}) reseteado a pendiente")
+
+                # Solo tocar el rfq si sigue en estado de imagen.
+                # Si ya avanzó a foto_lista / publicando / publicado / etc.,
+                # NO retroceder — causaría el loop publicar→foto_lista→publicar.
+                rfq_data = (
+                    supabase.table("rfqs")
+                    .select("estado")
+                    .eq("id", job["rfq_id"])
+                    .single()
+                    .execute()
+                    .data or {}
+                )
+                estado_actual = rfq_data.get("estado", "")
+                if estado_actual in ESTADOS_IMAGEN:
+                    supabase.table("rfqs").update({
+                        "estado": "procesando_imagen",
+                    }).eq("id", job["rfq_id"]).execute()
+                    log.info(f"  Job {job['id']} reseteado; rfq → procesando_imagen")
+                else:
+                    log.info(f"  Job {job['id']} reseteado; rfq queda en '{estado_actual}' (no retroceder)")
         else:
             log.info("Sin jobs huérfanos de imagen al arrancar")
     except Exception as e:
