@@ -19,6 +19,7 @@ if __name__ == "__main__":
     import agente_imagen
     import agente_publicador
     import agente_monitor
+    import agente_chat
 
     log.info("Iniciando Brain MRO Master Pro workers...")
 
@@ -26,14 +27,17 @@ if __name__ == "__main__":
     t2 = threading.Thread(target=agente_imagen.main,     name="imagen",     daemon=True)
     t3 = threading.Thread(target=agente_publicador.main, name="publicador", daemon=True)
     t4 = threading.Thread(target=agente_monitor.main,    name="monitor",    daemon=True)
+    t5 = threading.Thread(target=agente_chat.main,       name="chat",       daemon=True)
 
     t1.start()
     t2.start()
     t3.start()
     t4.start()
+    t5.start()
 
-    log.info("4 agentes corriendo: buscador, imagen, publicador, monitor. Esperando...")
+    log.info("5 agentes corriendo: buscador, imagen, publicador, monitor, chat. Esperando...")
     t1.join()
     t2.join()
     t3.join()
     t4.join()
+    t5.join()
