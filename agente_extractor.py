@@ -36,6 +36,7 @@ import httpx
 import anthropic
 from dotenv import load_dotenv
 from supabase import create_client, Client
+from config_agentes import get_config
 
 load_dotenv()
 logging.basicConfig(
@@ -96,9 +97,12 @@ def extraer_productos_con_claude(imagen_bytes: bytes, media_type: str) -> list[d
     """Usa Claude Vision para extraer lista de productos de una imagen."""
     imagen_b64 = base64.standard_b64encode(imagen_bytes).decode("utf-8")
 
+    cfg = get_config("lector")
+    extra = {"system": cfg["system_prompt"]} if cfg["system_prompt"] else {}
     resp = claude.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=4096,
+        model=cfg["model_id"],
+        max_tokens=cfg["max_tokens"],
+        temperature=cfg["temperature"],
         messages=[
             {
                 "role": "user",
@@ -115,6 +119,7 @@ def extraer_productos_con_claude(imagen_bytes: bytes, media_type: str) -> list[d
                 ],
             }
         ],
+        **extra,
     )
 
     raw = resp.content[0].text.strip()

@@ -31,6 +31,7 @@ from dotenv import load_dotenv
 import httpx
 import anthropic
 from supabase import create_client, Client
+from config_agentes import get_config
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -530,10 +531,14 @@ Responde SOLO con un JSON array con máximo 5 objetos, ordenados de mayor a meno
 
 No incluyas ningún texto fuera del JSON."""
 
+    cfg = get_config("buscador")
+    extra = {"system": cfg["system_prompt"]} if cfg["system_prompt"] else {}
     response = claude.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=2000,
+        model=cfg["model_id"],
+        max_tokens=cfg["max_tokens"],
+        temperature=cfg["temperature"],
         messages=[{"role": "user", "content": prompt}],
+        **extra,
     )
 
     text = response.content[0].text.strip()

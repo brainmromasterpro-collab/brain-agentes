@@ -34,6 +34,7 @@ from dotenv import load_dotenv
 import httpx
 import anthropic
 from supabase import create_client, Client
+from config_agentes import get_config
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -293,10 +294,14 @@ Devuelve SOLO este JSON (sin texto extra):
 }}"""
 
     try:
+        cfg = get_config("publicador")
+        extra = {"system": cfg["system_prompt"]} if cfg["system_prompt"] else {}
         response = claude.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=600,
+            model=cfg["model_id"],
+            max_tokens=cfg["max_tokens"],
+            temperature=cfg["temperature"],
             messages=[{"role": "user", "content": prompt}],
+            **extra,
         )
         text = response.content[0].text.strip().replace("```json", "").replace("```", "").strip()
         ficha = json.loads(text)

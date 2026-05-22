@@ -38,6 +38,7 @@ import httpx
 import anthropic
 from PIL import Image
 from supabase import create_client, Client
+from config_agentes import get_config
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -260,10 +261,14 @@ def evaluar_con_claude_vision(marca: str, modelo: str, candidatas: list[dict]) -
             content.append({"type": "text", "text": f"\n**Imagen {i}**: no se pudo incluir"})
 
     try:
+        cfg = get_config("imagen")
+        extra = {"system": cfg["system_prompt"]} if cfg["system_prompt"] else {}
         response = claude.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=800,
+            model=cfg["model_id"],
+            max_tokens=cfg["max_tokens"],
+            temperature=cfg["temperature"],
             messages=[{"role": "user", "content": content}],
+            **extra,
         )
         text = response.content[0].text.strip()
         text = text.replace("```json", "").replace("```", "").strip()
