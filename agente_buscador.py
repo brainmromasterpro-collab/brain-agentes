@@ -218,18 +218,31 @@ def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
 def buscar_en_crm_proveedores(marca: str, modelo: str) -> list[dict]:
     log.info(f"Buscando en 1CRM proveedores para: {marca}")
     try:
+        # Usar filter_text (no filters[name] — ese parámetro puede ser ignorado por la API)
         data = onecrm_get("data/Account", {
             "filters[account_type]": "Supplier",
-            "filters[name]": marca,
-            "limit": 10,
+            "filter_text": marca,
+            "limit": 20,
         })
         records = data.get("records", [])
+
+        # Validación client-side: el nombre del proveedor debe contener
+        # alguna palabra de la marca (evita devolver proveedores no relacionados)
+        palabras_marca = [p.lower() for p in marca.split() if len(p) >= 3]
+
         resultados = []
         for r in records:
+            nombre_proveedor = (r.get("name") or "").lower()
+
+            # Descartar si ninguna palabra de la marca aparece en el nombre del proveedor
+            if palabras_marca and not any(p in nombre_proveedor for p in palabras_marca):
+                log.debug(f"Proveedor descartado (sin relación con '{marca}'): {r.get('name')}")
+                continue
+
             resultados.append({
                 "proveedor": r.get("name"),
                 "nombre_producto": f"{marca} {modelo}",
-                "precio_orig": None,  # proveedores no tienen precio directo
+                "precio_orig": None,
                 "moneda": "USD",
                 "disponibilidad": "bajo_pedido",
                 "tiempo_entrega": "Consultar",
@@ -239,7 +252,8 @@ def buscar_en_crm_proveedores(marca: str, modelo: str) -> list[dict]:
                 "dist_autorizado": False,
                 "notas": f"Tel: {r.get('phone_office', '')}",
             })
-        log.info(f"1CRM proveedores: {len(resultados)} resultados")
+
+        log.info(f"1CRM proveedores: {len(resultados)} válidos de {len(records)} registros")
         return resultados
     except Exception as e:
         log.error(f"Error búsqueda 1CRM proveedores: {e}")
@@ -286,13 +300,13 @@ def buscar_en_sitio_propio(marca: str, modelo: str) -> list[dict]:
                 "nombre_producto": item.get("title", f"{marca} {modelo}"),
                 "precio_orig":     None,
                 "moneda":          "USD",
-                "disponibilidad":  "en_stock",
-                "tiempo_entrega":  "Inmediato",
+                "disponibilidad":  "consultar",        # ← aparece en web pero NO confirma stock ni 1CRM
+                "tiempo_entrega":  "Verificar en sitio",
                 "condicion":       "nuevo",
-                "fuente":          "sitio_propio",     # ← en nuestro website, pero NO confirma 1CRM
+                "fuente":          "sitio_propio",
                 "url":             url,
-                "dist_autorizado": True,
-                "notas":           item.get("snippet", ""),
+                "dist_autorizado": False,              # ← no confirmado hasta verificar en 1CRM
+                "notas":           f"[VERIFICAR en 1CRM] {item.get('snippet', '')}",
             })
         if resultados:
             log.info(f"Sitio propio: {len(resultados)} resultado(s) en website (verificar si está en 1CRM)")
@@ -433,6 +447,66 @@ def buscar_en_google_shopping(marca: str, modelo: str) -> list[dict]:
 
 
 # ─────────────────────────────────────────
+# FILTRO DE CALIDAD — RESULTADOS WEB
+# ─────────────────────────────────────────
+_SNIPPETS_BASURA = [
+    "página", "pagina", "page", "resultados de búsqueda",
+    "search results", "inicio", "home", "categoría", "categoria",
+    "directorio", "listado de", "todos los productos",
+]
+
+_DOMINIOS_BASURA = [
+    "facebook.com", "instagram.com", "twitter.com", "youtube.com",
+    "linkedin.com", "pinterest.com", "reddit.com", "wikipedia.org",
+    "slideshare.net", "scribd.com",
+]
+
+
+def _filtrar_resultados_web(resultados: list[dict], modelo: str) -> list[dict]:
+    """
+    Descarta resultados web orgánicos de baja calidad antes de rankear.
+    Nunca descarta fuentes confiables (1crm_productos, 1crm_proveedores, google_shopping).
+    """
+    norm_modelo = re.sub(r'[\s\-\./]', '', modelo).lower()
+    limpios = []
+
+    for r in resultados:
+        fuente = r.get("fuente", "")
+
+        # Fuentes confiables: pasan siempre sin filtro
+        if fuente in ("1crm_productos", "1crm_proveedores", "google_shopping"):
+            limpios.append(r)
+            continue
+
+        url     = (r.get("url") or "").lower()
+        snippet = (r.get("notas") or r.get("nombre_producto") or "").lower()
+        nombre  = (r.get("nombre_producto") or "").lower()
+
+        # Descartar dominios sociales / sin catálogo
+        if any(dom in url for dom in _DOMINIOS_BASURA):
+            log.debug(f"Descartado (dominio basura): {url[:80]}")
+            continue
+
+        # Descartar páginas de paginación / categoría genérica
+        if any(palabra in snippet for palabra in _SNIPPETS_BASURA):
+            log.debug(f"Descartado (snippet basura): {snippet[:80]}")
+            continue
+
+        # Para fuentes web y sitio_propio: exigir que el número de parte
+        # aparezca en el título o snippet (mínimo 5 chars normalizados)
+        if fuente in ("web", "sitio_propio") and len(norm_modelo) >= 5:
+            norm_nombre  = re.sub(r'[\s\-\./]', '', nombre).lower()
+            norm_snippet = re.sub(r'[\s\-\./]', '', snippet).lower()
+            if norm_modelo not in norm_nombre and norm_modelo not in norm_snippet:
+                log.debug(f"Descartado (modelo ausente en título/snippet): '{nombre[:60]}'")
+                continue
+
+        limpios.append(r)
+
+    return limpios
+
+
+# ─────────────────────────────────────────
 # CLAUDE — ANALIZA Y RANKEA TOP 5
 # ─────────────────────────────────────────
 def rankear_con_claude(
@@ -488,24 +562,36 @@ Tipo de cambio USD/MXN: {fx}
 {crm_seccion}RESULTADOS EXTERNOS (Google Shopping, Web, Proveedores CRM):
 {json.dumps([r for r in resultados_filtrados if r.get("fuente") != "1crm_productos"], ensure_ascii=False, indent=2)}
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+REGLAS ABSOLUTAS — VIOLACIÓN = RESULTADO INVÁLIDO
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+A. SOLO puedes incluir en el ranking resultados que estén LITERALMENTE en la lista de arriba.
+   Nunca inventes, combines ni crees resultados que no existan en los datos recibidos.
+
+B. DISPONIBILIDAD — únicamente usa "en_stock" si la fuente es "1crm_productos" (catálogo interno confirmado).
+   Para todas las demás fuentes (web, sitio_propio, google_shopping, 1crm_proveedores):
+   usa "consultar" a menos que el resultado traiga explícitamente un dato de stock verificado.
+
+C. PRECIOS — usa ÚNICAMENTE el valor del campo "precio_orig".
+   Si precio_orig es null, 0 o ausente → devuelve precio_orig=null, precio_mxn=null.
+   Nunca extraigas ni estimes precios de snippets, títulos o descripciones.
+
+D. Si hay pocos resultados de calidad, devuelve menos de 5. Prefiere 2 resultados reales
+   a 5 resultados donde los últimos 3 sean inventados o de baja calidad.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
 Tu tarea:
-1. {f"Incluye el resultado de 1CRM catálogo en rank 1 (ocupa 1 slot). Completa los 4 slots restantes con los mejores resultados externos — prioriza google_shopping (tienen precio real)." if crm_productos else "Selecciona los mejores 5 resultados priorizando google_shopping (precio real)."}
-2. Completa el Top 5 con los mejores resultados restantes
-3. PRECIOS — regla estricta:
-   - USA ÚNICAMENTE el precio que viene explícitamente en el campo "precio_orig" de cada resultado
-   - Si precio_orig es null, 0 o no existe: devuelve precio_orig=null y precio_mxn=null (NO inventes ni estimes precios)
-   - Si precio_orig tiene un valor real > 0: precio_mxn = precio_orig * {fx} (tipo de cambio)
-   - Nunca extraigas precios de snippets, títulos o descripciones
-4. Verifica si es distribuidor autorizado de {marca} (indicios en nombre o URL)
-5. Calcula el score de ranking:
+1. {f"Incluye el resultado de 1CRM catálogo en rank 1 (ocupa 1 slot). Completa los slots restantes con los mejores resultados externos — prioriza google_shopping (tienen precio real)." if crm_productos else "Selecciona los mejores resultados priorizando google_shopping (precio real)."}
+2. Completa el Top 5 solo si hay resultados válidos suficientes
+3. Calcula el score de ranking:
    - Si hay precios reales: el más barato = 100 puntos, los demás proporcional. Sin precio = 50 puntos base
    - Disponibilidad: en_stock=100, 1-5días=75, 1-2semanas=50, bajo_pedido=25, importación=10, consultar=30
    - Score final = (precio_pts * {0.3 if urgente else 0.6}) + (disponibilidad_pts * {0.7 if urgente else 0.4})
-6. Score de confianza (1-5):
-   - 5: producto en catálogo interno 1CRM (fuente=1crm_productos) — API directa
+4. Score de confianza (1-5):
+   - 5: producto en catálogo interno 1CRM (fuente=1crm_productos) — API directa, dato real
    - 4: proveedor en 1CRM con historial (fuente=1crm_proveedores)
-   - 3: Google Shopping con precio real (fuente=google_shopping) — precio verificado del vendedor
-   - 3: encontrado en website propio mromasterpro.com (fuente=sitio_propio) — visible pero NO confirmado en 1CRM
+   - 3: Google Shopping con precio real (fuente=google_shopping)
+   - 2: encontrado en website propio (fuente=sitio_propio) — visible en web, NO confirmado en 1CRM
    - 2: resultado Google web con datos claros (fuente=web)
    - 1: fuente no verificada o datos incompletos
 
@@ -515,17 +601,17 @@ Responde SOLO con un JSON array con máximo 5 objetos, ordenados de mayor a meno
     "rank": 1,
     "proveedor": "nombre",
     "dist_autorizado": true/false,
-    "precio_orig": 0.00,
+    "precio_orig": null,
     "moneda": "USD",
-    "precio_mxn": 0.00,
-    "disponibilidad": "en_stock|dias_N|bajo_pedido|importacion",
-    "tiempo_entrega": "texto",
+    "precio_mxn": null,
+    "disponibilidad": "en_stock|consultar|bajo_pedido|importacion|dias_N",
+    "tiempo_entrega": "texto del resultado original, no inventado",
     "condicion": "nuevo|reacondicionado|usado",
     "fuente": "1crm_productos|1crm_proveedores|sitio_propio|google_shopping|web",
-    "url": "https://...",
-    "score_confianza": 1-5,
+    "url": "url exacta del resultado original",
+    "score_confianza": 1,
     "score_ranking": 0.00,
-    "notas": "observaciones — si sin precio, indica 'Precio no disponible, consultar sitio'"
+    "notas": "si sin precio → 'Precio no disponible, consultar sitio'. si sitio_propio → 'Verificar disponibilidad real en 1CRM'"
   }}
 ]
 
@@ -693,9 +779,16 @@ def procesar_job(job: dict) -> None:
             log.info(f"Job {job_id} cerrado como sin_resultado — notificador encolado")
             return
 
+        # Filtrar resultados web basura antes de rankear
+        resultados_limpios = _filtrar_resultados_web(resultados, modelo)
+        descartados = len(resultados) - len(resultados_limpios)
+        if descartados:
+            log.info(f"Filtro web: {descartados} resultado(s) descartado(s) por baja calidad")
+            agregar_log_job(job_id, "filtro_web", f"{descartados} resultados descartados, {len(resultados_limpios)} pasan al ranking")
+
         # Claude rankea
-        agregar_log_job(job_id, "ranking", f"Claude rankeando {len(resultados)} resultados")
-        top5 = rankear_con_claude(marca, modelo, urgente, resultados, fx)
+        agregar_log_job(job_id, "ranking", f"Claude rankeando {len(resultados_limpios)} resultados")
+        top5 = rankear_con_claude(marca, modelo, urgente, resultados_limpios, fx)
 
         if not top5:
             log.warning(f"Claude no generó ranking para '{marca} {modelo}' — marcando sin_resultado")
