@@ -290,7 +290,11 @@ def buscar_en_sitio_propio(marca: str, modelo: str) -> list[dict]:
             timeout=20,
         )
         resp.raise_for_status()
-        items = resp.json().get("organic_results", [])
+        data = resp.json()
+        if "error" in data:
+            log.error(f"SerpAPI sitio_propio error: {data['error']}")
+            return []
+        items = data.get("organic_results", [])
 
         resultados = []
         for item in items:
@@ -336,7 +340,11 @@ def buscar_en_google(marca: str, modelo: str) -> list[dict]:
             timeout=20,
         )
         resp.raise_for_status()
-        items = resp.json().get("organic_results", [])
+        data = resp.json()
+        if "error" in data:
+            log.error(f"SerpAPI google_web error: {data['error']}")
+            return []
+        items = data.get("organic_results", [])
 
         resultados = []
         for item in items:
@@ -394,7 +402,11 @@ def buscar_en_google_shopping(marca: str, modelo: str) -> list[dict]:
             timeout=25,
         )
         resp.raise_for_status()
-        items = resp.json().get("shopping_results", [])
+        data = resp.json()
+        if "error" in data:
+            log.error(f"SerpAPI google_shopping error: {data['error']}")
+            return []
+        items = data.get("shopping_results", [])
 
         resultados = []
         for item in items:
