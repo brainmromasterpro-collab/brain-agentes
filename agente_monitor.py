@@ -538,7 +538,9 @@ def run_all_checks() -> None:
 
 
 def main() -> None:
-    log.info("Agente Monitor iniciado — intervalo: %ds", MONITOR_INTERVAL)
+    log.info("Agente Monitor iniciado — primer chequeo en 120s, luego cada %ds", MONITOR_INTERVAL)
+    # Esperar 2 minutos antes del primer chequeo para no saturar Railway al arrancar
+    time.sleep(120)
     while True:
         try:
             run_all_checks()
