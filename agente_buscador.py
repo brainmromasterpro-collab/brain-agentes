@@ -334,10 +334,12 @@ def buscar_en_google(marca: str, modelo: str) -> list[dict]:
             log.warning("Sin SERPAPI_KEY, saltando búsqueda web")
             return []
 
-        query = f"{marca} {modelo} precio distribuidor México"
+        # Buscar sin filtro de región — los catálogos industriales son en inglés/global
+        # "precio distribuidor México" + gl=mx devuelve sitios genéricos sin catálogo
+        query = f"{marca} {modelo}".strip() if marca else modelo
         resp = httpx.get(
             "https://serpapi.com/search.json",
-            params={"q": query, "api_key": api_key, "engine": "google", "num": 5, "gl": "mx", "hl": "es"},
+            params={"q": query, "api_key": api_key, "engine": "google", "num": 10},
             timeout=20,
         )
         resp.raise_for_status()
