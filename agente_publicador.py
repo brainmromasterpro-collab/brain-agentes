@@ -676,18 +676,31 @@ def procesar_job_publicador(job: dict) -> None:
         }).eq("id", rfq_uuid).execute()
 
         # ── Notificar ────────────────────────────────────────────────────
-        crm_url = f"{ONECRM_BASE}/index.php?module=ProductCatalog&record={product_id}"
+        crm_url  = f"{ONECRM_BASE}/index.php?module=ProductCatalog&record={product_id}"
         edit_url = f"{ONECRM_BASE}/index.php?module=AOS_Products&action=EditView&record={product_id}"
-        supabase.table("notificaciones").insert({
-            "tipo":      "producto_publicado",
-            "titulo":    f"Publicado en 1CRM — {marca} {modelo}",
-            "mensaje":   (
-                f"Producto creado en 1CRM.\n"
-                f"Imagen: {'✓ subida' if imagen_subida else '⚠ pendiente (subir manualmente)'}\n"
+
+        if imagen_subida:
+            titulo  = f"✅ Publicado con imagen — {marca} {modelo}"
+            mensaje = (
+                f"Producto creado en 1CRM con imagen.\n"
                 f"Ver producto: {crm_url}"
-            ),
-            "rfq_id":    rfq_uuid,
-            "leida":     False,
+            )
+            tipo = "producto_publicado"
+        else:
+            titulo  = f"⚠️ Publicado SIN imagen — {marca} {modelo}"
+            mensaje = (
+                f"Producto publicado en 1CRM, pero sin imagen.\n"
+                f"Cuando consigas la foto, súbela desde el EditView:\n"
+                f"{edit_url}"
+            )
+            tipo = "producto_publicado_sin_imagen"
+
+        supabase.table("notificaciones").insert({
+            "tipo":    tipo,
+            "titulo":  titulo,
+            "mensaje": mensaje,
+            "rfq_id":  rfq_uuid,
+            "leida":   False,
         }).execute()
 
         # ── Cerrar job ───────────────────────────────────────────────────
@@ -697,8 +710,10 @@ def procesar_job_publicador(job: dict) -> None:
             "output": {
                 "crm_product_id": product_id,
                 "crm_url":        crm_url,
+                "edit_url":       edit_url,
                 "imagen_subida":  imagen_subida,
                 "nombre":         ficha["nombre"],
+                "sin_imagen":     not imagen_subida and not bool(foto_url),
             },
         }).eq("id", job_id).execute()
 

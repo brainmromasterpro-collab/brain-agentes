@@ -391,6 +391,45 @@ def subir_a_storage(imagen_bytes: bytes, rfq_id: str, marca: str, modelo: str) -
 
 
 # ─────────────────────────────────────────
+# AUTO-PUBLICAR SIN IMAGEN
+# ─────────────────────────────────────────
+def _auto_publicar_sin_imagen(rfq_uuid: str, marca: str, modelo: str, motivo: str) -> None:
+    """
+    Cuando no se puede obtener una imagen aceptable (ni por Vision ni por error),
+    crea automáticamente un job de publicador para que el producto llegue a 1CRM
+    sin imagen. El gerente recibirá una notificación específica con el enlace de
+    edición para subir la foto manualmente cuando la consiga.
+    """
+    # 1. Crear job de publicador
+    nuevo_job = supabase.table("jobs").insert({
+        "agente":     "publicador",
+        "rfq_id":     rfq_uuid,
+        "estado":     "pendiente",
+        "created_at": datetime.utcnow().isoformat(),
+    }).execute()
+    job_id_pub = (nuevo_job.data or [{}])[0].get("id", "?")
+    log.info(f"Job publicador creado automáticamente: {job_id_pub} (sin imagen)")
+
+    # 2. Actualizar estado del RFQ a 'publicando' (igual que si el gerente lo aprobara)
+    supabase.table("rfqs").update({"estado": "publicando"}).eq("id", rfq_uuid).execute()
+
+    # 3. Notificación específica al gerente
+    supabase.table("notificaciones").insert({
+        "tipo":    "publicando_sin_imagen",
+        "titulo":  f"Sin imagen — publicando igual — {marca} {modelo}",
+        "mensaje": (
+            f"No se encontró una imagen limpia para {marca} {modelo}.\n"
+            f"Motivo: {motivo}\n\n"
+            f"El producto se publicará automáticamente en 1CRM sin imagen. "
+            f"Cuando consigas la foto, súbela desde el EditView del producto en 1CRM."
+        ),
+        "rfq_id":  rfq_uuid,
+        "leida":   False,
+    }).execute()
+    log.info(f"Notificación 'publicando_sin_imagen' enviada para rfq {rfq_uuid}")
+
+
+# ─────────────────────────────────────────
 # PROCESADOR PRINCIPAL
 # ─────────────────────────────────────────
 def procesar_job_imagen(job: dict) -> None:
@@ -425,23 +464,16 @@ def procesar_job_imagen(job: dict) -> None:
         mejor_idx = evaluar_con_claude_vision(marca, modelo, candidatas)
 
         if mejor_idx is None:
-            # Ninguna imagen aceptable → estado foto_pendiente
-            log.warning("Claude Vision: ninguna imagen aceptable → foto_pendiente")
-            supabase.table("rfqs").update({"estado": "foto_pendiente"}).eq("id", rfq_uuid).execute()
-            supabase.table("notificaciones").insert({
-                "tipo":      "foto_pendiente",
-                "titulo":    f"Foto requerida — {marca} {modelo}",
-                "mensaje":   (
-                    f"Claude revisó {len(candidatas)} imágenes y ninguna es aceptable "
-                    f"para {marca} {modelo}. Sube la foto manualmente desde Bolt."
-                ),
-                "rfq_id":    rfq_uuid,
-                "leida":     False,
-            }).execute()
+            # Ninguna imagen aceptable → publicar sin imagen de forma automática
+            log.warning("Claude Vision: ninguna imagen aceptable → publicando sin imagen")
+            _auto_publicar_sin_imagen(
+                rfq_uuid, marca, modelo,
+                motivo=f"Claude revisó {len(candidatas)} imagen(es) y ninguna es aceptable (logos, filigranas o baja calidad).",
+            )
             supabase.table("jobs").update({
-                "estado": "foto_pendiente",
+                "estado":      "sin_imagen",
                 "finished_at": datetime.utcnow().isoformat(),
-                "output": {"resultado": "foto_pendiente", "candidatas": len(candidatas)},
+                "output":      {"resultado": "sin_imagen", "candidatas": len(candidatas)},
             }).eq("id", job_id).execute()
             return
 
@@ -495,28 +527,16 @@ def procesar_job_imagen(job: dict) -> None:
             "error":       str(e),
         }).eq("id", job_id).execute()
 
-        # ── IMPORTANTE: poner rfq.estado = 'foto_pendiente' para que el UI muestre ──
-        # el widget de reintento / upload manual. NO usar 'busqueda_completa' porque
-        # el polling del frontend busca 'foto_pendiente' para mostrar el widget correcto.
+        # En lugar de bloquear el flujo, publicar automáticamente sin imagen
+        # para que el producto llegue a 1CRM y el gerente solo tenga que subir la foto.
         try:
-            supabase.table("rfqs").update({
-                "estado": "foto_pendiente",   # UI detecta esto y muestra retry / upload manual
-            }).eq("id", rfq_uuid).execute()
-
-            supabase.table("notificaciones").insert({
-                "tipo":      "imagen_fallida",
-                "titulo":    f"Error procesando imagen — revisar",
-                "mensaje":   (
-                    f"El agente de imágenes no pudo obtener una foto válida.\n"
-                    f"Error: {str(e)}\n"
-                    f"Puedes subir una foto manualmente o intentar publicar de nuevo."
-                ),
-                "rfq_id":    rfq_uuid,
-                "leida":     False,
-            }).execute()
-            log.info(f"RFQ {rfq_uuid} → foto_pendiente tras fallo de imagen")
+            _auto_publicar_sin_imagen(
+                rfq_uuid, marca, modelo,
+                motivo=f"Error en agente de imágenes: {str(e)[:200]}",
+            )
+            log.info(f"RFQ {rfq_uuid} → publicando sin imagen tras fallo de imagen")
         except Exception as e2:
-            log.error(f"Error reseteando rfq tras fallo: {e2}")
+            log.error(f"Error al auto-publicar sin imagen: {e2}")
 
 
 # ─────────────────────────────────────────
