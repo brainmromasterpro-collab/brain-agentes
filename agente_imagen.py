@@ -230,13 +230,20 @@ def evaluar_con_claude_vision(marca: str, modelo: str, candidatas: list[dict]) -
     content.append({
         "type": "text",
         "text": (
-            f"Eres un especialista en catálogos de productos industriales.\n\n"
+            f"Eres un especialista en catálogos de productos industriales MRO.\n\n"
             f"Evalúa estas {len(candidatas)} imágenes para el producto: **{marca} {modelo}**\n\n"
-            f"Criterios de aceptación:\n"
-            f"1. ¿Muestra el producto correcto ({marca} {modelo})?\n"
-            f"2. ¿Solo el producto, sin personas ni contexto de ambiente?\n"
-            f"3. ¿Resolución suficiente (ya filtrado ≥200px, pero ¿se ve nítida)?\n"
-            f"4. ¿Ángulo frontal o 3/4 (no trasero ni lateral extremo)?\n\n"
+            f"ACEPTA la imagen si:\n"
+            f"- Se ve claramente el producto o un producto del mismo tipo/familia\n"
+            f"- No tiene texto de marca de agua grande que tape el producto\n"
+            f"- No es solo un logo, icono o imagen de 'producto no disponible'\n"
+            f"- El producto es reconocible (fondo blanco, catálogo, foto técnica — todos OK)\n\n"
+            f"RECHAZA solo si:\n"
+            f"- Es un logo, ícono o placeholder (no muestra el producto real)\n"
+            f"- Tiene una filigrana/watermark que cubre más del 30% del producto\n"
+            f"- Es completamente irrelevante (muestra algo totalmente distinto)\n\n"
+            f"IMPORTANTE: Para piezas industriales (fittings, cables, transmisores, válvulas, etc.) "
+            f"las fotos de catálogo con fondo de color, varias piezas juntas, o en contexto de instalación "
+            f"son PERFECTAMENTE aceptables. Sé generoso — prefiere ACEPTA ante la duda.\n\n"
             f"Responde SOLO con este JSON:\n"
             f'{{"evaluaciones":[{{"indice":0,"decision":"ACEPTA|RECHAZA","razon":"breve"}},...], '
             f'"mejor_indice":0,"resumen":"texto breve"}}\n'
