@@ -512,16 +512,15 @@ def subir_imagen_a_crm(product_id: str, foto_url: str) -> bool:
 
     log.info(f"Subiendo imagen a 1CRM para producto {product_id}")
 
-    # ── Descargar imagen a archivo temporal ─────────────────────────────
+    # ── Descargar imagen a archivo temporal con nombre limpio ────────────
     try:
         img_resp = httpx.get(foto_url, timeout=30, follow_redirects=True)
         img_resp.raise_for_status()
         suffix = ".png" if "png" in foto_url.lower() else ".jpg"
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-        tmp.write(img_resp.content)
-        tmp.flush()
-        tmp.close()
-        img_path = tmp.name
+        # Usar nombre de archivo limpio basado en el product_id (evita tmp{random})
+        tmp_dir = pathlib.Path(tempfile.gettempdir())
+        img_path = str(tmp_dir / f"1crm_img_{product_id[:8]}{suffix}")
+        pathlib.Path(img_path).write_bytes(img_resp.content)
         log.info(f"Imagen descargada: {len(img_resp.content)} bytes → {img_path}")
     except Exception as e:
         log.error(f"Error descargando imagen de Supabase: {e}")
