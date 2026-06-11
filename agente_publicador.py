@@ -27,6 +27,7 @@ Variables de entorno (mismas que agente_buscador):
 import os
 import time
 import json
+import base64
 import logging
 from datetime import datetime
 from dotenv import load_dotenv
@@ -507,22 +508,31 @@ def subir_imagen_a_crm(product_id: str, foto_url: str) -> bool:
     """
     log.info(f"Subiendo imagen a 1CRM para producto {product_id}")
 
-    # Estrategia 1: PATCH con campo picture (URL)
-    try:
-        mod = discover_product_module()
-        onecrm_patch(f"data/{mod}/{product_id}", {"picture": foto_url})
-        log.info("Imagen vinculada via PATCH picture OK")
-        return True
-    except Exception as e:
-        log.warning(f"PATCH picture falló: {e} — intentando upload multipart")
-
-    # Estrategia 2: Upload multipart via /files
+    # Descargar imagen de Supabase Storage
     try:
         img_resp = httpx.get(foto_url, timeout=20)
         img_resp.raise_for_status()
         img_bytes = img_resp.content
+        log.info(f"Imagen descargada: {len(img_bytes)} bytes")
+    except Exception as e:
+        log.error(f"Error descargando imagen: {e}")
+        return False
 
-        mod = discover_product_module()
+    mod = discover_product_module()
+
+    # Estrategia 1: PATCH con picture en base64 (formato que espera 1CRM)
+    try:
+        b64 = base64.b64encode(img_bytes).decode("utf-8")
+        onecrm_patch(f"data/{mod}/{product_id}", {
+            "picture": f"data:image/png;base64,{b64}"
+        })
+        log.info("Imagen subida via PATCH base64 OK")
+        return True
+    except Exception as e:
+        log.warning(f"PATCH base64 falló: {e} — intentando upload multipart")
+
+    # Estrategia 2: Upload multipart via /files
+    try:
         resp = httpx.post(
             f"{ONECRM_BASE}/api.php/files",
             auth=(os.environ["ONECRM_USERNAME"], os.environ["ONECRM_PASSWORD"]),
@@ -535,7 +545,7 @@ def subir_imagen_a_crm(product_id: str, foto_url: str) -> bool:
             timeout=30,
         )
         if resp.status_code in (200, 201):
-            log.info("Imagen subida via /files OK")
+            log.info(f"Imagen subida via /files OK: {resp.text[:100]}")
             return True
         log.warning(f"Upload /files devolvió {resp.status_code}: {resp.text[:200]}")
         return False
