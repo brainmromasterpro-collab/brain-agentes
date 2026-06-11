@@ -159,7 +159,8 @@ def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
 
         # Estrategias: variantes del modelo + búsqueda por marca (filtrado client-side)
         busquedas = [{"filter_text": v, "limit": 20} for v in variantes]
-        busquedas.append({"filter_text": marca, "limit": 50})  # todos los productos de la marca
+        if marca:  # solo buscar por marca si es una marca real (no placeholder)
+            busquedas.append({"filter_text": marca, "limit": 50})
 
         vistos = set()
         resultados = []
@@ -728,11 +729,20 @@ def procesar_job(job: dict) -> None:
         # Obtener datos del RFQ
         rfq_resp = supabase.table("rfqs").select("*").eq("id", rfq_uuid).single().execute()
         rfq = rfq_resp.data
-        marca = rfq["marca"].strip().title()
+        marca_raw = (rfq["marca"] or "").strip()
         modelo = rfq["modelo"].strip()
         urgente = rfq.get("urgente", False)
 
-        agregar_log_job(job_id, "inicio", f"Buscando: {marca} {modelo} | urgente={urgente}")
+        # Normalizar placeholders de marca — "(Detectar)", "Detectar", "N/A", etc.
+        _MARCAS_PLACEHOLDER = {"detectar", "auto", "n/a", "na", "desconocido", "unknown", ""}
+        marca_norm = re.sub(r'[^\w]', '', marca_raw).lower()
+        if marca_norm in _MARCAS_PLACEHOLDER:
+            marca = ""
+            log.info(f"Marca placeholder '{marca_raw}' — buscando solo por modelo: {modelo}")
+        else:
+            marca = marca_raw.title()
+
+        agregar_log_job(job_id, "inicio", f"Buscando: '{marca}' '{modelo}' | urgente={urgente}")
 
         # Obtener tipo de cambio
         fx = get_fx_usd_mxn()
