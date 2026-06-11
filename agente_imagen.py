@@ -436,7 +436,6 @@ def procesar_job_imagen(job: dict) -> None:
                     f"para {marca} {modelo}. Sube la foto manualmente desde Bolt."
                 ),
                 "rfq_id":    rfq_uuid,
-                "stream_id": rfq.get("stream_id"),
                 "leida":     False,
             }).execute()
             supabase.table("jobs").update({
@@ -472,7 +471,6 @@ def procesar_job_imagen(job: dict) -> None:
             "titulo":    f"Foto lista — {marca} {modelo}",
             "mensaje":   "Imagen procesada (500×500, fondo blanco) y lista para publicar en 1CRM.",
             "rfq_id":    rfq_uuid,
-            "stream_id": rfq.get("stream_id"),
             "leida":     False,
         }).execute()
 
@@ -505,7 +503,6 @@ def procesar_job_imagen(job: dict) -> None:
                 "estado": "foto_pendiente",   # UI detecta esto y muestra retry / upload manual
             }).eq("id", rfq_uuid).execute()
 
-            rfq_stream = supabase.table("rfqs").select("stream_id").eq("id", rfq_uuid).single().execute().data or {}
             supabase.table("notificaciones").insert({
                 "tipo":      "imagen_fallida",
                 "titulo":    f"Error procesando imagen — revisar",
@@ -515,7 +512,6 @@ def procesar_job_imagen(job: dict) -> None:
                     f"Puedes subir una foto manualmente o intentar publicar de nuevo."
                 ),
                 "rfq_id":    rfq_uuid,
-                "stream_id": rfq_stream.get("stream_id"),
                 "leida":     False,
             }).execute()
             log.info(f"RFQ {rfq_uuid} → foto_pendiente tras fallo de imagen")
