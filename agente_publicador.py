@@ -602,7 +602,6 @@ def procesar_job_publicador(job: dict) -> None:
                 f"Ver en 1CRM: {crm_url}"
             ),
             "rfq_id":    rfq_uuid,
-            "stream_id": rfq.get("stream_id"),
             "leida":     False,
         }).execute()
 
