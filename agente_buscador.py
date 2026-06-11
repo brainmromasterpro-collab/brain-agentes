@@ -733,10 +733,12 @@ def procesar_job(job: dict) -> None:
         modelo = rfq["modelo"].strip()
         urgente = rfq.get("urgente", False)
 
-        # Normalizar placeholders de marca — "(Detectar)", "Detectar", "N/A", etc.
+        # Normalizar placeholders de marca — "(Detectar)", "(Archivo Adjunto)", "N/A", etc.
+        # Cualquier valor entre paréntesis o en la lista explícita se trata como placeholder
         _MARCAS_PLACEHOLDER = {"detectar", "auto", "n/a", "na", "desconocido", "unknown", ""}
         marca_norm = re.sub(r'[^\w]', '', marca_raw).lower()
-        if marca_norm in _MARCAS_PLACEHOLDER:
+        es_parentesis = bool(re.match(r'^\(.*\)$', marca_raw.strip()))
+        if marca_norm in _MARCAS_PLACEHOLDER or es_parentesis:
             marca = ""
             log.info(f"Marca placeholder '{marca_raw}' — buscando solo por modelo: {modelo}")
         else:
