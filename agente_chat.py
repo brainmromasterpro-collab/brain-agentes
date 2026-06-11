@@ -483,25 +483,29 @@ def procesar_mensaje(msg: dict) -> None:
     # Marcar como procesando
     supabase.table("mensajes").update({"procesado": True}).eq("id", msg_id).execute()
 
-    # Obtener historial del stream (últimos 10 mensajes)
+    # Obtener historial del stream (últimos 10 mensajes, más recientes primero → revertir)
     historial = []
     try:
         hist_resp = (
             supabase.table("mensajes")
             .select("role, content")
             .eq("stream_id", stream_id)
-            .order("created_at", desc=False)
+            .order("created_at", desc=True)   # más recientes primero
             .limit(10)
             .execute()
         )
         historial = [
             {"role": r["role"], "content": r["content"]}
-            for r in (hist_resp.data or [])
+            for r in reversed(hist_resp.data or [])   # revertir → orden cronológico
             if r["role"] in ("user", "assistant")
         ]
     except Exception as e:
         log.warning(f"No se pudo cargar historial: {e}")
         historial = [{"role": "user", "content": contenido}]
+
+    # Garantizar que el historial termina con el mensaje actual del usuario
+    if not historial or historial[-1].get("content") != contenido:
+        historial.append({"role": "user", "content": contenido})
 
     # Llamar a Claude
     try:
