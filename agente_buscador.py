@@ -26,6 +26,7 @@ import time
 import json
 import logging
 from datetime import datetime, date
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
 import httpx
@@ -354,21 +355,28 @@ def buscar_en_google(marca: str, modelo: str) -> list[dict]:
             url = item.get("link", "")
             hostname = url.split("/")[2] if url.startswith("http") else url
             es_propio = _es_dominio_propio(url)
+            snippet = item.get("snippet", "")
+
+            # Intentar extraer precio del snippet (a veces muestra "$227.68")
+            precio_snippet, moneda_snippet = _extract_price_from_text(snippet)
+
             resultados.append({
                 "proveedor":       f"Catálogo {DOMINIO_PROPIO}" if es_propio else hostname,
                 "nombre_producto": item.get("title", f"{marca} {modelo}"),
-                "precio_orig":     None,
-                "moneda":          "USD",
+                "precio_orig":     precio_snippet,
+                "moneda":          moneda_snippet,
                 "disponibilidad":  "en_stock" if es_propio else "consultar",
                 "tiempo_entrega":  "Inmediato" if es_propio else "Ver sitio",
                 "condicion":       "nuevo",
                 "fuente":          "sitio_propio" if es_propio else "web",
                 "url":             url,
                 "dist_autorizado": es_propio,
-                "notas":           item.get("snippet", ""),
+                "notas":           snippet,
             })
             if es_propio:
                 log.info(f"  ★ Resultado propio detectado: {url[:80]}")
+            if precio_snippet:
+                log.info(f"  $ Precio en snippet [{hostname}]: {precio_snippet} {moneda_snippet}")
         log.info(f"SerpAPI: {len(resultados)} resultados")
         return resultados
     except Exception as e:
@@ -391,15 +399,15 @@ def buscar_en_google_shopping(marca: str, modelo: str) -> list[dict]:
         if not api_key:
             return []
 
-        query = f"{marca} {modelo}"
+        # Sin restricción de región — distribuidores industriales son globales (Cadeco, Radwell, RS, etc.)
+        # gl=mx limita resultados a vendedores mexicanos que raramente tienen catálogo en Shopping
+        query = f"{marca} {modelo}".strip() if marca else modelo
         resp = httpx.get(
             "https://serpapi.com/search.json",
             params={
                 "engine":  "google_shopping",
                 "q":       query,
                 "api_key": api_key,
-                "hl":      "es",
-                "gl":      "mx",
                 "num":     10,
             },
             timeout=25,
@@ -459,6 +467,158 @@ def buscar_en_google_shopping(marca: str, modelo: str) -> list[dict]:
     except Exception as e:
         log.error(f"Error Google Shopping: {e}")
         return []
+
+
+# ─────────────────────────────────────────
+# EXTRACCIÓN DE PRECIOS — SNIPPETS Y PÁGINAS
+# ─────────────────────────────────────────
+def _extract_price_from_text(text: str) -> tuple:
+    """
+    Extrae precio de un fragmento de texto usando regex.
+    Retorna (precio_float, moneda_str) o (None, 'USD').
+    """
+    if not text:
+        return None, "USD"
+
+    is_mxn = bool(re.search(r'MXN|MX\$|pesos', text, re.IGNORECASE))
+
+    # Patrones en orden de confiabilidad (más específico primero)
+    patterns = [
+        (r'MX\$\s*(\d{1,6}(?:,\d{3})*(?:\.\d{2})?)',   'MXN'),
+        (r'MXN\s*(\d{1,6}(?:,\d{3})*(?:\.\d{2})?)',     'MXN'),
+        (r'USD\s*(\d{1,6}(?:,\d{3})*(?:\.\d{2})?)',     'USD'),
+        (r'\$\s*(\d{1,6}(?:,\d{3})*\.\d{2})',           'USD'),  # $227.68 (con centavos)
+        (r'\$\s*(\d{3,6}(?:,\d{3})*)',                  'USD'),  # $1,234 (sin centavos, mín 3 dígitos)
+    ]
+
+    for pattern, default_currency in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            try:
+                price = float(match.group(1).replace(',', ''))
+                if 0.01 < price < 1_000_000:
+                    currency = 'MXN' if (is_mxn or default_currency == 'MXN') else 'USD'
+                    return price, currency
+            except ValueError:
+                continue
+
+    return None, "USD"
+
+
+def _extraer_precio_de_url(url: str) -> tuple:
+    """
+    Visita la URL del resultado y extrae el precio estructurado (JSON-LD / meta tags).
+    NO hace scraping frágil de texto — solo usa datos estructurados.
+    Timeout 8s para no bloquear el pipeline.
+    Retorna (precio_float, moneda_str) o (None, 'USD').
+    """
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        resp = httpx.get(url, headers=headers, timeout=8, follow_redirects=True)
+        if resp.status_code != 200:
+            return None, "USD"
+
+        html = resp.text[:150000]  # Primeros 150 KB (suficiente para head + LD)
+
+        # 1. JSON-LD structured data — más confiable (Radwell, RS Components, Arrow, etc.)
+        ld_blocks = re.findall(
+            r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+            html, re.DOTALL | re.IGNORECASE
+        )
+        for block in ld_blocks:
+            try:
+                data = json.loads(block.strip())
+                if isinstance(data, list):
+                    data = data[0]
+                offers = data.get("offers") or data.get("Offers") or {}
+                if isinstance(offers, list):
+                    offers = offers[0]
+                price_val = offers.get("price") or offers.get("lowPrice")
+                if price_val:
+                    price = float(str(price_val).replace(",", "").strip())
+                    if 0.01 < price < 1_000_000:
+                        currency = (offers.get("priceCurrency") or "USD").upper()
+                        return price, currency
+            except Exception:
+                pass
+
+        # 2. Open Graph / meta tags (Shopify, WooCommerce, Parmex, etc.)
+        meta_price = re.search(
+            r'<meta[^>]+(?:property|name)=["\'](?:product:price:amount|og:price:amount)["\'][^>]+content=["\']([0-9.,]+)["\']',
+            html, re.IGNORECASE
+        )
+        if meta_price:
+            try:
+                price = float(meta_price.group(1).replace(",", ""))
+                if 0.01 < price < 1_000_000:
+                    meta_cur = re.search(
+                        r'<meta[^>]+(?:property|name)=["\'](?:product:price:currency|og:price:currency)["\'][^>]+content=["\']([A-Z]{3})["\']',
+                        html, re.IGNORECASE
+                    )
+                    currency = meta_cur.group(1).upper() if meta_cur else "USD"
+                    return price, currency
+            except Exception:
+                pass
+
+        # 3. data-price / itemprop="price" (schema.org microdata)
+        itemprop_price = re.search(
+            r'itemprop=["\']price["\'][^>]*content=["\']([0-9.,]+)["\']',
+            html, re.IGNORECASE
+        )
+        if itemprop_price:
+            try:
+                price = float(itemprop_price.group(1).replace(",", ""))
+                if 0.01 < price < 1_000_000:
+                    return price, "USD"
+            except Exception:
+                pass
+
+        return None, "USD"
+    except Exception as e:
+        log.debug(f"_extraer_precio_de_url({url[:60]}): {e}")
+        return None, "USD"
+
+
+def enriquecer_precios_web(resultados: list, max_urls: int = 4) -> list:
+    """
+    Para resultados web sin precio, visita las páginas en paralelo y extrae
+    el precio estructurado (JSON-LD / meta tags).
+    Solo procesa resultados de fuente 'web' sin precio_orig.
+    Agrega máx 12s al pipeline total (4 URLs en paralelo con timeout 8s cada una).
+    """
+    sin_precio = [
+        r for r in resultados
+        if r.get("fuente") == "web" and r.get("precio_orig") is None and r.get("url")
+    ]
+    if not sin_precio:
+        return resultados
+
+    a_enriquecer = sin_precio[:max_urls]
+    log.info(f"Enriqueciendo precios de {len(a_enriquecer)} URL(s) en paralelo...")
+
+    def _fetch(r):
+        precio, moneda = _extraer_precio_de_url(r["url"])
+        return r, precio, moneda
+
+    with ThreadPoolExecutor(max_workers=len(a_enriquecer)) as executor:
+        futures = {executor.submit(_fetch, r): r for r in a_enriquecer}
+        for future in as_completed(futures, timeout=13):
+            try:
+                r, precio, moneda = future.result()
+                if precio:
+                    r["precio_orig"] = precio
+                    r["moneda"] = moneda
+                    log.info(f"  ✓ Precio extraído [{r['proveedor']}]: {precio} {moneda}")
+                else:
+                    log.debug(f"  - Sin precio estructurado: {r['url'][:70]}")
+            except Exception as e:
+                log.debug(f"  Error enriqueciendo URL: {e}")
+
+    return resultados
 
 
 # ─────────────────────────────────────────
@@ -778,6 +938,14 @@ def procesar_job(job: dict) -> None:
 
         agregar_log_job(job_id, "busqueda_google", "Iniciando búsqueda en Google Web")
         res_google = buscar_en_google(marca, modelo)
+        # Enriquecer precios de resultados web visitando las páginas (JSON-LD / meta tags)
+        if res_google:
+            sin_precio_antes = sum(1 for r in res_google if r.get("precio_orig") is None and r.get("fuente") == "web")
+            if sin_precio_antes > 0:
+                agregar_log_job(job_id, "enriquecimiento_precios", f"Extrayendo precios de {min(sin_precio_antes, 4)} páginas web...")
+                res_google = enriquecer_precios_web(res_google, max_urls=4)
+                con_precio_web = sum(1 for r in res_google if r.get("precio_orig") and r.get("fuente") == "web")
+                agregar_log_job(job_id, "enriquecimiento_precios", f"{con_precio_web} precios extraídos de páginas web")
         resultados.extend(res_google)
         agregar_log_job(job_id, "busqueda_google", f"{len(res_google)} resultados")
 
