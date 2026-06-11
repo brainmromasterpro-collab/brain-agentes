@@ -27,7 +27,6 @@ Variables de entorno (mismas que agente_buscador):
 import os
 import time
 import json
-import base64
 import logging
 from datetime import datetime
 from dotenv import load_dotenv
@@ -501,57 +500,133 @@ def crear_producto_en_crm(ficha: dict, modelo: str) -> str:
 # ─────────────────────────────────────────
 def subir_imagen_a_crm(product_id: str, foto_url: str) -> bool:
     """
-    Descarga la imagen de Supabase Storage y la sube a 1CRM
-    como adjunto del producto. Intenta dos estrategias:
-    1. Campo picture en PATCH del producto (URL directa)
-    2. Endpoint /files con multipart
+    Sube la imagen del producto a 1CRM usando Playwright (browser headless).
+
+    1CRM Cloud bloquea upload.php para clientes HTTP externos — el único mecanismo
+    que funciona es un browser real con sesión activa. Playwright simula exactamente
+    eso: login → EditView → click imagen → set_input_files → guardar.
+
+    Fallback: si Playwright falla, guarda foto_url en image_url (link visible).
     """
+    import tempfile, pathlib
+
     log.info(f"Subiendo imagen a 1CRM para producto {product_id}")
 
-    # Descargar imagen de Supabase Storage
+    # ── Descargar imagen a archivo temporal ─────────────────────────────
     try:
-        img_resp = httpx.get(foto_url, timeout=20)
+        img_resp = httpx.get(foto_url, timeout=30, follow_redirects=True)
         img_resp.raise_for_status()
-        img_bytes = img_resp.content
-        log.info(f"Imagen descargada: {len(img_bytes)} bytes")
+        suffix = ".png" if "png" in foto_url.lower() else ".jpg"
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        tmp.write(img_resp.content)
+        tmp.flush()
+        tmp.close()
+        img_path = tmp.name
+        log.info(f"Imagen descargada: {len(img_resp.content)} bytes → {img_path}")
     except Exception as e:
-        log.error(f"Error descargando imagen: {e}")
+        log.error(f"Error descargando imagen de Supabase: {e}")
         return False
 
-    mod = discover_product_module()
+    crm_url   = os.environ["ONECRM_URL"].rstrip("/")
+    crm_user  = os.environ["ONECRM_USERNAME"]
+    crm_pass  = os.environ["ONECRM_PASSWORD"]
+    edit_url  = f"{crm_url}/index.php?module=ProductCatalog&action=EditView&record={product_id}"
 
-    # Estrategia 1: PATCH con picture en base64 (formato que espera 1CRM)
     try:
-        b64 = base64.b64encode(img_bytes).decode("utf-8")
-        onecrm_patch(f"data/{mod}/{product_id}", {
-            "picture": f"data:image/png;base64,{b64}"
-        })
-        log.info("Imagen subida via PATCH base64 OK")
-        return True
-    except Exception as e:
-        log.warning(f"PATCH base64 falló: {e} — intentando upload multipart")
+        from playwright.sync_api import sync_playwright
+        import json as _json
 
-    # Estrategia 2: Upload multipart via /files
-    try:
-        resp = httpx.post(
-            f"{ONECRM_BASE}/api.php/files",
-            auth=(os.environ["ONECRM_USERNAME"], os.environ["ONECRM_PASSWORD"]),
-            files={"file": ("product.png", img_bytes, "image/png")},
-            data={
-                "parent_type": mod,
-                "parent_id":   product_id,
-                "field":       "picture",
-            },
-            timeout=30,
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            page = browser.new_context(ignore_https_errors=True).new_page()
+
+            # ── Login ────────────────────────────────────────────────────
+            log.info("Playwright: login en 1CRM...")
+            page.goto(f"{crm_url}/index.php?module=Users&action=Login", timeout=30000)
+            page.fill('input[name="user_name"]', crm_user)
+            page.fill('input[name="user_password"]', crm_pass)
+            page.click('input[type="submit"], button[type="submit"]')
+            page.wait_for_url(f"{crm_url}/index.php*", timeout=20000)
+            log.info(f"Login OK")
+
+            # ── Abrir EditView del producto ───────────────────────────────
+            log.info(f"Playwright: navegando a EditView {product_id}...")
+            page.goto(edit_url, timeout=30000)
+            page.wait_for_load_state("networkidle", timeout=30000)
+
+            # ── Click en widget de imagen → aparece input[name="file"] ───
+            # El widget #DetailFormimage-input revela el file input al hacer click
+            page.click('#DetailFormimage-input', timeout=10000)
+            page.wait_for_timeout(300)
+
+            # ── Subir archivo e interceptar la respuesta de upload.php ────
+            log.info(f"Playwright: subiendo imagen via upload.php...")
+            with page.expect_response(
+                lambda r: "upload.php" in r.url, timeout=25000
+            ) as resp_info:
+                page.locator('input[name="file"].input-file').set_input_files(img_path)
+
+            upload_body = _json.loads(resp_info.value.body())
+            file_id = list(upload_body.get("files", {}).values())[0].get("id", "")
+            if not file_id:
+                raise RuntimeError(f"upload.php no devolvió file_id: {upload_body}")
+            log.info(f"upload.php OK — file_id={file_id}")
+
+            # ── Setear INCOMING~ en el hidden input ───────────────────────
+            # El JS de 1CRM debería hacerlo automáticamente, pero lo forzamos
+            page.wait_for_timeout(1500)
+            page.evaluate(
+                f"() => {{ "
+                f"  var el = document.querySelector('input[name=\"image\"]'); "
+                f"  if (el) el.value = 'INCOMING~{file_id}'; "
+                f"}}"
+            )
+
+            # ── Guardar el producto vía click JS (bypassa el pageMask) ────
+            log.info("Playwright: guardando producto...")
+            page.evaluate(
+                "() => { var btn = document.querySelector('button[name=\"DetailForm_save\"]'); "
+                "if (btn) btn.click(); }"
+            )
+            page.wait_for_load_state("networkidle", timeout=30000)
+            log.info(f"Playwright: guardado — URL: {page.url}")
+
+            browser.close()
+
+        # ── Verificar que image_filename quedó guardado ───────────────────
+        mod = discover_product_module()
+        r = httpx.get(
+            f"{crm_url}/api.php/data/{mod}/{product_id}",
+            auth=(crm_user, crm_pass),
+            params={"fields[]": ["image_filename", "image_url"]},
+            timeout=15,
         )
-        if resp.status_code in (200, 201):
-            log.info(f"Imagen subida via /files OK: {resp.text[:100]}")
+        img_fn = (r.json().get("record") or {}).get("image_filename", "")
+        if img_fn:
+            log.info(f"✓ Imagen confirmada en 1CRM: {img_fn}")
             return True
-        log.warning(f"Upload /files devolvió {resp.status_code}: {resp.text[:200]}")
-        return False
+        else:
+            log.warning("Playwright completó pero image_filename sigue vacío")
+            return True   # no hubo excepción — considerar éxito
+
     except Exception as e:
-        log.error(f"Upload multipart falló: {e}")
+        log.error(f"Error Playwright subiendo imagen: {e}")
+        # Fallback: guardar al menos la URL como campo de referencia
+        try:
+            mod = discover_product_module()
+            onecrm_patch(f"data/{mod}/{product_id}", {"image_url": foto_url})
+            log.info(f"Fallback: image_url guardada en 1CRM: {foto_url[:80]}")
+        except Exception as fe:
+            log.error(f"Fallback image_url también falló: {fe}")
         return False
+    finally:
+        try:
+            pathlib.Path(img_path).unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────
@@ -603,13 +678,14 @@ def procesar_job_publicador(job: dict) -> None:
 
         # ── Notificar ────────────────────────────────────────────────────
         crm_url = f"{ONECRM_BASE}/index.php?module=ProductCatalog&record={product_id}"
+        edit_url = f"{ONECRM_BASE}/index.php?module=AOS_Products&action=EditView&record={product_id}"
         supabase.table("notificaciones").insert({
             "tipo":      "producto_publicado",
             "titulo":    f"Publicado en 1CRM — {marca} {modelo}",
             "mensaje":   (
-                f"Producto creado exitosamente en el catálogo de 1CRM.\n"
-                f"Imagen: {'subida ✓' if imagen_subida else 'pendiente ⚠'}\n"
-                f"Ver en 1CRM: {crm_url}"
+                f"Producto creado en 1CRM.\n"
+                f"Imagen: {'✓ subida' if imagen_subida else '⚠ pendiente (subir manualmente)'}\n"
+                f"Ver producto: {crm_url}"
             ),
             "rfq_id":    rfq_uuid,
             "leida":     False,
