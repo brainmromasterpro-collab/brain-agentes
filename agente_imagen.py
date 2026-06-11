@@ -498,19 +498,28 @@ def procesar_job_imagen(job: dict) -> None:
         if not foto_url:
             raise Exception("Fallo al subir imagen a Supabase Storage")
 
-        # ── Actualizar RFQ ──────────────────────────────────────────────
+        # ── Actualizar RFQ y lanzar publicador automáticamente ──────────
         supabase.table("rfqs").update({
-            "foto_url":    foto_url,
-            "estado":      "foto_lista",
+            "foto_url": foto_url,
+            "estado":   "publicando",
         }).eq("id", rfq_uuid).execute()
+
+        pub_job = supabase.table("jobs").insert({
+            "rfq_id":     rfq_uuid,
+            "agente":     "publicador",
+            "estado":     "pendiente",
+            "created_at": datetime.utcnow().isoformat(),
+        }).execute()
+        pub_job_id = (pub_job.data or [{}])[0].get("id", "?")
+        log.info(f"Job publicador creado automáticamente: {pub_job_id}")
 
         # ── Notificar ───────────────────────────────────────────────────
         supabase.table("notificaciones").insert({
-            "tipo":      "foto_lista",
-            "titulo":    f"Foto lista — {marca} {modelo}",
-            "mensaje":   "Imagen procesada (500×500, fondo blanco) y lista para publicar en 1CRM.",
-            "rfq_id":    rfq_uuid,
-            "leida":     False,
+            "tipo":    "foto_lista",
+            "titulo":  f"Foto lista — publicando — {marca} {modelo}",
+            "mensaje": "Imagen procesada (500×500, fondo blanco). Publicando automáticamente en 1CRM.",
+            "rfq_id":  rfq_uuid,
+            "leida":   False,
         }).execute()
 
         # ── Cerrar job ──────────────────────────────────────────────────
