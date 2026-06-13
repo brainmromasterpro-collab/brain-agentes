@@ -1,0 +1,6 @@
+.claude/
+.env
+__pycache__/
+*.pyc
+debug_ui_save.py
+diagnostico_1crm.py
