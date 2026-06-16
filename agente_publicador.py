@@ -274,20 +274,20 @@ def generar_ficha_producto(marca: str, modelo: str, opciones: list[dict]) -> dic
             mejor_moneda = op.get("moneda", "USD")
             break
 
-    prompt = f"""Eres un especialista en catálogos de productos industriales MRO.
+    prompt = f"""You are an industrial MRO product catalog specialist.
 
-Genera la ficha de producto para el catálogo de 1CRM con estos datos:
+Generate the product listing for the 1CRM catalog with this data:
 
-Marca: {marca}
-Modelo/Número de parte: {modelo}
+Brand: {marca}
+Model/Part Number: {modelo}
 
-Resultados de búsqueda encontrados:
+Search results found:
 {json.dumps(opciones, ensure_ascii=False, indent=2)}
 
-Devuelve SOLO este JSON (sin texto extra):
+Return ONLY this JSON (no extra text):
 {{
-  "nombre": "Nombre comercial completo del producto (marca + modelo + descripción corta, máx 80 chars)",
-  "descripcion": "Descripción técnica en español, 2-4 oraciones. Incluye aplicación, características principales y compatibilidad si se conoce.",
+  "nombre": "Title format: {{modelo}} - {{marca}} - {{short technical description, max 60 chars}}. All in English.",
+  "descripcion": "Technical description in English, 2-4 sentences. Include application, key specs, and compatibility if known.",
   "precio_referencia": {mejor_precio or 0},
   "moneda": "{mejor_moneda}",
   "unidad": "PZA"
