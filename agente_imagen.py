@@ -471,12 +471,28 @@ def procesar_job_imagen(job: dict) -> None:
         mejor_idx = evaluar_con_claude_vision(marca, modelo, candidatas)
 
         if mejor_idx is None:
-            # Ninguna imagen aceptable → publicar sin imagen de forma automática
-            log.warning("Claude Vision: ninguna imagen aceptable → publicando sin imagen")
-            _auto_publicar_sin_imagen(
-                rfq_uuid, marca, modelo,
-                motivo=f"Claude revisó {len(candidatas)} imagen(es) y ninguna es aceptable (logos, filigranas o baja calidad).",
-            )
+            log.warning("Claude Vision: ninguna imagen aceptable")
+            stream_id = rfq.get("stream_id")
+            if stream_id:
+                # HITL: notificar al chat para que el usuario decida
+                supabase.table("mensajes").insert({
+                    "stream_id": stream_id,
+                    "role":      "user",
+                    "content":   (
+                        f"[SISTEMA:imagen_no_encontrada] rfq_id={rfq_uuid} "
+                        f"marca={marca} modelo={modelo} "
+                        f"motivo=Claude revisó {len(candidatas)} imagen(es) y ninguna es aceptable"
+                    ),
+                    "procesado": False,
+                    "metadata":  {"trigger": "imagen_no_encontrada", "rfq_id": rfq_uuid},
+                }).execute()
+                supabase.table("rfqs").update({"estado": "sin_imagen"}).eq("id", rfq_uuid).execute()
+            else:
+                # Automático: publicar sin imagen
+                _auto_publicar_sin_imagen(
+                    rfq_uuid, marca, modelo,
+                    motivo=f"Claude revisó {len(candidatas)} imagen(es) y ninguna es aceptable (logos, filigranas o baja calidad).",
+                )
             supabase.table("jobs").update({
                 "estado":      "sin_imagen",
                 "finished_at": datetime.utcnow().isoformat(),
@@ -498,29 +514,49 @@ def procesar_job_imagen(job: dict) -> None:
         if not foto_url:
             raise Exception("Fallo al subir imagen a Supabase Storage")
 
-        # ── Actualizar RFQ y lanzar publicador automáticamente ──────────
-        supabase.table("rfqs").update({
-            "foto_url": foto_url,
-            "estado":   "publicando",
-        }).eq("id", rfq_uuid).execute()
+        # ── Guardar foto_url, luego decidir modo ────────────────────────
+        stream_id = rfq.get("stream_id")
+        if stream_id:
+            # HITL: actualizar foto pero NO lanzar publicador — esperar aprobación del usuario
+            supabase.table("rfqs").update({
+                "foto_url": foto_url,
+                "estado":   "foto_lista",
+            }).eq("id", rfq_uuid).execute()
+            supabase.table("mensajes").insert({
+                "stream_id": stream_id,
+                "role":      "user",
+                "content":   (
+                    f"[SISTEMA:imagen_lista] rfq_id={rfq_uuid} "
+                    f"marca={marca} modelo={modelo} "
+                    f"foto_url={foto_url}"
+                ),
+                "procesado": False,
+                "metadata":  {"trigger": "imagen_lista", "rfq_id": rfq_uuid, "foto_url": foto_url},
+            }).execute()
+            log.info(f"HITL: imagen lista — esperando aprobación del usuario en stream {str(stream_id)[:8]}")
+        else:
+            # Automático: publicar de inmediato
+            supabase.table("rfqs").update({
+                "foto_url": foto_url,
+                "estado":   "publicando",
+            }).eq("id", rfq_uuid).execute()
 
-        pub_job = supabase.table("jobs").insert({
-            "rfq_id":     rfq_uuid,
-            "agente":     "publicador",
-            "estado":     "pendiente",
-            "created_at": datetime.utcnow().isoformat(),
-        }).execute()
-        pub_job_id = (pub_job.data or [{}])[0].get("id", "?")
-        log.info(f"Job publicador creado automáticamente: {pub_job_id}")
+            pub_job = supabase.table("jobs").insert({
+                "rfq_id":     rfq_uuid,
+                "agente":     "publicador",
+                "estado":     "pendiente",
+                "created_at": datetime.utcnow().isoformat(),
+            }).execute()
+            pub_job_id = (pub_job.data or [{}])[0].get("id", "?")
+            log.info(f"Job publicador creado automáticamente: {pub_job_id}")
 
-        # ── Notificar ───────────────────────────────────────────────────
-        supabase.table("notificaciones").insert({
-            "tipo":    "foto_lista",
-            "titulo":  f"Foto lista — publicando — {marca} {modelo}",
-            "mensaje": "Imagen procesada (500×500, fondo blanco). Publicando automáticamente en 1CRM.",
-            "rfq_id":  rfq_uuid,
-            "leida":   False,
-        }).execute()
+            supabase.table("notificaciones").insert({
+                "tipo":    "foto_lista",
+                "titulo":  f"Foto lista — publicando — {marca} {modelo}",
+                "mensaje": "Imagen procesada (500×500, fondo blanco). Publicando automáticamente en 1CRM.",
+                "rfq_id":  rfq_uuid,
+                "leida":   False,
+            }).execute()
 
         # ── Cerrar job ──────────────────────────────────────────────────
         supabase.table("jobs").update({
@@ -543,16 +579,33 @@ def procesar_job_imagen(job: dict) -> None:
             "error":       str(e),
         }).eq("id", job_id).execute()
 
-        # En lugar de bloquear el flujo, publicar automáticamente sin imagen
-        # para que el producto llegue a 1CRM y el gerente solo tenga que subir la foto.
+        # Fallback: sin imagen — en HITL notificar al chat, en automático publicar directo
         try:
-            _auto_publicar_sin_imagen(
-                rfq_uuid, marca, modelo,
-                motivo=f"Error en agente de imágenes: {str(e)[:200]}",
-            )
-            log.info(f"RFQ {rfq_uuid} → publicando sin imagen tras fallo de imagen")
+            rfq_fb = supabase.table("rfqs").select("stream_id,marca,modelo").eq("id", rfq_uuid).single().execute().data
+            stream_id_fb = (rfq_fb or {}).get("stream_id")
+            marca_fb  = (rfq_fb or {}).get("marca", marca)
+            modelo_fb = (rfq_fb or {}).get("modelo", modelo)
+            if stream_id_fb:
+                supabase.table("mensajes").insert({
+                    "stream_id": stream_id_fb,
+                    "role":      "user",
+                    "content":   (
+                        f"[SISTEMA:imagen_no_encontrada] rfq_id={rfq_uuid} "
+                        f"marca={marca_fb} modelo={modelo_fb} "
+                        f"motivo=Error en agente imagen: {str(e)[:150]}"
+                    ),
+                    "procesado": False,
+                    "metadata":  {"trigger": "imagen_no_encontrada", "rfq_id": rfq_uuid},
+                }).execute()
+                supabase.table("rfqs").update({"estado": "sin_imagen"}).eq("id", rfq_uuid).execute()
+            else:
+                _auto_publicar_sin_imagen(
+                    rfq_uuid, marca_fb, modelo_fb,
+                    motivo=f"Error en agente de imágenes: {str(e)[:200]}",
+                )
+            log.info(f"RFQ {rfq_uuid} → fallback sin imagen gestionado")
         except Exception as e2:
-            log.error(f"Error al auto-publicar sin imagen: {e2}")
+            log.error(f"Error en fallback sin imagen: {e2}")
 
 
 # ─────────────────────────────────────────

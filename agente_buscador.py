@@ -1053,6 +1053,23 @@ def procesar_job(job: dict) -> None:
             "estado": "pendiente",
         }).execute()
 
+        # HITL: si el RFQ viene de Bolt (tiene stream_id), notificar al chat
+        stream_id = rfq.get("stream_id")
+        if stream_id:
+            marca_disp = rfq.get("marca", "").strip() or "?"
+            modelo_disp = rfq.get("modelo", "").strip()
+            supabase.table("mensajes").insert({
+                "stream_id": stream_id,
+                "role":      "user",
+                "content":   (
+                    f"[SISTEMA:busqueda_completa] rfq_id={rfq_uuid} "
+                    f"marca={marca_disp} modelo={modelo_disp}"
+                ),
+                "procesado": False,
+                "metadata":  {"trigger": "busqueda_completa", "rfq_id": rfq_uuid},
+            }).execute()
+            log.info(f"Trigger de busqueda_completa enviado al stream {str(stream_id)[:8]}")
+
         # Cerrar job exitosamente
         supabase.table("jobs").update({
             "estado": "completado",

@@ -104,6 +104,149 @@ def tool_buscar_productos_crm(query: str, limite: int = 10) -> dict:
     }
 
 
+def tool_ver_producto_crm(producto_id: str) -> dict:
+    """Obtiene el detalle completo de un producto del catálogo 1CRM por su ID."""
+    if not ONECRM_BASE:
+        return {"error": "1CRM no configurado"}
+    data = _onecrm_get(f"data/ProductCatalog/{producto_id}")
+    record = data.get("record", data)
+    if "error" in data and not record:
+        return data
+    url_crm = f"{ONECRM_BASE}/index.php?module=ProductCatalog&record={producto_id}"
+    return {
+        "id":           record.get("id", producto_id),
+        "nombre":       record.get("name", ""),
+        "num_parte":    record.get("manufacturers_part_no", ""),
+        "descripcion":  record.get("description", ""),
+        "precio":       record.get("unit_price"),
+        "moneda":       record.get("currency_id", "USD"),
+        "categoria":    record.get("category", ""),
+        "marca":        record.get("mft_suggested_retail_price", ""),
+        "imagen_url":   record.get("picture", ""),
+        "url_crm":      url_crm,
+        "raw":          {k: v for k, v in record.items() if v and k not in ("id",)},
+    }
+
+
+def tool_listar_productos_crm(categoria: str = "", limite: int = 15) -> dict:
+    """Lista productos del catálogo 1CRM con filtro opcional de categoría."""
+    if not ONECRM_BASE:
+        return {"error": "1CRM no configurado"}
+    params: dict = {
+        "fields": "id,name,manufacturers_part_no,unit_price,currency_id,category,picture",
+        "limit":  min(limite, 50),
+        "order_by": "date_modified desc",
+    }
+    if categoria:
+        params["filter_text"] = categoria
+    data = _onecrm_get("data/ProductCatalog", params)
+    records = data.get("records", [])
+    return {
+        "total": data.get("total_count", len(records)),
+        "productos": [
+            {
+                "id":        r.get("id"),
+                "nombre":    r.get("name", ""),
+                "num_parte": r.get("manufacturers_part_no", ""),
+                "precio":    r.get("unit_price"),
+                "moneda":    r.get("currency_id", "USD"),
+                "categoria": r.get("category", ""),
+                "tiene_imagen": bool(r.get("picture")),
+                "url_crm": f"{ONECRM_BASE}/index.php?module=ProductCatalog&record={r.get('id')}",
+            }
+            for r in records
+        ],
+    }
+
+
+def tool_buscar_clientes_crm(query: str = "", limite: int = 10) -> dict:
+    """Busca cuentas/clientes en 1CRM."""
+    if not ONECRM_BASE:
+        return {"error": "1CRM no configurado"}
+    params: dict = {
+        "fields": "id,name,phone_office,website,billing_address_country,account_type,industry",
+        "limit":  min(limite, 30),
+    }
+    if query:
+        params["filter_text"] = query
+    data = _onecrm_get("data/Account", params)
+    records = data.get("records", [])
+    return {
+        "total": data.get("total_count", len(records)),
+        "cuentas": [
+            {
+                "id":       r.get("id"),
+                "nombre":   r.get("name", ""),
+                "tipo":     r.get("account_type", ""),
+                "industria": r.get("industry", ""),
+                "telefono": r.get("phone_office", ""),
+                "web":      r.get("website", ""),
+                "pais":     r.get("billing_address_country", ""),
+                "url_crm":  f"{ONECRM_BASE}/index.php?module=Accounts&record={r.get('id')}",
+            }
+            for r in records
+        ],
+    }
+
+
+def tool_ver_cliente_crm(cliente_id: str) -> dict:
+    """Obtiene el detalle completo de una cuenta/cliente en 1CRM."""
+    if not ONECRM_BASE:
+        return {"error": "1CRM no configurado"}
+    data = _onecrm_get(f"data/Account/{cliente_id}")
+    record = data.get("record", data)
+    return {
+        "id":        record.get("id", cliente_id),
+        "nombre":    record.get("name", ""),
+        "tipo":      record.get("account_type", ""),
+        "industria": record.get("industry", ""),
+        "telefono":  record.get("phone_office", ""),
+        "email":     record.get("email1", ""),
+        "web":       record.get("website", ""),
+        "direccion": {
+            "calle":   record.get("billing_address_street", ""),
+            "ciudad":  record.get("billing_address_city", ""),
+            "estado":  record.get("billing_address_state", ""),
+            "pais":    record.get("billing_address_country", ""),
+        },
+        "descripcion": record.get("description", ""),
+        "url_crm":  f"{ONECRM_BASE}/index.php?module=Accounts&record={cliente_id}",
+    }
+
+
+def tool_listar_cotizaciones_crm(estado: str = "", cliente_id: str = "", limite: int = 10) -> dict:
+    """Lista cotizaciones/quotes de 1CRM con filtros opcionales."""
+    if not ONECRM_BASE:
+        return {"error": "1CRM no configurado"}
+    params: dict = {
+        "fields": "id,name,quote_stage,grand_total,currency_id,date_quote_expected_closed,billing_account_name",
+        "limit":  min(limite, 30),
+        "order_by": "date_modified desc",
+    }
+    if estado:
+        params["filters[quote_stage]"] = estado
+    if cliente_id:
+        params["filters[billing_account_id]"] = cliente_id
+    data = _onecrm_get("data/Quotes", params)
+    records = data.get("records", [])
+    return {
+        "total": data.get("total_count", len(records)),
+        "cotizaciones": [
+            {
+                "id":       r.get("id"),
+                "nombre":   r.get("name", ""),
+                "estado":   r.get("quote_stage", ""),
+                "total":    r.get("grand_total"),
+                "moneda":   r.get("currency_id", "USD"),
+                "cliente":  r.get("billing_account_name", ""),
+                "cierre":   r.get("date_quote_expected_closed", ""),
+                "url_crm":  f"{ONECRM_BASE}/index.php?module=Quotes&record={r.get('id')}",
+            }
+            for r in records
+        ],
+    }
+
+
 def tool_buscar_proveedores_crm(nombre: str = "", categoria: str = "") -> dict:
     if not ONECRM_BASE:
         return {"error": "1CRM no configurado"}
@@ -212,6 +355,96 @@ def tool_buscar_internet(query: str) -> dict:
     return {"error": "Sin APIs de búsqueda disponibles"}
 
 
+def tool_obtener_opciones_rfq(rfq_id: str) -> dict:
+    """Lee las opciones de proveedor de la tabla opciones para un RFQ dado."""
+    try:
+        resp = supabase.table("opciones").select(
+            "id,rank,proveedor,precio_orig,moneda,disponibilidad,score_ranking,fuente"
+        ).eq("rfq_id", rfq_id).order("rank").execute()
+        rfq = supabase.table("rfqs").select("marca,modelo,estado").eq("id", rfq_id).single().execute().data
+        return {
+            "rfq_id": rfq_id,
+            "marca":  rfq.get("marca", ""),
+            "modelo": rfq.get("modelo", ""),
+            "estado": rfq.get("estado", ""),
+            "opciones": resp.data or [],
+        }
+    except Exception as e:
+        return {"error": str(e), "opciones": []}
+
+
+def tool_seleccionar_proveedor(rfq_id: str, opcion_id: str) -> dict:
+    """Guarda el proveedor seleccionado y crea job de imagen para el RFQ."""
+    try:
+        opcion = supabase.table("opciones").select("*").eq("id", opcion_id).single().execute().data
+        supabase.table("rfqs").update({
+            "estado":     "procesando_imagen",
+            "proveedor":  opcion.get("proveedor", ""),
+        }).eq("id", rfq_id).execute()
+        job = supabase.table("jobs").insert({
+            "rfq_id":     rfq_id,
+            "agente":     "imagen",
+            "estado":     "pendiente",
+            "created_at": datetime.utcnow().isoformat(),
+        }).execute()
+        job_id = (job.data or [{}])[0].get("id", "?")
+        log.info(f"Job imagen creado (HITL): {job_id} para rfq {rfq_id}")
+        return {"ok": True, "job_imagen": job_id, "proveedor": opcion.get("proveedor")}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def tool_obtener_foto_rfq(rfq_id: str) -> dict:
+    """Obtiene la URL de la foto del RFQ (para mostrar preview al usuario)."""
+    try:
+        rfq = supabase.table("rfqs").select("foto_url,estado,marca,modelo").eq("id", rfq_id).single().execute().data
+        return {
+            "rfq_id":   rfq_id,
+            "foto_url": rfq.get("foto_url"),
+            "estado":   rfq.get("estado"),
+            "marca":    rfq.get("marca"),
+            "modelo":   rfq.get("modelo"),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def tool_publicar_rfq(rfq_id: str) -> dict:
+    """Aprueba la publicación del RFQ: crea job de publicador en 1CRM."""
+    try:
+        supabase.table("rfqs").update({"estado": "publicando"}).eq("id", rfq_id).execute()
+        job = supabase.table("jobs").insert({
+            "rfq_id":     rfq_id,
+            "agente":     "publicador",
+            "estado":     "pendiente",
+            "created_at": datetime.utcnow().isoformat(),
+        }).execute()
+        job_id = (job.data or [{}])[0].get("id", "?")
+        log.info(f"Job publicador creado (HITL aprobado): {job_id} para rfq {rfq_id}")
+        return {"ok": True, "job_publicador": job_id}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def tool_publicar_sin_imagen_rfq(rfq_id: str) -> dict:
+    """Publica el RFQ sin imagen cuando el usuario lo aprueba así."""
+    try:
+        supabase.table("rfqs").update({
+            "estado":   "publicando",
+            "foto_url": None,
+        }).eq("id", rfq_id).execute()
+        job = supabase.table("jobs").insert({
+            "rfq_id":     rfq_id,
+            "agente":     "publicador",
+            "estado":     "pendiente",
+            "created_at": datetime.utcnow().isoformat(),
+        }).execute()
+        job_id = (job.data or [{}])[0].get("id", "?")
+        return {"ok": True, "job_publicador": job_id}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def tool_crear_rfqs_desde_texto(
     productos: list[dict],
     stream_id: str,
@@ -304,6 +537,62 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "ver_producto_crm",
+        "description": "Obtiene el detalle completo de un producto del catálogo 1CRM: descripción, precio, imagen, link directo al CRM.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "producto_id": {"type": "string", "description": "ID del producto en 1CRM"},
+            },
+            "required": ["producto_id"],
+        },
+    },
+    {
+        "name": "listar_productos_crm",
+        "description": "Lista los productos más recientes del catálogo 1CRM con filtro opcional de categoría. Útil para explorar el catálogo.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "categoria": {"type": "string", "description": "Filtro de categoría (opcional)"},
+                "limite":    {"type": "integer", "default": 15},
+            },
+        },
+    },
+    {
+        "name": "buscar_clientes_crm",
+        "description": "Busca cuentas o clientes en 1CRM por nombre, empresa o industria.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query":  {"type": "string", "description": "Nombre o término a buscar"},
+                "limite": {"type": "integer", "default": 10},
+            },
+        },
+    },
+    {
+        "name": "ver_cliente_crm",
+        "description": "Obtiene el detalle completo de una cuenta/cliente en 1CRM: contacto, dirección, industria.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "cliente_id": {"type": "string", "description": "ID de la cuenta en 1CRM"},
+            },
+            "required": ["cliente_id"],
+        },
+    },
+    {
+        "name": "listar_cotizaciones_crm",
+        "description": "Lista cotizaciones (quotes) de 1CRM. Puede filtrar por estado o cliente.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "estado":     {"type": "string", "description": "Estado: Draft, Delivered, On Hold, etc."},
+                "cliente_id": {"type": "string", "description": "ID de cuenta para filtrar por cliente"},
+                "limite":     {"type": "integer", "default": 10},
+            },
+        },
+    },
+    {
         "name": "buscar_proveedores_crm",
         "description": "Busca proveedores registrados en 1CRM.",
         "input_schema": {
@@ -339,6 +628,62 @@ TOOLS: list[dict] = [
                 "query": {"type": "string", "description": "Término de búsqueda"},
             },
             "required": ["query"],
+        },
+    },
+    {
+        "name": "obtener_opciones_rfq",
+        "description": "Obtiene las opciones de proveedores encontradas por el buscador para un RFQ. Úsalo cuando el sistema avise que la búsqueda completó (trigger busqueda_completa).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "rfq_id": {"type": "string", "description": "UUID del RFQ"},
+            },
+            "required": ["rfq_id"],
+        },
+    },
+    {
+        "name": "seleccionar_proveedor",
+        "description": "Guarda el proveedor seleccionado por el usuario y lanza la búsqueda de imagen. Llama este tool después de que el usuario elija un proveedor de la tabla de opciones.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "rfq_id":   {"type": "string", "description": "UUID del RFQ"},
+                "opcion_id": {"type": "string", "description": "UUID de la opción seleccionada"},
+            },
+            "required": ["rfq_id", "opcion_id"],
+        },
+    },
+    {
+        "name": "obtener_foto_rfq",
+        "description": "Obtiene la URL de la imagen procesada del RFQ para mostrar preview al usuario. Úsalo cuando el sistema avise que la imagen está lista (trigger imagen_lista).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "rfq_id": {"type": "string", "description": "UUID del RFQ"},
+            },
+            "required": ["rfq_id"],
+        },
+    },
+    {
+        "name": "publicar_rfq",
+        "description": "Aprueba y publica el producto en 1CRM. Úsalo cuando el usuario apruebe la imagen.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "rfq_id": {"type": "string", "description": "UUID del RFQ"},
+            },
+            "required": ["rfq_id"],
+        },
+    },
+    {
+        "name": "publicar_sin_imagen_rfq",
+        "description": "Publica el producto en 1CRM sin imagen cuando el usuario lo aprueba así (imagen no encontrada o rechazada).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "rfq_id": {"type": "string", "description": "UUID del RFQ"},
+            },
+            "required": ["rfq_id"],
         },
     },
     {
@@ -379,19 +724,29 @@ TOOLS: list[dict] = [
 ]
 
 TOOL_FUNCTIONS = {
-    "buscar_productos_crm":   tool_buscar_productos_crm,
-    "buscar_proveedores_crm": tool_buscar_proveedores_crm,
-    "consultar_rfqs":         tool_consultar_rfqs,
-    "consultar_metricas":     tool_consultar_metricas,
-    "buscar_internet":        tool_buscar_internet,
-    "crear_rfqs_desde_texto": tool_crear_rfqs_desde_texto,
+    "buscar_productos_crm":      tool_buscar_productos_crm,
+    "ver_producto_crm":          tool_ver_producto_crm,
+    "listar_productos_crm":      tool_listar_productos_crm,
+    "buscar_proveedores_crm":    tool_buscar_proveedores_crm,
+    "buscar_clientes_crm":       tool_buscar_clientes_crm,
+    "ver_cliente_crm":           tool_ver_cliente_crm,
+    "listar_cotizaciones_crm":   tool_listar_cotizaciones_crm,
+    "consultar_rfqs":            tool_consultar_rfqs,
+    "consultar_metricas":        tool_consultar_metricas,
+    "buscar_internet":           tool_buscar_internet,
+    "crear_rfqs_desde_texto":    tool_crear_rfqs_desde_texto,
+    "obtener_opciones_rfq":      tool_obtener_opciones_rfq,
+    "seleccionar_proveedor":     tool_seleccionar_proveedor,
+    "obtener_foto_rfq":          tool_obtener_foto_rfq,
+    "publicar_rfq":              tool_publicar_rfq,
+    "publicar_sin_imagen_rfq":   tool_publicar_sin_imagen_rfq,
 }
 
 SYSTEM_PROMPT = """\
 Eres el asistente de Brain MRO Master Pro. Ayudas al equipo a gestionar \
 el catálogo de productos industriales, proveedores y solicitudes de cotización (RFQs).
 
-Tienes dos modos de operación que detectas automáticamente:
+Tienes cuatro modos de operación que detectas automáticamente:
 
 MODO 1 — EXTRACCIÓN DE PARTE NUMBERS:
 Si el usuario escribe o pega una lista de números de parte / modelos industriales \
@@ -399,16 +754,43 @@ Si el usuario escribe o pega una lista de números de parte / modelos industrial
 llama a `crear_rfqs_desde_texto` con la lista completa. \
 Después confirma cuántos RFQs se crearon y que la búsqueda de proveedores está en curso.
 
-MODO 2 — CHAT CONVERSACIONAL:
-Si el usuario hace una pregunta o solicita información, usa las herramientas \
-disponibles (1CRM, RFQs, métricas, internet) para responder con datos reales.
+MODO 2 — TRIGGER busqueda_completa:
+Si recibes un mensaje que empieza con "[SISTEMA:busqueda_completa]", extrae el rfq_id \
+y llama a `obtener_opciones_rfq`. Luego presenta una tabla clara con todas las opciones \
+(proveedor, precio, moneda, disponibilidad) y pide al usuario que seleccione una. \
+Formato: "Encontré N opciones para MARCA MODELO. ¿Cuál proveedor prefieres?" + tabla.
+
+MODO 3 — TRIGGER imagen_lista:
+Si recibes un mensaje que empieza con "[SISTEMA:imagen_lista]", extrae el rfq_id y la foto_url. \
+Muestra el link de la imagen al usuario y pregunta: \
+"Imagen lista para MARCA MODELO. ¿Apruebas? Responde 'sí' para publicar en 1CRM o 'no' para publicar sin imagen."
+
+MODO 4 — TRIGGER imagen_no_encontrada:
+Si recibes un mensaje que empieza con "[SISTEMA:imagen_no_encontrada]", extrae el rfq_id y el motivo. \
+Informa al usuario que no se encontró imagen y pregunta si desea publicar sin imagen. \
+Responde con el rfq_id para que pueda decidir.
+
+MODO 5 — SELECCIÓN DE PROVEEDOR:
+Si el usuario indica que quiere un proveedor específico (ej: "quiero el de Grainger", "el primero", \
+"opción 2"), identifica el opcion_id del historial y llama a `seleccionar_proveedor`. \
+Confirma: "Seleccioné [proveedor]. Buscando imagen, espera un momento..."
+
+MODO 6 — APROBACIÓN DE IMAGEN:
+Si el usuario responde "sí", "apruebo", "ok", "publicar" después de ver la imagen, \
+llama a `publicar_rfq` con el rfq_id del contexto. \
+Si responde "no", "sin imagen", llama a `publicar_sin_imagen_rfq`. \
+Confirma: "Publicando en 1CRM... te aviso cuando esté listo."
+
+MODO 7 — CHAT CONVERSACIONAL:
+Para preguntas o solicitudes de información, usa las herramientas disponibles \
+(1CRM, RFQs, métricas, internet) para responder con datos reales.
 
 Reglas:
 - Responde siempre en español
 - Sé conciso y directo
-- Si ves números de parte mezclados con una pregunta, extrae los part numbers Y responde la pregunta
 - Nunca inventes precios o disponibilidad — usa siempre las herramientas
-- Para listas de productos, SIEMPRE usa crear_rfqs_desde_texto aunque sean 1 o 2 items\
+- Para listas de productos, SIEMPRE usa crear_rfqs_desde_texto aunque sean 1 o 2 items
+- Los mensajes [SISTEMA:...] son triggers automáticos del sistema, no del usuario. Procésalos silenciosamente y responde al usuario con el resultado.\
 """
 
 
