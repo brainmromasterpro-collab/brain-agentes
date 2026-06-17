@@ -920,8 +920,8 @@ def main() -> None:
 
     # Recuperar mensajes huérfanos (procesado=false de sesiones anteriores)
     try:
-        supabase.table("mensajes").update({"procesado": True}).eq(
-            "procesado", False
+        supabase.table("mensajes").update({"procesado": True}).filter(
+            "procesado", "is", "false"
         ).eq("role", "user").lt(
             "created_at",
             datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -935,7 +935,7 @@ def main() -> None:
                 supabase.table("mensajes")
                 .select("*")
                 .eq("role", "user")
-                .eq("procesado", False)
+                .filter("procesado", "is", "false")
                 .order("created_at")
                 .limit(1)
                 .execute()
