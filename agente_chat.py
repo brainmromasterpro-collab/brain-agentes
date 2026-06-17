@@ -898,15 +898,18 @@ def procesar_mensaje(msg: dict) -> None:
         tools_used = []
 
     # Guardar respuesta del asistente
-    supabase.table("mensajes").insert({
-        "stream_id": stream_id,
+    log.info(f"Insertando respuesta | stream_id={str(stream_id)!r} | len={len(respuesta)}")
+    insert_resp = supabase.table("mensajes").insert({
+        "stream_id": stream_id if stream_id else None,
         "role":      "assistant",
         "content":   respuesta,
         "procesado": True,
         "metadata":  {"tools_used": tools_used},
     }).execute()
-
-    log.info(f"Respuesta enviada | tools={tools_used}")
+    if hasattr(insert_resp, 'error') and insert_resp.error:
+        log.error(f"Error insertando respuesta: {insert_resp.error}")
+    else:
+        log.info(f"Respuesta enviada | tools={tools_used}")
 
 
 # ─────────────────────────────────────────────────────────────
