@@ -474,8 +474,12 @@ def tool_crear_rfqs_desde_texto(
         if not modelo:
             continue
         try:
+            now    = datetime.now(timezone.utc)
+            suffix = str(uuid.uuid4())[:6].upper()
+            rfq_id_str = f"RFQ-{now.year}-{now.month:02d}{now.day:02d}-{suffix}"
             rfq_resp = supabase.table("rfqs").insert({
                 "stream_id": stream_id,
+                "rfq_id":    rfq_id_str,
                 "modelo":    modelo,
                 "marca":     marca,
                 "estado":    "recibido",
