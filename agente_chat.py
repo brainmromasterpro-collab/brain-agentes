@@ -909,6 +909,7 @@ def procesar_mensaje(msg: dict) -> None:
             {"role": r["role"], "content": r["content"]}
             for r in reversed(hist_resp.data or [])   # revertir → orden cronológico
             if r["role"] in ("user", "assistant")
+            and not r["content"].startswith("[SISTEMA:")
         ]
     except Exception as e:
         log.warning(f"No se pudo cargar historial: {e}")
