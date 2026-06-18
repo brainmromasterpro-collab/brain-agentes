@@ -205,6 +205,7 @@ def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
                     "url":              f"{ONECRM_BASE}/index.php?module=Products&record={rid}",
                     "dist_autorizado":  True,
                     "notas":            desc,
+                    "imagen_url":       r.get("picture") or None,
                 })
 
         log.info(f"1CRM productos: {len(resultados)} resultados (variantes probadas: {len(busquedas)})")
@@ -360,6 +361,12 @@ def buscar_en_google(marca: str, modelo: str) -> list[dict]:
             # Intentar extraer precio del snippet (a veces muestra "$227.68")
             precio_snippet, moneda_snippet = _extract_price_from_text(snippet)
 
+            thumbnail = (
+                item.get("thumbnail")
+                or (item.get("pagemap", {}).get("cse_image") or [{}])[0].get("src")
+                or (item.get("pagemap", {}).get("cse_thumbnail") or [{}])[0].get("src")
+                or None
+            )
             resultados.append({
                 "proveedor":       f"Catálogo {DOMINIO_PROPIO}" if es_propio else hostname,
                 "nombre_producto": item.get("title", f"{marca} {modelo}"),
@@ -372,6 +379,7 @@ def buscar_en_google(marca: str, modelo: str) -> list[dict]:
                 "url":             url,
                 "dist_autorizado": es_propio,
                 "notas":           snippet,
+                "imagen_url":      thumbnail,
             })
             if es_propio:
                 log.info(f"  ★ Resultado propio detectado: {url[:80]}")
@@ -850,6 +858,7 @@ def guardar_opciones(rfq_uuid: str, opciones: list[dict], fx: float) -> None:
             "score_confianza": op.get("score_confianza"),
             "score_ranking": op.get("score_ranking"),
             "notas": op.get("notas"),
+            "imagen_url": op.get("imagen_url") or None,
         }).execute()
 
     log.info("Opciones guardadas OK")
