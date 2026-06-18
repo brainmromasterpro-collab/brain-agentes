@@ -765,8 +765,8 @@ MODO 1 — EXTRACCIÓN DE PARTE NUMBERS:
 Si el usuario escribe o pega una lista de números de parte / modelos industriales \
 (ej: "XA2EVB4LC", "1756-L61", "3RT2028-1AK60"), extrae TODOS los productos y \
 llama a `crear_rfqs_desde_texto` con la lista completa. \
-Responde solo con una línea corta: "N RFQ(s) creados. Buscando proveedores..." \
-No repitas los productos ni incluyas tablas en la confirmación.
+NO respondas nada después — el widget del sistema confirma automáticamente. \
+Devuelve exactamente una cadena vacía como respuesta final.
 
 MODO 2 — TRIGGER busqueda_completa:
 Si recibes un mensaje que empieza con "[SISTEMA:busqueda_completa]", extrae el rfq_id \
@@ -881,8 +881,13 @@ def procesar_mensaje(msg: dict) -> None:
 
     log.info(f"Chat msg {msg_id[:8]} | stream={stream_id!r} | '{contenido[:60]}...'")
 
-    # Marcar como procesando
+    # Marcar como procesado
     supabase.table("mensajes").update({"procesado": True}).eq("id", msg_id).execute()
+
+    # Los triggers [SISTEMA:...] los maneja el widget del frontend — no necesitan respuesta de Claude
+    if contenido.startswith("[SISTEMA:"):
+        log.info(f"Trigger sistema ignorado (widget lo maneja): {contenido[:60]}")
+        return
 
     # Obtener historial del stream (últimos 10 mensajes, más recientes primero → revertir)
     historial = []
@@ -915,6 +920,11 @@ def procesar_mensaje(msg: dict) -> None:
         log.error(f"Error en Claude: {e}")
         respuesta  = f"Error procesando tu mensaje. Intenta de nuevo. ({str(e)[:80]})"
         tools_used = []
+
+    # No insertar respuesta vacía (widget ya confirmó visualmente)
+    if not respuesta.strip():
+        log.info("Respuesta vacía — widget maneja la UI, no se inserta mensaje")
+        return
 
     # Guardar respuesta del asistente
     log.info(f"Insertando respuesta | stream_id={str(stream_id)!r} | len={len(respuesta)}")
