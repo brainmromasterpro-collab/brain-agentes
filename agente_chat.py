@@ -459,9 +459,14 @@ def tool_crear_rfqs_desde_texto(
     if not productos:
         return {"error": "Lista de productos vacía"}
 
+    if not stream_id or stream_id in ("None", ""):
+        log.error(f"stream_id inválido en crear_rfqs_desde_texto: {stream_id!r}")
+        return {"error": f"stream_id inválido: {stream_id!r}. El sistema no pudo inyectarlo correctamente."}
+
     bulk_id  = str(uuid.uuid4())
     rfq_ids  = []
     creados  = []
+    errores  = []
 
     for p in productos:
         modelo = p.get("modelo", "").strip()
@@ -490,6 +495,7 @@ def tool_crear_rfqs_desde_texto(
             log.info(f"  → RFQ {rfq_id}: {modelo} | {marca}")
         except Exception as e:
             log.error(f"Error creando RFQ para {modelo}: {e}")
+            errores.append({"modelo": modelo, "error": str(e)})
 
     if rfq_ids:
         lista_txt = "\n".join(
@@ -512,12 +518,15 @@ def tool_crear_rfqs_desde_texto(
         except Exception as e:
             log.warning(f"No se pudo enviar notificación bulk: {e}")
 
-    return {
+    result: dict = {
         "bulk_id":  bulk_id,
         "creados":  len(creados),
         "rfq_ids":  rfq_ids,
         "productos": creados,
     }
+    if errores:
+        result["errores"] = errores
+    return result
 
 
 # ─────────────────────────────────────────────────────────────
@@ -860,7 +869,7 @@ def procesar_mensaje(msg: dict) -> None:
     stream_id = msg.get("stream_id", "")
     contenido = msg.get("content", "")
 
-    log.info(f"Chat msg {msg_id[:8]} | stream={str(stream_id)[:8]} | '{contenido[:60]}...'")
+    log.info(f"Chat msg {msg_id[:8]} | stream={stream_id!r} | '{contenido[:60]}...'")
 
     # Marcar como procesando
     supabase.table("mensajes").update({"procesado": True}).eq("id", msg_id).execute()
