@@ -710,7 +710,7 @@ TOOLS: list[dict] = [
                 },
                 "stream_id": {
                     "type": "string",
-                    "description": "UUID del stream donde se crearán los RFQs",
+                    "description": "UUID del stream — el sistema lo inyecta automáticamente. NO lo pidas al usuario ni lo incluyas tú; déjalo vacío y el sistema lo completará.",
                 },
                 "urgente": {
                     "type": "boolean",
@@ -718,7 +718,7 @@ TOOLS: list[dict] = [
                     "default": False,
                 },
             },
-            "required": ["productos", "stream_id"],
+            "required": ["productos"],
         },
     },
 ]
