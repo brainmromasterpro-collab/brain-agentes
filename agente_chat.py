@@ -487,8 +487,6 @@ def tool_crear_rfqs_desde_texto(
                 "urgente":   urgente,
                 "bulk_id":   bulk_id,
             }
-            if descripcion:
-                rfq_row["descripcion"] = descripcion
             rfq_resp = supabase.table("rfqs").insert(rfq_row).execute()
             rfq_id = rfq_resp.data[0]["id"]
             rfq_ids.append(rfq_id)
@@ -821,8 +819,9 @@ Reglas:
 # ─────────────────────────────────────────────────────────────
 # LOOP DE CLAUDE CON TOOL_USE
 # ─────────────────────────────────────────────────────────────
-def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str]]:
+def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool]:
     tools_used: list[str] = []
+    rfqs_created = False
     current_messages = list(messages)
 
     for _ in range(10):
@@ -838,7 +837,7 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str]]:
             text = next(
                 (b.text for b in response.content if hasattr(b, "text")), ""
             )
-            return text, tools_used
+            return text, tools_used, rfqs_created
 
         if response.stop_reason == "tool_use":
             current_messages.append({"role": "assistant", "content": response.content})
@@ -860,6 +859,8 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str]]:
                 fn = TOOL_FUNCTIONS.get(tool_name)
                 try:
                     result = fn(**tool_input) if fn else {"error": f"Tool '{tool_name}' no existe"}
+                    if tool_name == "crear_rfqs_desde_texto" and result.get("creados", 0) > 0:
+                        rfqs_created = True
                 except Exception as e:
                     result = {"error": str(e)}
 
@@ -873,7 +874,7 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str]]:
         else:
             break
 
-    return "No pude completar la respuesta.", tools_used
+    return "No pude completar la respuesta.", tools_used, rfqs_created
 
 
 # ─────────────────────────────────────────────────────────────
@@ -921,15 +922,16 @@ def procesar_mensaje(msg: dict) -> None:
 
     # Llamar a Claude
     try:
-        respuesta, tools_used = run_chat(historial, stream_id=str(stream_id))
+        respuesta, tools_used, rfqs_created = run_chat(historial, stream_id=str(stream_id))
     except Exception as e:
         log.error(f"Error en Claude: {e}")
-        respuesta  = f"Error procesando tu mensaje. Intenta de nuevo. ({str(e)[:80]})"
-        tools_used = []
+        respuesta    = f"Error procesando tu mensaje. Intenta de nuevo. ({str(e)[:80]})"
+        tools_used   = []
+        rfqs_created = False
 
-    # Si Claude usó crear_rfqs_desde_texto, el widget maneja la UI — no insertar texto
-    if "crear_rfqs_desde_texto" in tools_used:
-        log.info("RFQs creados — widget maneja la UI, omitiendo respuesta de texto")
+    # Si se crearon RFQs exitosamente, el widget confirma visualmente — no insertar texto
+    if rfqs_created:
+        log.info("RFQs creados exitosamente — widget maneja UI, omitiendo respuesta")
         return
 
     # No insertar respuesta vacía
