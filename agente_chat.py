@@ -710,7 +710,7 @@ TOOLS: list[dict] = [
                 },
                 "stream_id": {
                     "type": "string",
-                    "description": "UUID del stream — el sistema lo inyecta automáticamente. NO lo pidas al usuario ni lo incluyas tú; déjalo vacío y el sistema lo completará.",
+                    "description": "NO incluyas este campo en tu tool call. El sistema lo inyecta solo.",
                 },
                 "urgente": {
                     "type": "boolean",
@@ -830,7 +830,7 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str]]:
                 log.info(f"Tool: {tool_name}({json.dumps(tool_input)[:120]})")
 
                 # Inyectar stream_id automáticamente en crear_rfqs_desde_texto
-                if tool_name == "crear_rfqs_desde_texto" and "stream_id" not in tool_input:
+                if tool_name == "crear_rfqs_desde_texto" and not tool_input.get("stream_id"):
                     tool_input["stream_id"] = stream_id
 
                 fn = TOOL_FUNCTIONS.get(tool_name)
