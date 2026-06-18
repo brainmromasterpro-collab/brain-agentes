@@ -927,9 +927,14 @@ def procesar_mensaje(msg: dict) -> None:
         respuesta  = f"Error procesando tu mensaje. Intenta de nuevo. ({str(e)[:80]})"
         tools_used = []
 
-    # No insertar respuesta vacía (widget ya confirmó visualmente)
+    # Si Claude usó crear_rfqs_desde_texto, el widget maneja la UI — no insertar texto
+    if "crear_rfqs_desde_texto" in tools_used:
+        log.info("RFQs creados — widget maneja la UI, omitiendo respuesta de texto")
+        return
+
+    # No insertar respuesta vacía
     if not respuesta.strip():
-        log.info("Respuesta vacía — widget maneja la UI, no se inserta mensaje")
+        log.info("Respuesta vacía — omitiendo inserción")
         return
 
     # Guardar respuesta del asistente
