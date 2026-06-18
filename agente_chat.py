@@ -469,15 +469,16 @@ def tool_crear_rfqs_desde_texto(
     errores  = []
 
     for p in productos:
-        modelo = p.get("modelo", "").strip()
-        marca  = p.get("marca",  "").strip()
+        modelo      = p.get("modelo",      "").strip()
+        marca       = p.get("marca",       "").strip()
+        descripcion = p.get("descripcion", "").strip()
         if not modelo:
             continue
         try:
             now    = datetime.now(timezone.utc)
             suffix = str(uuid.uuid4())[:6].upper()
             rfq_id_str = f"RFQ-{now.year}-{now.month:02d}{now.day:02d}-{suffix}"
-            rfq_resp = supabase.table("rfqs").insert({
+            rfq_row: dict = {
                 "stream_id": stream_id,
                 "rfq_id":    rfq_id_str,
                 "modelo":    modelo,
@@ -485,7 +486,10 @@ def tool_crear_rfqs_desde_texto(
                 "estado":    "recibido",
                 "urgente":   urgente,
                 "bulk_id":   bulk_id,
-            }).execute()
+            }
+            if descripcion:
+                rfq_row["descripcion"] = descripcion
+            rfq_resp = supabase.table("rfqs").insert(rfq_row).execute()
             rfq_id = rfq_resp.data[0]["id"]
             rfq_ids.append(rfq_id)
 
@@ -715,8 +719,9 @@ TOOLS: list[dict] = [
                     "items": {
                         "type": "object",
                         "properties": {
-                            "modelo": {"type": "string", "description": "Número de parte / modelo exacto"},
-                            "marca":  {"type": "string", "description": "Fabricante / marca (vacío si no está claro)"},
+                            "modelo":      {"type": "string", "description": "Número de parte / modelo exacto"},
+                            "marca":       {"type": "string", "description": "Fabricante / marca (vacío si no está claro)"},
+                            "descripcion": {"type": "string", "description": "Descripción breve del producto (ej: 'Outer Piston', 'Circuit Breaker 20A'). Extrae del texto del usuario si está disponible."},
                         },
                         "required": ["modelo"],
                     },
