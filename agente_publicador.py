@@ -670,7 +670,7 @@ def procesar_job_publicador(job: dict) -> None:
             log.warning("Sin foto_url — producto creado sin imagen")
 
         # ── Actualizar RFQ ───────────────────────────────────────────────
-        crm_url  = f"{ONECRM_BASE}/index.php?module=ProductCatalog&record={product_id}"
+        crm_url  = f"{ONECRM_BASE}/index.php?module=ProductCatalog&action=DetailView&record={product_id}"
         supabase.table("rfqs").update({
             "crm_product_id": product_id,
             "crm_url":        crm_url,
