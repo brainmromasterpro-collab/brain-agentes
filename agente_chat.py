@@ -82,25 +82,38 @@ def _onecrm_get(endpoint: str, params: dict = {}) -> dict:
 
 
 def tool_buscar_productos_crm(query: str, limite: int = 10) -> dict:
-    """Busca productos publicados en el CRM buscando en rfqs de Supabase por modelo o marca."""
+    """Busca productos por modelo o marca en Supabase, luego verifica su existencia real en 1CRM
+    usando el crm_product_id. Así confirma que el producto está tanto en Supabase como en el CRM."""
     q = query.strip()
-    resultados = []
+    candidatos = []
     try:
         for field in ("modelo", "marca"):
             resp = supabase.table("rfqs").select(
-                "marca,modelo,estado,crm_url"
+                "marca,modelo,estado,crm_url,crm_product_id"
             ).eq("estado", "publicado").ilike(field, f"%{q}%").limit(limite).execute()
             for r in (resp.data or []):
-                url = r.get("crm_url", "")
-                if url and not any(x["crm_url"] == url for x in resultados):
-                    resultados.append({
-                        "marca":     r.get("marca", ""),
-                        "modelo":    r.get("modelo", ""),
-                        "publicado": True,
-                        "crm_url":   url,
-                    })
+                pid = r.get("crm_product_id")
+                if pid and not any(x["crm_product_id"] == pid for x in candidatos):
+                    candidatos.append(r)
     except Exception as e:
         return {"error": str(e), "total": 0, "resultados": []}
+
+    # Verificar existencia real en 1CRM por ID (una llamada por producto, rápida)
+    resultados = []
+    for r in candidatos:
+        pid = r.get("crm_product_id")
+        try:
+            crm_data = _onecrm_get(f"data/Product/{pid}")
+            en_crm = bool(crm_data.get("record", {}).get("id"))
+        except Exception:
+            en_crm = False
+        resultados.append({
+            "marca":         r.get("marca", ""),
+            "modelo":        r.get("modelo", ""),
+            "en_crm":        en_crm,
+            "crm_url":       r.get("crm_url", "") if en_crm else None,
+        })
+
     return {"total": len(resultados), "resultados": resultados}
 
 
