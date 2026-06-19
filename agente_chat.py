@@ -832,6 +832,9 @@ MODO 1 — EXTRACCIÓN DE PARTE NUMBERS:
 Si el usuario escribe o pega una lista de números de parte / modelos industriales \
 (ej: "XA2EVB4LC", "1756-L61", "3RT2028-1AK60"), extrae TODOS los productos y \
 llama a `crear_rfqs_desde_texto` con la lista completa. \
+CRÍTICO: extrae ÚNICAMENTE los productos del ÚLTIMO mensaje del usuario. \
+Ignora completamente los productos mencionados en mensajes anteriores del historial — \
+esos ya fueron procesados. Nunca combines productos de mensajes distintos en un mismo lote. \
 NO respondas nada después — el widget del sistema confirma automáticamente. \
 Devuelve exactamente una cadena vacía como respuesta final.
 
