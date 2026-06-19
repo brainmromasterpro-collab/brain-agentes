@@ -82,26 +82,32 @@ def _onecrm_get(endpoint: str, params: dict = {}) -> dict:
 
 
 def tool_buscar_productos_crm(query: str, limite: int = 10) -> dict:
-    if not ONECRM_BASE:
-        return {"error": "1CRM no configurado"}
-    data = _onecrm_get("data/Product", {
-        "filter_text": query,
-        "fields": "id,name,description,unit_price,currency_id,manufacturers_part_no",
-        "limit": min(limite, 20),
-    })
-    records = data.get("records", [])
-    return {
-        "total": data.get("total_count", len(records)),
-        "resultados": [
-            {
-                "nombre":      r.get("name", ""),
-                "num_parte":   r.get("manufacturers_part_no", ""),
-                "descripcion": (r.get("description") or "")[:200],
-                "precio":      r.get("unit_price"),
-            }
-            for r in records
-        ],
-    }
+    """Busca productos publicados consultando rfqs en Supabase (fuente de verdad más rápida y confiable)."""
+    try:
+        resp = supabase.table("rfqs").select(
+            "id,marca,modelo,estado,crm_url,crm_product_id,foto_url"
+        ).eq("estado", "publicado").ilike("modelo", f"%{query}%").limit(limite).execute()
+        rows = resp.data or []
+        if not rows:
+            # intenta por marca también
+            resp2 = supabase.table("rfqs").select(
+                "id,marca,modelo,estado,crm_url,crm_product_id"
+            ).eq("estado", "publicado").ilike("marca", f"%{query}%").limit(limite).execute()
+            rows = resp2.data or []
+        return {
+            "total": len(rows),
+            "resultados": [
+                {
+                    "marca":     r.get("marca", ""),
+                    "modelo":    r.get("modelo", ""),
+                    "publicado": r.get("estado") == "publicado",
+                    "crm_url":   r.get("crm_url", ""),
+                }
+                for r in rows
+            ],
+        }
+    except Exception as e:
+        return {"error": str(e), "total": 0, "resultados": []}
 
 
 def tool_ver_producto_crm(producto_id: str) -> dict:
