@@ -467,6 +467,28 @@ def tool_publicar_sin_imagen_rfq(rfq_id: str) -> dict:
         return {"error": str(e)}
 
 
+def tool_verificar_lista_productos(modelos: list) -> dict:
+    """Verifica si una lista de modelos/partes está publicada en el CRM."""
+    resultados = []
+    for modelo in modelos:
+        r = tool_buscar_productos_crm(str(modelo), limite=1)
+        if r.get("total", 0) > 0:
+            item = r["resultados"][0]
+            resultados.append({
+                "modelo":       modelo,
+                "encontrado":   item.get("en_crm", False),
+                "nombre_crm":   item.get("nombre_crm", ""),
+                "precio":       item.get("precio"),
+                "moneda":       item.get("moneda", "USD"),
+                "crm_url":      item.get("crm_url"),
+                "tiene_imagen": item.get("tiene_imagen", False),
+            })
+        else:
+            resultados.append({"modelo": modelo, "encontrado": False, "nombre_crm": "", "precio": None, "crm_url": None})
+    publicados = sum(1 for r in resultados if r["encontrado"])
+    return {"total": len(resultados), "publicados": publicados, "no_encontrados": len(resultados) - publicados, "resultados": resultados}
+
+
 def tool_crear_rfqs_desde_texto(
     productos: list[dict],
     stream_id: str,
@@ -724,6 +746,25 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "verificar_lista_productos",
+        "description": (
+            "Verifica si una lista de modelos/números de parte está publicada en el catálogo 1CRM. "
+            "Úsala cuando el usuario suba un archivo (XLS, documento) y quiera saber cuáles están publicados, "
+            "o cuando pida 'verificar', 'cotejar', '¿cuáles están en el CRM?' sobre una lista de productos."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "modelos": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Lista de modelos o números de parte a verificar",
+                },
+            },
+            "required": ["modelos"],
+        },
+    },
+    {
         "name": "crear_rfqs_desde_texto",
         "description": (
             "Crea RFQs a partir de una lista de productos extraídos del texto del usuario. "
@@ -772,6 +813,7 @@ TOOL_FUNCTIONS = {
     "consultar_rfqs":            tool_consultar_rfqs,
     "consultar_metricas":        tool_consultar_metricas,
     "buscar_internet":           tool_buscar_internet,
+    "verificar_lista_productos":  tool_verificar_lista_productos,
     "crear_rfqs_desde_texto":    tool_crear_rfqs_desde_texto,
     "obtener_opciones_rfq":      tool_obtener_opciones_rfq,
     "seleccionar_proveedor":     tool_seleccionar_proveedor,
@@ -824,6 +866,18 @@ Si el usuario responde "sí", "apruebo", "ok", "publicar" después de ver la ima
 llama a `publicar_rfq` con el rfq_id del contexto. \
 Si responde "no", "sin imagen", llama a `publicar_sin_imagen_rfq`. \
 Confirma: "Publicando en 1CRM... te aviso cuando esté listo."
+
+MODO 8 — VERIFICACIÓN DE LISTA (cuando el usuario sube un archivo con productos):
+Si el usuario manda un mensaje que incluye "[X productos extraídos de" o pide "verificar", "cotejar", \
+"¿cuáles están en el CRM?" sobre una lista de productos, extrae los modelos y llama a \
+`verificar_lista_productos` con todos ellos. Presenta el resultado como tabla:
+
+| Modelo | Estado | Precio | Link |
+|--------|--------|--------|------|
+| modelo1 | ✅ Publicado | $X USD | [Ver CRM](...) |
+| modelo2 | ❌ No encontrado | — | — |
+
+Termina con: "X de Y productos están publicados en el CRM."
 
 MODO 7 — CHAT CONVERSACIONAL:
 Para preguntas o solicitudes de información, usa las herramientas disponibles \
