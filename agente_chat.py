@@ -108,11 +108,11 @@ def tool_ver_producto_crm(producto_id: str) -> dict:
     """Obtiene el detalle completo de un producto del catálogo 1CRM por su ID."""
     if not ONECRM_BASE:
         return {"error": "1CRM no configurado"}
-    data = _onecrm_get(f"data/ProductCatalog/{producto_id}")
+    data = _onecrm_get(f"data/Product/{producto_id}")
     record = data.get("record", data)
     if "error" in data and not record:
         return data
-    url_crm = f"{ONECRM_BASE}/index.php?module=ProductCatalog&record={producto_id}"
+    url_crm = f"{ONECRM_BASE}/index.php?module=ProductCatalog&action=DetailView&record={producto_id}"
     return {
         "id":           record.get("id", producto_id),
         "nombre":       record.get("name", ""),
@@ -139,20 +139,20 @@ def tool_listar_productos_crm(categoria: str = "", limite: int = 15) -> dict:
     }
     if categoria:
         params["filter_text"] = categoria
-    data = _onecrm_get("data/ProductCatalog", params)
+    data = _onecrm_get("data/Product", params)
     records = data.get("records", [])
     return {
-        "total": data.get("total_count", len(records)),
+        "total": data.get("total_results", len(records)),
         "productos": [
             {
                 "id":        r.get("id"),
                 "nombre":    r.get("name", ""),
                 "num_parte": r.get("manufacturers_part_no", ""),
-                "precio":    r.get("unit_price"),
+                "precio":    r.get("list_price"),
                 "moneda":    r.get("currency_id", "USD"),
                 "categoria": r.get("category", ""),
-                "tiene_imagen": bool(r.get("picture")),
-                "url_crm": f"{ONECRM_BASE}/index.php?module=ProductCatalog&record={r.get('id')}",
+                "tiene_imagen": bool(r.get("image_url")),
+                "url_crm": f"{ONECRM_BASE}/index.php?module=ProductCatalog&action=DetailView&record={r.get('id')}",
             }
             for r in records
         ],
