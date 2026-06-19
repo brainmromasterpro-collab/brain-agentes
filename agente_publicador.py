@@ -286,7 +286,7 @@ Search results found:
 
 Return ONLY this JSON (no extra text):
 {{
-  "nombre": "Title format: {{marca}} {{modelo}} - {{short technical description, max 60 chars}}. All in English.",
+  "nombre": "Title format: {{modelo}} - {{marca}} - {{short technical description, max 60 chars}}. All in English.",
   "descripcion": "Technical description in English, 2-4 sentences. Include application, key specs, and compatibility if known.",
   "precio_referencia": {mejor_precio or 0},
   "moneda": "{mejor_moneda}",
@@ -310,7 +310,7 @@ Return ONLY this JSON (no extra text):
     except Exception as e:
         log.error(f"Error generando ficha con Claude: {e}")
         return {
-            "nombre": f"{marca} {modelo} - Industrial Part",
+            "nombre": f"{modelo} - {marca}",
             "descripcion": f"Producto {marca} número de parte {modelo}.",
             "precio_referencia": mejor_precio or 0,
             "moneda": mejor_moneda,
