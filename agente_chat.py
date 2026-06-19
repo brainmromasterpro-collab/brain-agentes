@@ -82,36 +82,60 @@ def _onecrm_get(endpoint: str, params: dict = {}) -> dict:
 
 
 def tool_buscar_productos_crm(query: str, limite: int = 10) -> dict:
-    """Busca productos publicados. Primero busca en rfqs de Supabase (productos publicados desde Jinni).
-    La API de 1CRM no soporta búsqueda por campo — devuelve todos los productos sin filtrar.
-    Si no hay resultados en Supabase, indica que el producto no fue publicado a través de Jinni."""
+    """Busca productos en el catálogo 1CRM por nombre o número de parte.
+    Primero busca en Supabase (rápido). Si no encuentra, itera el catálogo 1CRM filtrando localmente."""
+    q = query.lower().strip()
+    resultados = []
+
+    # 1. Buscar en Supabase rfqs (publicados por Jinni) — rápido
     try:
-        # Buscar por modelo (número de parte)
-        resp = supabase.table("rfqs").select(
-            "id,marca,modelo,estado,crm_url,crm_product_id"
-        ).eq("estado", "publicado").ilike("modelo", f"%{query}%").limit(limite).execute()
-        rows = resp.data or []
-        # Si no encuentra por modelo, buscar por marca
-        if not rows:
-            resp2 = supabase.table("rfqs").select(
-                "id,marca,modelo,estado,crm_url,crm_product_id"
-            ).eq("estado", "publicado").ilike("marca", f"%{query}%").limit(limite).execute()
-            rows = resp2.data or []
-        return {
-            "total": len(rows),
-            "fuente": "supabase_rfqs",
-            "nota": "Solo incluye productos publicados a través de Jinni. La API de 1CRM no soporta búsqueda por campo.",
-            "resultados": [
-                {
-                    "marca":   r.get("marca", ""),
-                    "modelo":  r.get("modelo", ""),
-                    "crm_url": r.get("crm_url", ""),
-                }
-                for r in rows
-            ],
-        }
-    except Exception as e:
-        return {"error": str(e), "total": 0, "resultados": []}
+        for field in ("modelo", "marca"):
+            resp = supabase.table("rfqs").select(
+                "marca,modelo,estado,crm_url"
+            ).eq("estado", "publicado").ilike(field, f"%{q}%").limit(limite).execute()
+            for r in (resp.data or []):
+                if not any(x["crm_url"] == r.get("crm_url") for x in resultados):
+                    resultados.append({
+                        "marca":   r.get("marca", ""),
+                        "modelo":  r.get("modelo", ""),
+                        "crm_url": r.get("crm_url", ""),
+                    })
+    except Exception:
+        pass
+
+    if resultados:
+        return {"total": len(resultados), "resultados": resultados}
+
+    # 2. No encontrado en Supabase — buscar en 1CRM paginando (filtra localmente)
+    if not ONECRM_BASE:
+        return {"total": 0, "resultados": []}
+
+    page = 0
+    page_size = 50
+    max_pages = 10  # máximo 500 productos revisados
+    while page < max_pages and len(resultados) < limite:
+        data = _onecrm_get("data/Product", {
+            "max_results": page_size,
+            "offset": page * page_size,
+            "fields": "id,name,manufacturers_part_no,list_price,image_url",
+            "order_by": "date_modified desc",
+        })
+        records = data.get("records", [])
+        if not records:
+            break
+        for r in records:
+            name = (r.get("name") or "").lower()
+            part = (r.get("manufacturers_part_no") or "").lower()
+            if q in name or q in part:
+                resultados.append({
+                    "nombre":       r.get("name", ""),
+                    "num_parte":    r.get("manufacturers_part_no", ""),
+                    "tiene_imagen": bool(r.get("image_url")),
+                    "crm_url": f"{ONECRM_BASE}/index.php?module=ProductCatalog&action=DetailView&record={r.get('id')}",
+                })
+        page += 1
+
+    return {"total": len(resultados), "resultados": resultados}
 
 
 def tool_ver_producto_crm(producto_id: str) -> dict:
