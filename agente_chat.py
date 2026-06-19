@@ -98,20 +98,29 @@ def tool_buscar_productos_crm(query: str, limite: int = 10) -> dict:
     except Exception as e:
         return {"error": str(e), "total": 0, "resultados": []}
 
-    # Verificar existencia real en 1CRM por ID (una llamada por producto, rápida)
+    # Verificar en 1CRM por ID y traer detalles completos del producto
     resultados = []
     for r in candidatos:
         pid = r.get("crm_product_id")
         try:
             crm_data = _onecrm_get(f"data/Product/{pid}")
-            en_crm = bool(crm_data.get("record", {}).get("id"))
+            rec = crm_data.get("record", {})
+            en_crm = bool(rec.get("id"))
         except Exception:
+            rec = {}
             en_crm = False
         resultados.append({
-            "marca":         r.get("marca", ""),
-            "modelo":        r.get("modelo", ""),
-            "en_crm":        en_crm,
-            "crm_url":       r.get("crm_url", "") if en_crm else None,
+            "marca":        r.get("marca", ""),
+            "modelo":       r.get("modelo", ""),
+            "en_crm":       en_crm,
+            "crm_url":      r.get("crm_url", "") if en_crm else None,
+            "nombre_crm":   rec.get("name", ""),
+            "descripcion":  (rec.get("description") or "")[:300],
+            "precio":       rec.get("list_price"),
+            "moneda":       rec.get("currency_id", "USD"),
+            "disponible":   rec.get("is_available"),
+            "tiene_imagen": bool(rec.get("image_url")),
+            "imagen_url":   rec.get("image_url") or rec.get("thumbnail_url"),
         })
 
     return {"total": len(resultados), "resultados": resultados}
