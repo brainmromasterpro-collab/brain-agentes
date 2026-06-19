@@ -980,18 +980,23 @@ def procesar_mensaje(msg: dict) -> None:
     try:
         hist_resp = (
             supabase.table("mensajes")
-            .select("role, content")
+            .select("role, content, procesado")
             .eq("stream_id", stream_id)
-            .order("created_at", desc=True)   # más recientes primero
+            .order("created_at", desc=True)
             .limit(10)
             .execute()
         )
-        historial = [
-            {"role": r["role"], "content": r["content"]}
-            for r in reversed(hist_resp.data or [])   # revertir → orden cronológico
-            if r["role"] in ("user", "assistant")
-            and not r["content"].startswith("[SISTEMA:")
-        ]
+        for r in reversed(hist_resp.data or []):
+            if r["role"] not in ("user", "assistant"):
+                continue
+            if r["content"].startswith("[SISTEMA:"):
+                continue
+            # Reemplazar contenido de mensajes de usuario ya procesados para que
+            # Claude no re-extraiga productos de turnos anteriores
+            content = r["content"]
+            if r["role"] == "user" and r.get("procesado") and content != contenido:
+                content = "[mensaje anterior — ya procesado]"
+            historial.append({"role": r["role"], "content": content})
     except Exception as e:
         log.warning(f"No se pudo cargar historial: {e}")
         historial = [{"role": "user", "content": contenido}]
