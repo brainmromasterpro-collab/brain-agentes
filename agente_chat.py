@@ -82,59 +82,25 @@ def _onecrm_get(endpoint: str, params: dict = {}) -> dict:
 
 
 def tool_buscar_productos_crm(query: str, limite: int = 10) -> dict:
-    """Busca productos en el catálogo 1CRM por nombre o número de parte.
-    Primero busca en Supabase (rápido). Si no encuentra, itera el catálogo 1CRM filtrando localmente."""
-    q = query.lower().strip()
+    """Busca productos publicados en el CRM buscando en rfqs de Supabase por modelo o marca."""
+    q = query.strip()
     resultados = []
-
-    # 1. Buscar en Supabase rfqs (publicados por Jinni) — rápido
     try:
         for field in ("modelo", "marca"):
             resp = supabase.table("rfqs").select(
                 "marca,modelo,estado,crm_url"
             ).eq("estado", "publicado").ilike(field, f"%{q}%").limit(limite).execute()
             for r in (resp.data or []):
-                if not any(x["crm_url"] == r.get("crm_url") for x in resultados):
+                url = r.get("crm_url", "")
+                if url and not any(x["crm_url"] == url for x in resultados):
                     resultados.append({
-                        "marca":   r.get("marca", ""),
-                        "modelo":  r.get("modelo", ""),
-                        "crm_url": r.get("crm_url", ""),
+                        "marca":     r.get("marca", ""),
+                        "modelo":    r.get("modelo", ""),
+                        "publicado": True,
+                        "crm_url":   url,
                     })
-    except Exception:
-        pass
-
-    if resultados:
-        return {"total": len(resultados), "resultados": resultados}
-
-    # 2. No encontrado en Supabase — buscar en 1CRM paginando (filtra localmente)
-    if not ONECRM_BASE:
-        return {"total": 0, "resultados": []}
-
-    page = 0
-    page_size = 50
-    max_pages = 10  # máximo 500 productos revisados
-    while page < max_pages and len(resultados) < limite:
-        data = _onecrm_get("data/Product", {
-            "max_results": page_size,
-            "offset": page * page_size,
-            "fields": "id,name,manufacturers_part_no,list_price,image_url",
-            "order_by": "date_modified desc",
-        })
-        records = data.get("records", [])
-        if not records:
-            break
-        for r in records:
-            name = (r.get("name") or "").lower()
-            part = (r.get("manufacturers_part_no") or "").lower()
-            if q in name or q in part:
-                resultados.append({
-                    "nombre":       r.get("name", ""),
-                    "num_parte":    r.get("manufacturers_part_no", ""),
-                    "tiene_imagen": bool(r.get("image_url")),
-                    "crm_url": f"{ONECRM_BASE}/index.php?module=ProductCatalog&action=DetailView&record={r.get('id')}",
-                })
-        page += 1
-
+    except Exception as e:
+        return {"error": str(e), "total": 0, "resultados": []}
     return {"total": len(resultados), "resultados": resultados}
 
 
