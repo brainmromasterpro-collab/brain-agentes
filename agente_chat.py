@@ -82,26 +82,30 @@ def _onecrm_get(endpoint: str, params: dict = {}) -> dict:
 
 
 def tool_buscar_productos_crm(query: str, limite: int = 10) -> dict:
-    """Busca productos publicados consultando rfqs en Supabase (fuente de verdad más rápida y confiable)."""
+    """Busca productos publicados. Primero busca en rfqs de Supabase (productos publicados desde Jinni).
+    La API de 1CRM no soporta búsqueda por campo — devuelve todos los productos sin filtrar.
+    Si no hay resultados en Supabase, indica que el producto no fue publicado a través de Jinni."""
     try:
+        # Buscar por modelo (número de parte)
         resp = supabase.table("rfqs").select(
-            "id,marca,modelo,estado,crm_url,crm_product_id,foto_url"
+            "id,marca,modelo,estado,crm_url,crm_product_id"
         ).eq("estado", "publicado").ilike("modelo", f"%{query}%").limit(limite).execute()
         rows = resp.data or []
+        # Si no encuentra por modelo, buscar por marca
         if not rows:
-            # intenta por marca también
             resp2 = supabase.table("rfqs").select(
                 "id,marca,modelo,estado,crm_url,crm_product_id"
             ).eq("estado", "publicado").ilike("marca", f"%{query}%").limit(limite).execute()
             rows = resp2.data or []
         return {
             "total": len(rows),
+            "fuente": "supabase_rfqs",
+            "nota": "Solo incluye productos publicados a través de Jinni. La API de 1CRM no soporta búsqueda por campo.",
             "resultados": [
                 {
-                    "marca":     r.get("marca", ""),
-                    "modelo":    r.get("modelo", ""),
-                    "publicado": r.get("estado") == "publicado",
-                    "crm_url":   r.get("crm_url", ""),
+                    "marca":   r.get("marca", ""),
+                    "modelo":  r.get("modelo", ""),
+                    "crm_url": r.get("crm_url", ""),
                 }
                 for r in rows
             ],
