@@ -899,10 +899,12 @@ Reglas:
 # ─────────────────────────────────────────────────────────────
 # LOOP DE CLAUDE CON TOOL_USE
 # ─────────────────────────────────────────────────────────────
-def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool]:
+def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool, dict]:
     tools_used: list[str] = []
     rfqs_created = False
     current_messages = list(messages)
+    total_input_tokens  = 0
+    total_output_tokens = 0
 
     for _ in range(10):
         response = claude.messages.create(
@@ -913,11 +915,16 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool
             messages=current_messages,
         )
 
+        if hasattr(response, "usage") and response.usage:
+            total_input_tokens  += getattr(response.usage, "input_tokens",  0)
+            total_output_tokens += getattr(response.usage, "output_tokens", 0)
+
         if response.stop_reason == "end_turn":
             text = next(
                 (b.text for b in response.content if hasattr(b, "text")), ""
             )
-            return text, tools_used, rfqs_created
+            token_counts = {"tokens_input": total_input_tokens, "tokens_output": total_output_tokens}
+            return text, tools_used, rfqs_created, token_counts
 
         if response.stop_reason == "tool_use":
             current_messages.append({"role": "assistant", "content": response.content})
@@ -954,7 +961,8 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool
         else:
             break
 
-    return "No pude completar la respuesta.", tools_used, rfqs_created
+    token_counts = {"tokens_input": total_input_tokens, "tokens_output": total_output_tokens}
+    return "No pude completar la respuesta.", tools_used, rfqs_created, token_counts
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1006,13 +1014,28 @@ def procesar_mensaje(msg: dict) -> None:
         historial.append({"role": "user", "content": contenido})
 
     # Llamar a Claude
+    token_counts = {"tokens_input": 0, "tokens_output": 0}
     try:
-        respuesta, tools_used, rfqs_created = run_chat(historial, stream_id=str(stream_id))
+        respuesta, tools_used, rfqs_created, token_counts = run_chat(historial, stream_id=str(stream_id))
     except Exception as e:
         log.error(f"Error en Claude: {e}")
         respuesta    = f"Error procesando tu mensaje. Intenta de nuevo. ({str(e)[:80]})"
         tools_used   = []
         rfqs_created = False
+
+    # Registrar job de chat con tokens para que agente_monitor los sume
+    try:
+        supabase.table("jobs").insert({
+            "agente": "chat",
+            "estado": "completado",
+            "output": {
+                **token_counts,
+                "tokens_total": token_counts["tokens_input"] + token_counts["tokens_output"],
+                "tools_used":   tools_used,
+            },
+        }).execute()
+    except Exception as e:
+        log.warning(f"No se pudo registrar job de chat: {e}")
 
     # Si se crearon RFQs exitosamente, el widget confirma visualmente — no insertar texto
     if rfqs_created:
@@ -1036,7 +1059,7 @@ def procesar_mensaje(msg: dict) -> None:
     if hasattr(insert_resp, 'error') and insert_resp.error:
         log.error(f"Error insertando respuesta: {insert_resp.error}")
     else:
-        log.info(f"Respuesta enviada | tools={tools_used}")
+        log.info(f"Respuesta enviada | tools={tools_used} | tokens={token_counts}")
 
 
 # ─────────────────────────────────────────────────────────────
