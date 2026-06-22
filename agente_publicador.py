@@ -650,13 +650,26 @@ def procesar_job_publicador(job: dict) -> None:
 
         log.info(f"Publicando: {marca} {modelo} | foto={'sí' if foto_url else 'no'}")
 
-        # ── Obtener opciones (Top 5) ─────────────────────────────────────
+        # ── Obtener opciones ─────────────────────────────────────────────
         opts = supabase.table("opciones").select("*").eq("rfq_id", rfq_uuid)\
             .order("rank").execute().data or []
         log.info(f"{len(opts)} opciones encontradas")
 
+        # Usar la opción que el usuario seleccionó (guardada como UUID en rfqs.opcion_seleccionada)
+        opcion_id = rfq.get("opcion_seleccionada")
+        if opcion_id:
+            opts_para_ficha = [op for op in opts if op.get("id") == opcion_id]
+            if not opts_para_ficha:
+                log.warning(f"opcion_seleccionada={opcion_id} no encontrada en opciones, usando rank 1")
+                opts_para_ficha = opts[:1]
+        else:
+            log.warning("No hay opcion_seleccionada en el RFQ, usando rank 1")
+            opts_para_ficha = opts[:1]
+        op_elegida = opts_para_ficha[0]
+        log.info(f"Publicando con opción seleccionada: {op_elegida.get('proveedor','?')} @ {op_elegida.get('precio_orig','?')} {op_elegida.get('moneda','')}")
+
         # ── Claude genera ficha ──────────────────────────────────────────
-        ficha = generar_ficha_producto(marca, modelo, opts)
+        ficha = generar_ficha_producto(marca, modelo, opts_para_ficha)
 
         # ── Crear producto en 1CRM ───────────────────────────────────────
         # crear_producto_en_crm raises RuntimeError with full response if 1CRM fails
