@@ -159,11 +159,10 @@ def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
         log.info(f"Variantes de búsqueda: {variantes}")
 
         # Estrategias: variantes del modelo + búsqueda por marca (filtrado client-side)
-        # Usamos solo los campos básicos en el list — precio e imagen se obtienen del detalle
-        FIELDS = "id,name,product_code,description"
-        busquedas = [{"filter_text": v, "limit": 20, "fields": FIELDS} for v in variantes]
+        # NO pasar "fields" — la API de 1CRM devuelve cero resultados cuando se especifica
+        busquedas = [{"filter_text": v, "limit": 20} for v in variantes]
         if marca:
-            busquedas.append({"filter_text": marca, "limit": 50, "fields": FIELDS})
+            busquedas.append({"filter_text": marca, "limit": 50})
 
         vistos = set()
         resultados = []
