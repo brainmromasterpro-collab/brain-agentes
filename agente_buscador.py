@@ -159,9 +159,11 @@ def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
         log.info(f"Variantes de búsqueda: {variantes}")
 
         # Estrategias: variantes del modelo + búsqueda por marca (filtrado client-side)
-        busquedas = [{"filter_text": v, "limit": 20} for v in variantes]
+        # fields explícitos para que la API devuelva precio (no viene en el default)
+        FIELDS = "id,name,product_code,description,list_price,price,unit_price,currency_id,picture"
+        busquedas = [{"filter_text": v, "limit": 20, "fields": FIELDS} for v in variantes]
         if marca:  # solo buscar por marca si es una marca real (no placeholder)
-            busquedas.append({"filter_text": marca, "limit": 50})
+            busquedas.append({"filter_text": marca, "limit": 50, "fields": FIELDS})
 
         vistos = set()
         resultados = []
@@ -203,7 +205,7 @@ def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
                     "tiempo_entrega":   "Inmediato",
                     "condicion":        "nuevo",
                     "fuente":           "1crm_productos",
-                    "url":              f"{ONECRM_BASE}/index.php?module=AOS_Products&action=DetailView&record={rid}",
+                    "url":              f"{ONECRM_BASE}/index.php?module=ProductCatalog&action=DetailView&record={rid}",
                     "dist_autorizado":  True,
                     "notas":            nombre,
                     "imagen_url":       r.get("picture") or None,
