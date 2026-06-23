@@ -193,18 +193,19 @@ def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
                     continue
 
                 vistos.add(rid)
+                precio_raw = r.get("list_price") or r.get("price") or r.get("unit_price") or 0
                 resultados.append({
                     "proveedor":        "1CRM Catálogo",
                     "nombre_producto":  nombre,
-                    "precio_orig":      float(r.get("price") or 0) or None,
+                    "precio_orig":      float(precio_raw) if float(precio_raw) > 0 else None,
                     "moneda":           "USD",
                     "disponibilidad":   "en_stock",
                     "tiempo_entrega":   "Inmediato",
                     "condicion":        "nuevo",
                     "fuente":           "1crm_productos",
-                    "url":              f"{ONECRM_BASE}/index.php?module=Products&record={rid}",
+                    "url":              f"{ONECRM_BASE}/index.php?module=AOS_Products&action=DetailView&record={rid}",
                     "dist_autorizado":  True,
-                    "notas":            desc,
+                    "notas":            nombre,
                     "imagen_url":       r.get("picture") or None,
                 })
 
