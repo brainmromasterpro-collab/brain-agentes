@@ -505,31 +505,19 @@ def procesar_job_imagen(job: dict) -> None:
         mejor_idx = evaluar_con_claude_vision(marca, modelo, candidatas)
 
         if mejor_idx is None:
-            log.warning("Claude Vision: ninguna imagen aceptable — publicando sin imagen")
-            stream_id = rfq.get("stream_id")
-            motivo = f"Claude revisó {len(candidatas)} imagen(es) y ninguna es aceptable (logos, filigranas o baja calidad)."
-            # Avisar en el chat del stream que no se encontró imagen (informativo)
-            if stream_id:
-                supabase.table("mensajes").insert({
-                    "stream_id": stream_id,
-                    "role":      "user",
-                    "content":   (
-                        f"[SISTEMA:imagen_no_encontrada] rfq_id={rfq_uuid} "
-                        f"marca={marca} modelo={modelo} "
-                        f"motivo=No se encontró imagen aceptable — se publica sin imagen"
-                    ),
-                    "procesado": False,
-                    "metadata":  {"trigger": "imagen_no_encontrada", "rfq_id": rfq_uuid},
-                }).execute()
-            # Publicar de todos modos (restaura el comportamiento que ya funcionaba):
-            # crea el job de publicador, pone rfq en 'publicando' y notifica.
-            _auto_publicar_sin_imagen(rfq_uuid, marca, modelo, motivo=motivo)
-            supabase.table("jobs").update({
-                "estado":      "sin_imagen",
-                "finished_at": datetime.utcnow().isoformat(),
-                "output":      {"resultado": "sin_imagen", "candidatas": len(candidatas)},
-            }).eq("id", job_id).execute()
-            return
+            # Claude rechazó todas, pero SÍ hay imágenes descargadas. Publicar sin
+            # imagen pasaba demasiado seguido (Claude muy estricto). En vez de eso,
+            # usar la candidata de mayor resolución — el usuario puede revisarla y
+            # reemplazarla si no le gusta. "Sin imagen" queda solo para cuando de
+            # verdad no se descargó ninguna candidata.
+            mejor_idx = max(
+                range(len(candidatas)),
+                key=lambda i: candidatas[i]["width"] * candidatas[i]["height"],
+            )
+            log.warning(
+                f"Claude Vision rechazó todas; usando candidata de mayor resolución "
+                f"[idx={mejor_idx}] como fallback"
+            )
 
         ganadora = candidatas[mejor_idx]
         log.info(f"Imagen ganadora [idx={mejor_idx}]: {ganadora['width']}x{ganadora['height']} — {ganadora['url'][:80]}")
