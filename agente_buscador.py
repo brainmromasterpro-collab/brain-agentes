@@ -1249,11 +1249,63 @@ def procesar_job_notificador(job: dict):
 
 # LOOP PRINCIPAL — POLLING
 # ─────────────────────────────────────────
+def resetear_jobs_huerfanos():
+    """
+    Al arrancar, atiende jobs de buscador/notificador que quedaron en
+    'corriendo' por un crash/redeploy anterior (jobs zombie):
+      - recientes (< 1h): probablemente los mató este redeploy → reintentar (pendiente)
+      - viejos: abandonados → marcar fallido (no resucitar)
+    Evita que un agente se vea "encendido" para siempre por un job colgado.
+    """
+    try:
+        huerfanos = (
+            supabase.table("jobs")
+            .select("id, agente, created_at")
+            .in_("agente", ["buscador", "notificador"])
+            .eq("estado", "corriendo")
+            .execute()
+            .data or []
+        )
+        if not huerfanos:
+            log.info("Sin jobs huérfanos del buscador al arrancar")
+            return
+
+        reintentados = 0
+        fallidos = 0
+        for job in huerfanos:
+            try:
+                age_min = (time.time() - datetime.fromisoformat(job["created_at"]).timestamp()) / 60
+            except Exception:
+                age_min = 9999
+
+            if age_min < 60:
+                supabase.table("jobs").update({
+                    "estado":     "pendiente",
+                    "started_at": None,
+                    "error":      "Reseteado por reinicio del agente (redeploy)",
+                }).eq("id", job["id"]).execute()
+                reintentados += 1
+            else:
+                supabase.table("jobs").update({
+                    "estado":      "fallido",
+                    "finished_at": datetime.utcnow().isoformat(),
+                    "error":       "Job zombie: quedó en 'corriendo' tras un crash, sin terminar",
+                }).eq("id", job["id"]).execute()
+                fallidos += 1
+
+        log.warning(f"⚠ Jobs huérfanos buscador: {reintentados} reintentados, {fallidos} marcados fallido")
+    except Exception as e:
+        log.error(f"Error reseteando jobs huérfanos del buscador: {e}")
+
+
 def main():
     log.info("Agente Buscador iniciado — escuchando jobs...")
     log.info(f"1CRM: {ONECRM_BASE}")
     log.info(f"Supabase: {os.environ['SUPABASE_URL']}")
     log.info(f"Poll interval: {POLL_INTERVAL}s")
+
+    # Limpiar jobs que quedaron colgados por un redeploy/crash anterior
+    resetear_jobs_huerfanos()
 
     # Diagnóstico de variables de entorno opcionales
     serpapi_key = os.environ.get("SERPAPI_KEY", "")
