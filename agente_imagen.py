@@ -487,6 +487,13 @@ def procesar_job_imagen(job: dict) -> None:
                     "metadata":  {"trigger": "imagen_no_encontrada", "rfq_id": rfq_uuid},
                 }).execute()
                 supabase.table("rfqs").update({"estado": "sin_imagen"}).eq("id", rfq_uuid).execute()
+                supabase.table("notificaciones").insert({
+                    "tipo":    "imagen_no_encontrada",
+                    "titulo":  f"Sin imagen — {marca} {modelo}",
+                    "mensaje": "No se encontró una imagen aceptable para este producto. Puedes publicarlo sin imagen o reintentar la búsqueda.",
+                    "rfq_id":  rfq_uuid,
+                    "leida":   False,
+                }).execute()
             else:
                 # Automático: publicar sin imagen
                 _auto_publicar_sin_imagen(
@@ -598,6 +605,13 @@ def procesar_job_imagen(job: dict) -> None:
                     "metadata":  {"trigger": "imagen_no_encontrada", "rfq_id": rfq_uuid},
                 }).execute()
                 supabase.table("rfqs").update({"estado": "sin_imagen"}).eq("id", rfq_uuid).execute()
+                supabase.table("notificaciones").insert({
+                    "tipo":    "imagen_no_encontrada",
+                    "titulo":  f"Sin imagen — {marca_fb} {modelo_fb}",
+                    "mensaje": "No se pudo obtener una imagen para este producto. Puedes publicarlo sin imagen o reintentar la búsqueda.",
+                    "rfq_id":  rfq_uuid,
+                    "leida":   False,
+                }).execute()
             else:
                 _auto_publicar_sin_imagen(
                     rfq_uuid, marca_fb, modelo_fb,
