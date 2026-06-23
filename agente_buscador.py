@@ -743,11 +743,30 @@ def rankear_con_claude(
         r for r in otros if r not in crm_proveedores
     ]
 
+    # Asignar un índice estable a cada resultado. Claude devuelve este idx y
+    # reconstruimos la opción desde el dict original — así nunca perdemos
+    # campos como url, imagen_url, nombre_producto que Claude tiende a omitir.
+    for i, r in enumerate(resultados_filtrados):
+        r["_idx"] = i
+
+    def _para_prompt(r: dict) -> dict:
+        return {
+            "idx":             r["_idx"],
+            "proveedor":       r.get("proveedor"),
+            "nombre_producto": r.get("nombre_producto"),
+            "precio_orig":     r.get("precio_orig"),
+            "moneda":          r.get("moneda"),
+            "disponibilidad":  r.get("disponibilidad"),
+            "tiempo_entrega":  r.get("tiempo_entrega"),
+            "condicion":       r.get("condicion"),
+            "fuente":          r.get("fuente"),
+        }
+
     crm_seccion = ""
     if crm_productos:
         crm_seccion = f"""
 ⚠️ CATÁLOGO INTERNO 1CRM — PRIORIDAD MÁXIMA:
-{json.dumps(crm_productos, ensure_ascii=False, indent=2)}
+{json.dumps([_para_prompt(r) for r in crm_productos], ensure_ascii=False, indent=2)}
 
 REGLA: Incluye este resultado en rank 1 (score_confianza=5). Ocupa UN solo slot del Top 5.
 Los slots restantes deben llenarse con las mejores fuentes externas (preferir google_shopping con precio real).
@@ -762,7 +781,7 @@ Ponderación: {ponderacion}
 Tipo de cambio USD/MXN: {fx}
 
 {crm_seccion}RESULTADOS EXTERNOS (Google Shopping, Web, Proveedores CRM):
-{json.dumps([r for r in resultados_filtrados if r.get("fuente") != "1crm_productos"], ensure_ascii=False, indent=2)}
+{json.dumps([_para_prompt(r) for r in resultados_filtrados if r.get("fuente") != "1crm_productos"], ensure_ascii=False, indent=2)}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 REGLAS ABSOLUTAS — VIOLACIÓN = RESULTADO INVÁLIDO
@@ -797,27 +816,25 @@ Tu tarea:
    - 2: resultado Google web con datos claros (fuente=web)
    - 1: fuente no verificada o datos incompletos
 
-Responde SOLO con un JSON array con máximo 5 objetos, ordenados de mayor a menor score_ranking:
+Responde SOLO con un JSON array con máximo 5 objetos, ordenados de mayor a menor score_ranking.
+Cada objeto referencia un resultado original por su "idx" — NO copies proveedor, url ni nombres,
+solo el idx y los campos que calculas tú:
 [
   {{
+    "idx": 0,
     "rank": 1,
-    "proveedor": "nombre",
     "dist_autorizado": true/false,
     "precio_orig": null,
     "moneda": "USD",
     "precio_mxn": null,
     "disponibilidad": "en_stock|consultar|bajo_pedido|importacion|dias_N",
-    "tiempo_entrega": "texto del resultado original, no inventado",
-    "condicion": "nuevo|reacondicionado|usado",
-    "fuente": "1crm_productos|1crm_proveedores|sitio_propio|google_shopping|web",
-    "url": "url exacta del resultado original",
     "score_confianza": 1,
     "score_ranking": 0.00,
     "notas": "si sin precio → 'Precio no disponible, consultar sitio'. si sitio_propio → 'Verificar disponibilidad real en 1CRM'"
   }}
 ]
 
-No incluyas ningún texto fuera del JSON."""
+El "idx" DEBE ser uno de los índices listados arriba. No incluyas ningún texto fuera del JSON."""
 
     cfg = get_config("buscador")
     extra = {"system": cfg["system_prompt"]} if cfg["system_prompt"] else {}
@@ -835,11 +852,32 @@ No incluyas ningún texto fuera del JSON."""
 
     try:
         ranked = json.loads(text)
-        log.info(f"Claude rankeo: {len(ranked)} opciones en Top 5")
-        return ranked
     except json.JSONDecodeError as e:
         log.error(f"Error parseando JSON de Claude: {e}\nRespuesta: {text}")
         return []
+
+    # Reconstruir cada opción: dict original (con url, imagen_url, nombre_producto)
+    # + campos calculados por Claude (rank, scores, precio, disponibilidad, notas).
+    por_idx = {r["_idx"]: r for r in resultados_filtrados}
+    campos_claude = (
+        "rank", "dist_autorizado", "precio_orig", "moneda", "precio_mxn",
+        "disponibilidad", "score_confianza", "score_ranking", "notas",
+    )
+    final = []
+    for item in ranked:
+        idx = item.get("idx")
+        orig = por_idx.get(idx)
+        if orig is None:
+            log.warning(f"Claude devolvió idx inválido {idx} — omitiendo")
+            continue
+        opcion = {k: v for k, v in orig.items() if k != "_idx"}
+        for campo in campos_claude:
+            if campo in item:
+                opcion[campo] = item[campo]
+        final.append(opcion)
+
+    log.info(f"Claude rankeo: {len(final)} opciones en Top 5")
+    return final
 
 
 # ─────────────────────────────────────────
