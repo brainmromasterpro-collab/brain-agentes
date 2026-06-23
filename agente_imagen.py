@@ -57,19 +57,28 @@ BUCKET = "product-images"
 # ─────────────────────────────────────────
 # PASO 1 — BUSCAR IMÁGENES EN GOOGLE
 # ─────────────────────────────────────────
+# Cuántas URLs candidatas reunir antes de pasar a descarga/evaluación
+TARGET_URLS = 8
+
+
 def _build_queries(marca: str, modelo: str) -> list[str]:
-    """Genera lista de queries degradando el modelo de específico a genérico."""
+    """
+    Genera queries de MÁS específica/limpia a más genérica.
+    Las búsquedas limpias (marca+modelo, o solo el part number) suelen dar
+    la imagen correcta; los sufijos tipo 'product image'/'white background'
+    sesgan a fotos stock genéricas equivocadas, así que NO se usan.
+    """
     partes = modelo.split("-")
     modelo_base  = partes[0]                                             # "3RT2028"
     modelo_corto = "-".join(partes[:2]) if len(partes) > 1 else modelo  # "3RT2028-1AK60"
     queries = [
-        f"{marca} {modelo} product image",
-        f"{marca} {modelo_corto} product image",
-        f"{marca} {modelo_base} product image white background",
-        f"{marca} {modelo_base}",
-        f"{marca} {modelo_base} industrial catalog",
+        f"{marca} {modelo}".strip(),            # más limpio primero
+        modelo,                                  # solo el part number (suele ser único)
+        f"{marca} {modelo_corto}".strip(),
+        f"{marca} {modelo} datasheet".strip(),   # datasheets traen foto del producto
+        f"{marca} {modelo_base}".strip(),
     ]
-    return list(dict.fromkeys(queries))  # eliminar duplicados
+    return list(dict.fromkeys(q for q in queries if q))  # dedup, sin vacíos
 
 
 def buscar_imagenes_google(marca: str, modelo: str) -> list[str]:
@@ -83,6 +92,10 @@ def buscar_imagenes_google(marca: str, modelo: str) -> list[str]:
         log.warning("Sin GOOGLE_API_KEY o GOOGLE_CX — Google Images desactivado")
         return []
 
+    # Agregar resultados de varias queries (limpias primero) hasta juntar
+    # un buen pool — no quedarse con el primer hit (que solía traer fotos malas).
+    urls: list[str] = []
+    seen: set[str] = set()
     for query in _build_queries(marca, modelo):
         log.info(f"Google Images: probando query → '{query}'")
         try:
@@ -94,23 +107,29 @@ def buscar_imagenes_google(marca: str, modelo: str) -> list[str]:
                     "q": query,
                     "searchType": "image",
                     "num": 5,
-                    "imgSize": "medium",
                     "safe": "active",
+                    # sin imgSize: 'medium' excluía muchas imágenes válidas
                 },
                 timeout=15,
             )
             resp.raise_for_status()
             items = resp.json().get("items", [])
-            urls = [item["link"] for item in items if "link" in item]
-            if urls:
-                log.info(f"Google Images: {len(urls)} URLs con query '{query}'")
-                return urls
-            log.info(f"Google Images: sin resultados para '{query}', probando siguiente...")
+            nuevos = 0
+            for item in items:
+                link = item.get("link")
+                if link and link not in seen:
+                    seen.add(link)
+                    urls.append(link)
+                    nuevos += 1
+            log.info(f"Google Images: +{nuevos} URLs con '{query}' (total {len(urls)})")
+            if len(urls) >= TARGET_URLS:
+                break
         except Exception as e:
             log.error(f"Google Images error '{query}': {e}")
 
-    log.warning("Google Images: sin resultados tras todos los intentos")
-    return []
+    if not urls:
+        log.warning("Google Images: sin resultados tras todos los intentos")
+    return urls[:TARGET_URLS]
 
 
 def buscar_imagenes_serpapi(marca: str, modelo: str) -> list[str]:
@@ -124,6 +143,8 @@ def buscar_imagenes_serpapi(marca: str, modelo: str) -> list[str]:
         log.warning("Sin SERPAPI_KEY — SerpAPI Images desactivado")
         return []
 
+    urls: list[str] = []
+    seen: set[str] = set()
     for query in _build_queries(marca, modelo):
         log.info(f"SerpAPI Images: probando query → '{query}'")
         try:
@@ -139,16 +160,22 @@ def buscar_imagenes_serpapi(marca: str, modelo: str) -> list[str]:
             )
             resp.raise_for_status()
             images = resp.json().get("images_results", [])
-            urls = [img["original"] for img in images[:5] if img.get("original")]
-            if urls:
-                log.info(f"SerpAPI Images: {len(urls)} URLs con query '{query}'")
-                return urls
-            log.info(f"SerpAPI Images: sin resultados para '{query}', probando siguiente...")
+            nuevos = 0
+            for img in images:
+                link = img.get("original")
+                if link and link not in seen:
+                    seen.add(link)
+                    urls.append(link)
+                    nuevos += 1
+            log.info(f"SerpAPI Images: +{nuevos} URLs con '{query}' (total {len(urls)})")
+            if len(urls) >= TARGET_URLS:
+                break
         except Exception as e:
             log.error(f"SerpAPI Images error '{query}': {e}")
 
-    log.warning("SerpAPI Images: sin resultados tras todos los intentos")
-    return []
+    if not urls:
+        log.warning("SerpAPI Images: sin resultados tras todos los intentos")
+    return urls[:TARGET_URLS]
 
 
 def buscar_imagenes(marca: str, modelo: str) -> list[str]:
@@ -157,10 +184,17 @@ def buscar_imagenes(marca: str, modelo: str) -> list[str]:
     usa SerpAPI como fallback.
     """
     urls = buscar_imagenes_google(marca, modelo)
-    if urls:
-        return urls
-    log.info("Google Images no devolvió resultados — intentando SerpAPI como fallback")
-    return buscar_imagenes_serpapi(marca, modelo)
+    # Si Google trajo pocas, complementar con SerpAPI (mejor pool para Claude)
+    if len(urls) < 4:
+        log.info(f"Google dio {len(urls)} URLs — complementando con SerpAPI")
+        seen = set(urls)
+        for u in buscar_imagenes_serpapi(marca, modelo):
+            if u not in seen:
+                seen.add(u)
+                urls.append(u)
+            if len(urls) >= TARGET_URLS:
+                break
+    return urls[:TARGET_URLS]
 
 
 
