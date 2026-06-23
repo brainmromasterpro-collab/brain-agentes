@@ -159,8 +159,8 @@ def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
         log.info(f"Variantes de búsqueda: {variantes}")
 
         # Estrategias: variantes del modelo + búsqueda por marca (filtrado client-side)
-        # fields explícitos para que la API devuelva precio (no viene en el default)
-        FIELDS = "id,name,product_code,description,list_price,price,unit_price,currency_id,picture"
+        # fields explícitos para que la API devuelva precio e imagen (no vienen en el default)
+        FIELDS = "id,name,product_code,description,list_price,price,unit_price,currency_id,picture,image_url,image_filename"
         busquedas = [{"filter_text": v, "limit": 20, "fields": FIELDS} for v in variantes]
         if marca:  # solo buscar por marca si es una marca real (no placeholder)
             busquedas.append({"filter_text": marca, "limit": 50, "fields": FIELDS})
@@ -196,6 +196,20 @@ def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
 
                 vistos.add(rid)
                 precio_raw = r.get("list_price") or r.get("price") or r.get("unit_price") or 0
+
+                # Construir URL de imagen: preferir image_url (Supabase/externo),
+                # luego image_filename (subido via Playwright → servido por 1CRM),
+                # luego picture como último recurso
+                img_url = r.get("image_url") or None
+                if not img_url:
+                    fn = r.get("image_filename") or ""
+                    if fn:
+                        img_url = f"{ONECRM_BASE}/index.php?entryPoint=download&id={rid}&type=AOS_Products_Quotes&field=picture"
+                if not img_url:
+                    pic = r.get("picture") or ""
+                    if pic.startswith("http"):
+                        img_url = pic
+
                 resultados.append({
                     "proveedor":        "1CRM Catálogo",
                     "nombre_producto":  nombre,
@@ -208,8 +222,9 @@ def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
                     "url":              f"{ONECRM_BASE}/index.php?module=ProductCatalog&action=DetailView&record={rid}",
                     "dist_autorizado":  True,
                     "notas":            nombre,
-                    "imagen_url":       r.get("picture") or None,
+                    "imagen_url":       img_url,
                 })
+                log.info(f"1CRM producto encontrado: {nombre[:40]} | precio={precio_raw} | img={'sí' if img_url else 'no'}")
 
         log.info(f"1CRM productos: {len(resultados)} resultados (variantes probadas: {len(busquedas)})")
         return resultados
