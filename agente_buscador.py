@@ -237,9 +237,25 @@ def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
 # ─────────────────────────────────────────
 # BÚSQUEDA EN 1CRM — PROVEEDORES
 # ─────────────────────────────────────────
+# Proveedores que NUNCA deben aparecer como opción:
+# - la cuenta del propio sistema 1CRM (viene por defecto, no es un proveedor real)
+# - cuentas sin catálogo / genéricas que el usuario pidió excluir
+PROVEEDORES_EXCLUIDOS = [
+    "1crm systems",   # 1CRM Systems Corp — cuenta del propio CRM
+    "2d2",            # 2D2, S.A. de C.V. — sin catálogo
+    "2 d2",
+]
+
+
 def buscar_en_crm_proveedores(marca: str, modelo: str) -> list[dict]:
     log.info(f"Buscando en 1CRM proveedores para: {marca}")
     try:
+        # Sin marca real no se pueden relacionar proveedores → no devolver genéricos
+        palabras_marca = [p.lower() for p in marca.split() if len(p) >= 3]
+        if not palabras_marca:
+            log.info("1CRM proveedores: sin marca, se omite (evita devolver proveedores no relacionados)")
+            return []
+
         # Usar filter_text (no filters[name] — ese parámetro puede ser ignorado por la API)
         data = onecrm_get("data/Account", {
             "filters[account_type]": "Supplier",
@@ -248,16 +264,17 @@ def buscar_en_crm_proveedores(marca: str, modelo: str) -> list[dict]:
         })
         records = data.get("records", [])
 
-        # Validación client-side: el nombre del proveedor debe contener
-        # alguna palabra de la marca (evita devolver proveedores no relacionados)
-        palabras_marca = [p.lower() for p in marca.split() if len(p) >= 3]
-
         resultados = []
         for r in records:
             nombre_proveedor = (r.get("name") or "").lower()
 
+            # Excluir cuentas del sistema / sin catálogo
+            if any(excl in nombre_proveedor for excl in PROVEEDORES_EXCLUIDOS):
+                log.info(f"Proveedor excluido (lista negra): {r.get('name')}")
+                continue
+
             # Descartar si ninguna palabra de la marca aparece en el nombre del proveedor
-            if palabras_marca and not any(p in nombre_proveedor for p in palabras_marca):
+            if not any(p in nombre_proveedor for p in palabras_marca):
                 log.debug(f"Proveedor descartado (sin relación con '{marca}'): {r.get('name')}")
                 continue
 
