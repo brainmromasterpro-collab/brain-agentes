@@ -264,24 +264,19 @@ def evaluar_con_claude_vision(marca: str, modelo: str, candidatas: list[dict]) -
     content.append({
         "type": "text",
         "text": (
-            f"Eres un especialista en catálogos de productos industriales MRO.\n\n"
-            f"Evalúa estas {len(candidatas)} imágenes para el producto: **{marca} {modelo}**\n\n"
-            f"ACEPTA la imagen si:\n"
-            f"- Se ve claramente el producto o un producto del mismo tipo/familia\n"
-            f"- No tiene texto de marca de agua grande que tape el producto\n"
-            f"- No es solo un logo, icono o imagen de 'producto no disponible'\n"
-            f"- El producto es reconocible (fondo blanco, catálogo, foto técnica — todos OK)\n\n"
-            f"RECHAZA solo si:\n"
-            f"- Es un logo, ícono o placeholder (no muestra el producto real)\n"
-            f"- Tiene una filigrana/watermark que cubre más del 30% del producto\n"
-            f"- Es completamente irrelevante (muestra algo totalmente distinto)\n\n"
-            f"IMPORTANTE: Para piezas industriales (fittings, cables, transmisores, válvulas, etc.) "
-            f"las fotos de catálogo con fondo de color, varias piezas juntas, o en contexto de instalación "
-            f"son PERFECTAMENTE aceptables. Sé generoso — prefiere ACEPTA ante la duda.\n\n"
+            f"Selecciona la mejor imagen para el producto: **{marca} {modelo}**\n\n"
+            f"ACEPTA cualquier imagen que muestre un producto físico real — foto de catálogo, "
+            f"foto técnica, fondo blanco, fondo de color, varias piezas, en contexto de "
+            f"instalación, con o sin texto descriptivo, pixelada, pequeña — todo vale.\n\n"
+            f"RECHAZA ÚNICAMENTE si la imagen es:\n"
+            f"- Un placeholder de '404 not found' o 'imagen no disponible'\n"
+            f"- Un logotipo corporativo puro (sin ningún producto visible)\n"
+            f"- Un ícono de interfaz (carrito, lupa, etc.)\n\n"
+            f"CUALQUIER duda → ACEPTA. Es mejor una imagen imperfecta que ninguna.\n\n"
             f"Responde SOLO con este JSON:\n"
             f'{{"evaluaciones":[{{"indice":0,"decision":"ACEPTA|RECHAZA","razon":"breve"}},...], '
             f'"mejor_indice":0,"resumen":"texto breve"}}\n'
-            f'Si ninguna es aceptable: {{"evaluaciones":[...],"mejor_indice":null,"resumen":"..."}}'
+            f'Si ninguna imagen cumple los criterios mínimos: {{"evaluaciones":[...],"mejor_indice":null,"resumen":"..."}}'
         ),
     })
 
