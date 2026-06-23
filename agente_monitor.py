@@ -160,27 +160,35 @@ def check_removebg() -> None:
             timeout=10,
         )
         resp.raise_for_status()
-        data = resp.json().get("data", {})
-        credits = data.get("credits", {})
+        # La API devuelve los créditos bajo data.attributes.credits (no data.credits)
+        attrs   = resp.json().get("data", {}).get("attributes", {})
+        credits = attrs.get("credits", {})
 
         total_creditos    = float(credits.get("total", 0))
         sub_creditos      = float(credits.get("subscription", 0))
         payg_creditos     = float(credits.get("payg", 0))
-        # Remove.bg suscripción gratis: 50 créditos/mes
-        limite            = float(credits.get("subscription_monthly_limit", 50))
+        enterprise        = float(credits.get("enterprise", 0))
 
-        estado = _estado_restante(sub_creditos, limite)
+        # Cuenta de pago (cuota anual): no hay límite mensual fijo.
+        # Marcamos critical solo si quedan muy pocos créditos en términos absolutos.
+        if total_creditos <= 10:
+            estado = "critical"
+        elif total_creditos <= 50:
+            estado = "warning"
+        else:
+            estado = "ok"
 
         upsert("removebg", "creditos_restantes",
-               valor=total_creditos, unidad="créditos",
-               limite=limite, estado=estado)
+               valor=total_creditos, unidad="créditos", estado=estado)
         upsert("removebg", "creditos_suscripcion",
-               valor=sub_creditos, unidad="créditos", limite=limite)
+               valor=sub_creditos, unidad="créditos")
         upsert("removebg", "creditos_payg",
                valor=payg_creditos, unidad="créditos")
+        upsert("removebg", "creditos_enterprise",
+               valor=enterprise, unidad="créditos")
 
         log.info(f"Remove.bg: {total_creditos:.0f} créditos totales "
-                 f"(sub={sub_creditos:.0f}, payg={payg_creditos:.0f}) | {estado}")
+                 f"(sub={sub_creditos:.0f}, payg={payg_creditos:.0f}, ent={enterprise:.0f}) | {estado}")
     except Exception as e:
         log.error(f"Remove.bg check falló: {e}")
         upsert("removebg", "creditos_restantes", estado="critical",
@@ -298,21 +306,39 @@ def check_supabase() -> None:
             except Exception:
                 pass
 
-        # Storage: listar buckets y sumar tamaño
+        # Storage: listar buckets y sumar tamaño (recursivo en subcarpetas)
         try:
             buckets_resp = supabase.storage.list_buckets()
             total_bytes  = 0
+
+            def _sumar_carpeta(bucket_id: str, prefijo: str = "", profundidad: int = 0) -> int:
+                """Suma bytes de una carpeta y desciende en subcarpetas (máx 6 niveles)."""
+                if profundidad > 6:
+                    return 0
+                acumulado = 0
+                try:
+                    items = supabase.storage.from_(bucket_id).list(
+                        prefijo, {"limit": 1000}
+                    )
+                except Exception:
+                    return 0
+                for it in (items or []):
+                    nombre = it.get("name", "")
+                    meta   = it.get("metadata") or {}
+                    if meta.get("size") is not None:
+                        # Es un archivo
+                        acumulado += int(meta.get("size", 0))
+                    else:
+                        # Es una subcarpeta — descender
+                        sub = f"{prefijo}/{nombre}" if prefijo else nombre
+                        acumulado += _sumar_carpeta(bucket_id, sub, profundidad + 1)
+                return acumulado
+
             for bucket in (buckets_resp or []):
                 bucket_id = bucket.id if hasattr(bucket, "id") else bucket.get("id", "")
                 if not bucket_id:
                     continue
-                try:
-                    files = supabase.storage.from_(bucket_id).list()
-                    for f in (files or []):
-                        meta = f.get("metadata") or {}
-                        total_bytes += int(meta.get("size", 0))
-                except Exception:
-                    pass
+                total_bytes += _sumar_carpeta(bucket_id)
 
             storage_gb = round(total_bytes / (1024 ** 3), 3)
             # Plan free de Supabase: 1 GB storage
@@ -348,7 +374,6 @@ def check_railway() -> None:
     token = os.environ.get("RAILWAY_TOKEN", "").strip()
     if not token:
         log.debug("Railway: sin RAILWAY_TOKEN, omitiendo")
-        upsert("railway", "estado", valor_texto="Token no configurado", estado="warning")
         return
     try:
         query = """
@@ -433,53 +458,13 @@ def check_railway() -> None:
         log.info(f"Railway: {servicios_ok} OK / {servicios_error} error | "
                  f"uso={actual} USD | {estado_gral}")
     except Exception as e:
-        log.error(f"Railway check falló: {e}")
-        upsert("railway", "estado", valor_texto=f"Error: {str(e)[:80]}",
-               estado="critical")
+        # No marcamos falla crítica: el heartbeat ya cubre "¿está vivo el backend?".
+        # El API de costos de Railway cambia de esquema; si falla, solo lo registramos.
+        log.warning(f"Railway cost check falló (no crítico): {e}")
 
 
 # ─────────────────────────────────────────────────────────────
-# 7. GITHUB — rate limit
-# ─────────────────────────────────────────────────────────────
-def check_github() -> None:
-    token = os.environ.get("GITHUB_TOKEN", "").strip()
-    headers = {"Accept": "application/vnd.github+json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    try:
-        resp = httpx.get(
-            "https://api.github.com/rate_limit",
-            headers=headers,
-            timeout=10,
-        )
-        resp.raise_for_status()
-        resources = resp.json().get("resources", {})
-
-        core    = resources.get("core",    {})
-        search  = resources.get("search",  {})
-        graphql = resources.get("graphql", {})
-
-        for nombre, data in [("core", core), ("search", search), ("graphql", graphql)]:
-            restante = float(data.get("remaining", 0))
-            limite   = float(data.get("limit",     60))
-            reset_ts = data.get("reset", 0)
-            reset_dt = datetime.fromtimestamp(reset_ts, tz=timezone.utc).strftime("%H:%M UTC")
-
-            estado = _estado_restante(restante, limite)
-            upsert("github", f"{nombre}_restante",
-                   valor=restante, unidad="llamadas",
-                   limite=limite, estado=estado)
-            upsert("github", f"{nombre}_reset",
-                   valor_texto=reset_dt)
-
-        log.info(f"GitHub: core={core.get('remaining')}/{core.get('limit')} | "
-                 f"search={search.get('remaining')}/{search.get('limit')}")
-    except Exception as e:
-        log.error(f"GitHub check falló: {e}")
-
-
-# ─────────────────────────────────────────────────────────────
-# 8. 1CRM — productos y proveedores
+# 7. 1CRM — productos y proveedores
 # ─────────────────────────────────────────────────────────────
 def check_1crm() -> None:
     base = os.environ.get("ONECRM_URL", "").rstrip("/")
@@ -497,7 +482,8 @@ def check_1crm() -> None:
             timeout=15,
         )
         resp_prod.raise_for_status()
-        total_productos = int(resp_prod.json().get("total_count", 0))
+        # La API de 1CRM devuelve "total_results" (no "total_count")
+        total_productos = int(resp_prod.json().get("total_results", 0))
 
         # Total de proveedores (cuentas tipo Supplier)
         resp_prov = httpx.get(
@@ -507,7 +493,7 @@ def check_1crm() -> None:
             timeout=15,
         )
         resp_prov.raise_for_status()
-        total_proveedores = int(resp_prov.json().get("total_count", 0))
+        total_proveedores = int(resp_prov.json().get("total_results", 0))
 
         upsert("1crm", "productos_total",
                valor=total_productos, unidad="productos", estado="ok")
@@ -524,6 +510,15 @@ def check_1crm() -> None:
 # ─────────────────────────────────────────────────────────────
 # LOOP PRINCIPAL
 # ─────────────────────────────────────────────────────────────
+def check_heartbeat() -> None:
+    """Latido del backend. Como el monitor corre DENTRO del worker de Railway,
+    el solo hecho de escribir este timestamp prueba que el backend está vivo.
+    El dashboard calcula 'hace X min' — si es reciente, Railway está corriendo."""
+    upsert("sistema", "backend_activo",
+           valor_texto=datetime.now(timezone.utc).isoformat(),
+           estado="ok")
+
+
 def run_all_checks() -> None:
     log.info("▶ Monitor: ejecutando chequeo de todos los servicios...")
     check_serpapi()
@@ -532,8 +527,8 @@ def run_all_checks() -> None:
     check_google_cse()
     check_supabase()
     check_railway()
-    check_github()
     check_1crm()
+    check_heartbeat()
     log.info("✓ Monitor: chequeo completo")
 
 
