@@ -505,35 +505,25 @@ def procesar_job_imagen(job: dict) -> None:
         mejor_idx = evaluar_con_claude_vision(marca, modelo, candidatas)
 
         if mejor_idx is None:
-            log.warning("Claude Vision: ninguna imagen aceptable")
+            log.warning("Claude Vision: ninguna imagen aceptable — publicando sin imagen")
             stream_id = rfq.get("stream_id")
+            motivo = f"Claude revisó {len(candidatas)} imagen(es) y ninguna es aceptable (logos, filigranas o baja calidad)."
+            # Avisar en el chat del stream que no se encontró imagen (informativo)
             if stream_id:
-                # HITL: notificar al chat para que el usuario decida
                 supabase.table("mensajes").insert({
                     "stream_id": stream_id,
                     "role":      "user",
                     "content":   (
                         f"[SISTEMA:imagen_no_encontrada] rfq_id={rfq_uuid} "
                         f"marca={marca} modelo={modelo} "
-                        f"motivo=Claude revisó {len(candidatas)} imagen(es) y ninguna es aceptable"
+                        f"motivo=No se encontró imagen aceptable — se publica sin imagen"
                     ),
                     "procesado": False,
                     "metadata":  {"trigger": "imagen_no_encontrada", "rfq_id": rfq_uuid},
                 }).execute()
-                supabase.table("rfqs").update({"estado": "sin_imagen"}).eq("id", rfq_uuid).execute()
-                supabase.table("notificaciones").insert({
-                    "tipo":    "imagen_no_encontrada",
-                    "titulo":  f"Sin imagen — {marca} {modelo}",
-                    "mensaje": "No se encontró una imagen aceptable para este producto. Puedes publicarlo sin imagen o reintentar la búsqueda.",
-                    "rfq_id":  rfq_uuid,
-                    "leida":   False,
-                }).execute()
-            else:
-                # Automático: publicar sin imagen
-                _auto_publicar_sin_imagen(
-                    rfq_uuid, marca, modelo,
-                    motivo=f"Claude revisó {len(candidatas)} imagen(es) y ninguna es aceptable (logos, filigranas o baja calidad).",
-                )
+            # Publicar de todos modos (restaura el comportamiento que ya funcionaba):
+            # crea el job de publicador, pone rfq en 'publicando' y notifica.
+            _auto_publicar_sin_imagen(rfq_uuid, marca, modelo, motivo=motivo)
             supabase.table("jobs").update({
                 "estado":      "sin_imagen",
                 "finished_at": datetime.utcnow().isoformat(),
@@ -620,7 +610,7 @@ def procesar_job_imagen(job: dict) -> None:
             "error":       str(e),
         }).eq("id", job_id).execute()
 
-        # Fallback: sin imagen — en HITL notificar al chat, en automático publicar directo
+        # Fallback: error obteniendo imagen → avisar en el chat y publicar sin imagen
         try:
             rfq_fb = supabase.table("rfqs").select("stream_id,marca,modelo").eq("id", rfq_uuid).single().execute().data
             stream_id_fb = (rfq_fb or {}).get("stream_id")
@@ -633,25 +623,17 @@ def procesar_job_imagen(job: dict) -> None:
                     "content":   (
                         f"[SISTEMA:imagen_no_encontrada] rfq_id={rfq_uuid} "
                         f"marca={marca_fb} modelo={modelo_fb} "
-                        f"motivo=Error en agente imagen: {str(e)[:150]}"
+                        f"motivo=No se pudo obtener imagen — se publica sin imagen"
                     ),
                     "procesado": False,
                     "metadata":  {"trigger": "imagen_no_encontrada", "rfq_id": rfq_uuid},
                 }).execute()
-                supabase.table("rfqs").update({"estado": "sin_imagen"}).eq("id", rfq_uuid).execute()
-                supabase.table("notificaciones").insert({
-                    "tipo":    "imagen_no_encontrada",
-                    "titulo":  f"Sin imagen — {marca_fb} {modelo_fb}",
-                    "mensaje": "No se pudo obtener una imagen para este producto. Puedes publicarlo sin imagen o reintentar la búsqueda.",
-                    "rfq_id":  rfq_uuid,
-                    "leida":   False,
-                }).execute()
-            else:
-                _auto_publicar_sin_imagen(
-                    rfq_uuid, marca_fb, modelo_fb,
-                    motivo=f"Error en agente de imágenes: {str(e)[:200]}",
-                )
-            log.info(f"RFQ {rfq_uuid} → fallback sin imagen gestionado")
+            # Publicar de todos modos (crea publicador + pone 'publicando' + notifica)
+            _auto_publicar_sin_imagen(
+                rfq_uuid, marca_fb, modelo_fb,
+                motivo=f"Error en agente de imágenes: {str(e)[:200]}",
+            )
+            log.info(f"RFQ {rfq_uuid} → fallback sin imagen: publicando igual")
         except Exception as e2:
             log.error(f"Error en fallback sin imagen: {e2}")
 
