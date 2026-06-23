@@ -1013,6 +1013,17 @@ def procesar_job(job: dict) -> None:
         agregar_log_job(job_id, "ranking", f"Claude rankeando {len(resultados_limpios)} resultados")
         top5 = rankear_con_claude(marca, modelo, urgente, resultados_limpios, fx)
 
+        # Recuperar imagen_url desde los resultados originales (Claude no la incluye en su output)
+        # Indexar por URL exacta y por fuente+proveedor como fallback
+        raw_by_url  = {r.get("url", ""): r for r in resultados_limpios if r.get("url")}
+        raw_by_key  = {(r.get("fuente", ""), r.get("proveedor", "")): r for r in resultados_limpios}
+        for item in top5:
+            if item.get("imagen_url"):
+                continue
+            orig = raw_by_url.get(item.get("url", "")) or raw_by_key.get((item.get("fuente", ""), item.get("proveedor", "")))
+            if orig and orig.get("imagen_url"):
+                item["imagen_url"] = orig["imagen_url"]
+
         if not top5:
             log.warning(f"Claude no generó ranking para '{marca} {modelo}' — marcando sin_resultado")
             agregar_log_job(job_id, "sin_resultado", "Claude no pudo generar ranking")
@@ -1055,6 +1066,7 @@ def procesar_job(job: dict) -> None:
                     "score_confianza": 5,
                     "score_ranking": 95.0,
                     "notas": prod.get("notas", ""),
+                    "imagen_url": prod.get("imagen_url"),
                 })
             # Renumerar: insertar al inicio, desplazar los últimos
             for i, item in enumerate(insertar):
