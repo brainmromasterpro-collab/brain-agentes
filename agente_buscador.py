@@ -159,10 +159,10 @@ def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
         log.info(f"Variantes de búsqueda: {variantes}")
 
         # Estrategias: variantes del modelo + búsqueda por marca (filtrado client-side)
-        # fields explícitos para que la API devuelva precio e imagen (no vienen en el default)
-        FIELDS = "id,name,product_code,description,list_price,price,unit_price,currency_id,picture,image_url,image_filename"
+        # Usamos solo los campos básicos en el list — precio e imagen se obtienen del detalle
+        FIELDS = "id,name,product_code,description"
         busquedas = [{"filter_text": v, "limit": 20, "fields": FIELDS} for v in variantes]
-        if marca:  # solo buscar por marca si es una marca real (no placeholder)
+        if marca:
             busquedas.append({"filter_text": marca, "limit": 50, "fields": FIELDS})
 
         vistos = set()
@@ -185,46 +185,48 @@ def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
 
                 nombre = r.get("name") or ""
                 codigo = r.get("product_code") or ""
-                desc   = r.get("description") or ""
 
-                # Siempre validar client-side que el modelo realmente coincide,
-                # tanto en búsqueda por marca como en búsqueda por variante
-                # (1CRM filter_text puede hacer fuzzy match y devolver productos no relacionados)
                 if not (_coincide_modelo(modelo, nombre) or _coincide_modelo(modelo, codigo)):
                     log.debug(f"Descartado por _coincide_modelo: '{nombre}' / '{codigo}' vs '{modelo}'")
                     continue
 
                 vistos.add(rid)
-                precio_raw = r.get("list_price") or r.get("price") or r.get("unit_price") or 0
 
-                # Construir URL de imagen: preferir image_url (Supabase/externo),
-                # luego image_filename (subido via Playwright → servido por 1CRM),
-                # luego picture como último recurso
-                img_url = r.get("image_url") or None
-                if not img_url:
-                    fn = r.get("image_filename") or ""
-                    if fn:
+                # Obtener detalle completo para precio e imagen
+                precio_raw = 0
+                img_url    = None
+                try:
+                    det = onecrm_get(f"data/Product/{rid}")
+                    rec = det.get("record", {})
+                    precio_raw = rec.get("list_price") or rec.get("price") or rec.get("unit_price") or 0
+                    # image_url = URL de Supabase (fallback) o vacío
+                    img_url = rec.get("image_url") or None
+                    # image_filename = subido vía Playwright → servido por entryPoint
+                    if not img_url and rec.get("image_filename"):
                         img_url = f"{ONECRM_BASE}/index.php?entryPoint=download&id={rid}&type=AOS_Products_Quotes&field=picture"
-                if not img_url:
-                    pic = r.get("picture") or ""
-                    if pic.startswith("http"):
-                        img_url = pic
+                    # picture como último recurso si es una URL completa
+                    if not img_url:
+                        pic = rec.get("picture") or ""
+                        if pic.startswith("http"):
+                            img_url = pic
+                    log.info(f"1CRM detalle {rid[:8]}: precio={precio_raw} img={'sí' if img_url else 'no'}")
+                except Exception as e:
+                    log.warning(f"No se pudo obtener detalle de 1CRM {rid}: {e}")
 
                 resultados.append({
-                    "proveedor":        "1CRM Catálogo",
-                    "nombre_producto":  nombre,
-                    "precio_orig":      float(precio_raw) if float(precio_raw) > 0 else None,
-                    "moneda":           "USD",
-                    "disponibilidad":   "en_stock",
-                    "tiempo_entrega":   "Inmediato",
-                    "condicion":        "nuevo",
-                    "fuente":           "1crm_productos",
-                    "url":              f"{ONECRM_BASE}/index.php?module=ProductCatalog&action=DetailView&record={rid}",
-                    "dist_autorizado":  True,
-                    "notas":            nombre,
-                    "imagen_url":       img_url,
+                    "proveedor":       "1CRM Catálogo",
+                    "nombre_producto": nombre,
+                    "precio_orig":     float(precio_raw) if float(precio_raw) > 0 else None,
+                    "moneda":          "USD",
+                    "disponibilidad":  "en_stock",
+                    "tiempo_entrega":  "Inmediato",
+                    "condicion":       "nuevo",
+                    "fuente":          "1crm_productos",
+                    "url":             f"{ONECRM_BASE}/index.php?module=ProductCatalog&action=DetailView&record={rid}",
+                    "dist_autorizado": True,
+                    "notas":           nombre,
+                    "imagen_url":      img_url,
                 })
-                log.info(f"1CRM producto encontrado: {nombre[:40]} | precio={precio_raw} | img={'sí' if img_url else 'no'}")
 
         log.info(f"1CRM productos: {len(resultados)} resultados (variantes probadas: {len(busquedas)})")
         return resultados
