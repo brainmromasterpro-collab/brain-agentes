@@ -1063,6 +1063,14 @@ def procesar_job(job: dict) -> None:
             log.info(f"Filtro web: {descartados} resultado(s) descartado(s) por baja calidad")
             agregar_log_job(job_id, "filtro_web", f"{descartados} resultados descartados, {len(resultados_limpios)} pasan al ranking")
 
+        # Descartar fuentes web/shopping sin precio — no aportan valor al ranking
+        FUENTES_REQUIEREN_PRECIO = ("web", "sitio_propio", "google_shopping")
+        resultados_limpios = [
+            r for r in resultados_limpios
+            if r.get("fuente") not in FUENTES_REQUIEREN_PRECIO or (r.get("precio_orig") and float(r.get("precio_orig", 0)) > 0)
+        ]
+        log.info(f"Tras filtro de precio: {len(resultados_limpios)} resultados con precio o fuente confiable")
+
         # Claude rankea
         agregar_log_job(job_id, "ranking", f"Claude rankeando {len(resultados_limpios)} resultados")
         top5 = rankear_con_claude(marca, modelo, urgente, resultados_limpios, fx)
