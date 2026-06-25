@@ -627,125 +627,13 @@ def _extraer_precio_de_url(url: str) -> tuple:
         return None, "USD"
 
 
-# Dominios que bloquean HTTP o renderizan precios con JS — requieren Playwright
-_DOMINIOS_JS = {
-    "radwell.com", "kempstoncontrols.com", "kempston.co.uk",
-    "automation.com", "plcdirect.eu", "surplusindustrialequip.com",
-    "ebay.com", "amazon.com", "aliexpress.com",
-}
-
-def _dominio_requiere_js(url: str) -> bool:
-    try:
-        from urllib.parse import urlparse
-        host = urlparse(url).netloc.lower().lstrip("www.")
-        return any(host == d or host.endswith("." + d) for d in _DOMINIOS_JS)
-    except Exception:
-        return False
-
-
-def _extraer_precio_playwright(url: str) -> tuple:
-    """
-    Visita la URL con Chromium headless y extrae precio de la página renderizada.
-    Solo usar para sitios que requieren JS (Radwell, Kempston, etc.).
-    Timeout total ~20s.
-    """
-    try:
-        from playwright.sync_api import sync_playwright
-
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-            page = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
-            ).new_page()
-            try:
-                page.goto(url, timeout=18000, wait_until="domcontentloaded")
-                page.wait_for_timeout(2500)  # Esperar que JS renderice precios
-                html = page.content()
-            finally:
-                browser.close()
-
-        # Intentar los mismos métodos que _extraer_precio_de_url sobre el HTML renderizado
-        # 1. JSON-LD
-        ld_blocks = re.findall(
-            r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-            html, re.DOTALL | re.IGNORECASE
-        )
-        for block in ld_blocks:
-            try:
-                data = json.loads(block.strip())
-                if isinstance(data, list):
-                    data = data[0]
-                offers = data.get("offers") or data.get("Offers") or {}
-                if isinstance(offers, list):
-                    offers = offers[0]
-                price_val = offers.get("price") or offers.get("lowPrice")
-                if price_val:
-                    price = float(str(price_val).replace(",", "").strip())
-                    if 0.01 < price < 1_000_000:
-                        currency = (offers.get("priceCurrency") or "USD").upper()
-                        return price, currency
-            except Exception:
-                pass
-
-        # 2. Open Graph
-        meta_price = re.search(
-            r'<meta[^>]+(?:product:price:amount|og:price:amount)["\'][^>]+content=["\']([0-9.,]+)["\']',
-            html, re.IGNORECASE
-        )
-        if meta_price:
-            try:
-                price = float(meta_price.group(1).replace(",", ""))
-                if 0.01 < price < 1_000_000:
-                    meta_cur = re.search(
-                        r'<meta[^>]+(?:product:price:currency|og:price:currency)["\'][^>]+content=["\']([A-Z]{3})["\']',
-                        html, re.IGNORECASE
-                    )
-                    return price, (meta_cur.group(1).upper() if meta_cur else "USD")
-            except Exception:
-                pass
-
-        # 3. itemprop
-        ip = re.search(r'itemprop=["\']price["\'][^>]*content=["\']([0-9.,]+)["\']', html, re.IGNORECASE)
-        if ip:
-            try:
-                price = float(ip.group(1).replace(",", ""))
-                if 0.01 < price < 1_000_000:
-                    return price, "USD"
-            except Exception:
-                pass
-
-        # 4. data-price attribute (Radwell usa esto)
-        dp = re.search(r'data-price=["\']([0-9.,]+)["\']', html, re.IGNORECASE)
-        if dp:
-            try:
-                price = float(dp.group(1).replace(",", ""))
-                if 0.01 < price < 1_000_000:
-                    return price, "USD"
-            except Exception:
-                pass
-
-        # 5. Precio en texto visible: "$X,XXX.XX" o "USD X,XXX"
-        price_text = re.search(r'\$\s*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)', html)
-        if price_text:
-            try:
-                price = float(price_text.group(1).replace(",", ""))
-                if 0.01 < price < 1_000_000:
-                    return price, "USD"
-            except Exception:
-                pass
-
-        return None, "USD"
-    except Exception as e:
-        log.debug(f"_extraer_precio_playwright({url[:60]}): {e}")
-        return None, "USD"
-
 
 def enriquecer_precios_web(resultados: list, max_urls: int = 4) -> list:
     """
-    Para resultados web sin precio:
-    1. Visita en paralelo con HTTP rápido (JSON-LD / meta tags).
-    2. Para dominios JS (Radwell, Kempston, etc.) que siguen sin precio,
-       corre Playwright secuencialmente en el hilo principal (no en pool).
+    Para resultados web sin precio, visita las páginas en paralelo y extrae
+    el precio estructurado (JSON-LD / meta tags).
+    Solo procesa resultados de fuente 'web' sin precio_orig.
+    Agrega máx 12s al pipeline total (4 URLs en paralelo con timeout 8s cada una).
     """
     sin_precio = [
         r for r in resultados
@@ -755,45 +643,25 @@ def enriquecer_precios_web(resultados: list, max_urls: int = 4) -> list:
         return resultados
 
     a_enriquecer = sin_precio[:max_urls]
-    log.info(f"Enriqueciendo precios de {len(a_enriquecer)} URL(s) en paralelo (HTTP)...")
+    log.info(f"Enriqueciendo precios de {len(a_enriquecer)} URL(s) en paralelo...")
 
-    # Fase 1: HTTP en paralelo (rápido, ~8s)
-    def _fetch_http(r):
+    def _fetch(r):
         precio, moneda = _extraer_precio_de_url(r["url"])
         return r, precio, moneda
 
     with ThreadPoolExecutor(max_workers=len(a_enriquecer)) as executor:
-        futures = {executor.submit(_fetch_http, r): r for r in a_enriquecer}
+        futures = {executor.submit(_fetch, r): r for r in a_enriquecer}
         for future in as_completed(futures, timeout=13):
             try:
                 r, precio, moneda = future.result()
                 if precio:
                     r["precio_orig"] = precio
                     r["moneda"] = moneda
-                    log.info(f"  ✓ HTTP [{r['proveedor']}]: {precio} {moneda}")
+                    log.info(f"  ✓ Precio extraído [{r['proveedor']}]: {precio} {moneda}")
                 else:
-                    log.debug(f"  - Sin precio HTTP: {r['url'][:70]}")
+                    log.debug(f"  - Sin precio estructurado: {r['url'][:70]}")
             except Exception as e:
-                log.debug(f"  Error HTTP: {e}")
-
-    # Fase 2: Playwright secuencial para dominios JS que siguen sin precio
-    para_playwright = [
-        r for r in a_enriquecer
-        if r.get("precio_orig") is None and _dominio_requiere_js(r.get("url", ""))
-    ]
-    if para_playwright:
-        log.info(f"Enriqueciendo {len(para_playwright)} URL(s) con Playwright (JS)...")
-        for r in para_playwright:
-            try:
-                precio, moneda = _extraer_precio_playwright(r["url"])
-                if precio:
-                    r["precio_orig"] = precio
-                    r["moneda"] = moneda
-                    log.info(f"  ✓ Playwright [{r['proveedor']}]: {precio} {moneda}")
-                else:
-                    log.debug(f"  - Sin precio Playwright: {r['url'][:70]}")
-            except Exception as e:
-                log.debug(f"  Error Playwright: {e}")
+                log.debug(f"  Error enriqueciendo URL: {e}")
 
     return resultados
 
