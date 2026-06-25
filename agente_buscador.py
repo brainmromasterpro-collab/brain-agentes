@@ -742,10 +742,10 @@ def _extraer_precio_playwright(url: str) -> tuple:
 
 def enriquecer_precios_web(resultados: list, max_urls: int = 4) -> list:
     """
-    Para resultados web sin precio, visita las páginas en paralelo y extrae
-    el precio estructurado (JSON-LD / meta tags).
-    Solo procesa resultados de fuente 'web' sin precio_orig.
-    Agrega máx 12s al pipeline total (4 URLs en paralelo con timeout 8s cada una).
+    Para resultados web sin precio:
+    1. Visita en paralelo con HTTP rápido (JSON-LD / meta tags).
+    2. Para dominios JS (Radwell, Kempston, etc.) que siguen sin precio,
+       corre Playwright secuencialmente en el hilo principal (no en pool).
     """
     sin_precio = [
         r for r in resultados
@@ -755,25 +755,45 @@ def enriquecer_precios_web(resultados: list, max_urls: int = 4) -> list:
         return resultados
 
     a_enriquecer = sin_precio[:max_urls]
-    log.info(f"Enriqueciendo precios de {len(a_enriquecer)} URL(s) en paralelo...")
+    log.info(f"Enriqueciendo precios de {len(a_enriquecer)} URL(s) en paralelo (HTTP)...")
 
-    def _fetch(r):
+    # Fase 1: HTTP en paralelo (rápido, ~8s)
+    def _fetch_http(r):
         precio, moneda = _extraer_precio_de_url(r["url"])
         return r, precio, moneda
 
     with ThreadPoolExecutor(max_workers=len(a_enriquecer)) as executor:
-        futures = {executor.submit(_fetch, r): r for r in a_enriquecer}
+        futures = {executor.submit(_fetch_http, r): r for r in a_enriquecer}
         for future in as_completed(futures, timeout=13):
             try:
                 r, precio, moneda = future.result()
                 if precio:
                     r["precio_orig"] = precio
                     r["moneda"] = moneda
-                    log.info(f"  ✓ Precio extraído [{r['proveedor']}]: {precio} {moneda}")
+                    log.info(f"  ✓ HTTP [{r['proveedor']}]: {precio} {moneda}")
                 else:
-                    log.debug(f"  - Sin precio estructurado: {r['url'][:70]}")
+                    log.debug(f"  - Sin precio HTTP: {r['url'][:70]}")
             except Exception as e:
-                log.debug(f"  Error enriqueciendo URL: {e}")
+                log.debug(f"  Error HTTP: {e}")
+
+    # Fase 2: Playwright secuencial para dominios JS que siguen sin precio
+    para_playwright = [
+        r for r in a_enriquecer
+        if r.get("precio_orig") is None and _dominio_requiere_js(r.get("url", ""))
+    ]
+    if para_playwright:
+        log.info(f"Enriqueciendo {len(para_playwright)} URL(s) con Playwright (JS)...")
+        for r in para_playwright:
+            try:
+                precio, moneda = _extraer_precio_playwright(r["url"])
+                if precio:
+                    r["precio_orig"] = precio
+                    r["moneda"] = moneda
+                    log.info(f"  ✓ Playwright [{r['proveedor']}]: {precio} {moneda}")
+                else:
+                    log.debug(f"  - Sin precio Playwright: {r['url'][:70]}")
+            except Exception as e:
+                log.debug(f"  Error Playwright: {e}")
 
     return resultados
 
