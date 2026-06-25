@@ -758,16 +758,12 @@ def enriquecer_precios_web(resultados: list, max_urls: int = 4) -> list:
     log.info(f"Enriqueciendo precios de {len(a_enriquecer)} URL(s) en paralelo...")
 
     def _fetch(r):
-        url = r["url"]
-        if _dominio_requiere_js(url):
-            precio, moneda = _extraer_precio_playwright(url)
-        else:
-            precio, moneda = _extraer_precio_de_url(url)
+        precio, moneda = _extraer_precio_de_url(r["url"])
         return r, precio, moneda
 
     with ThreadPoolExecutor(max_workers=len(a_enriquecer)) as executor:
         futures = {executor.submit(_fetch, r): r for r in a_enriquecer}
-        for future in as_completed(futures, timeout=30):
+        for future in as_completed(futures, timeout=13):
             try:
                 r, precio, moneda = future.result()
                 if precio:
