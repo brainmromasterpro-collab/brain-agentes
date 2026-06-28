@@ -87,7 +87,7 @@ def _onecrm_post(endpoint: str, payload: dict) -> dict:
     try:
         resp = httpx.post(
             f"{ONECRM_BASE}/api.php/{endpoint}",
-            auth=(user, pwd), json={"record": payload}, timeout=20,
+            auth=(user, pwd), json={"data": payload}, timeout=20,
         )
         resp.raise_for_status()
         return resp.json()
@@ -348,6 +348,43 @@ def tool_crear_oportunidad_crm(
         "id":      opp_id,
         "nombre":  nombre,
         "url_crm": f"{ONECRM_BASE}/index.php?module=Opportunities&record={opp_id}" if opp_id else "",
+    }
+
+
+def tool_crear_cuenta_crm(
+    nombre: str,
+    tipo: str = "Customer",
+    email: str = "",
+    telefono: str = "",
+    tel_alternativo: str = "",
+    web: str = "",
+    ciudad: str = "",
+    estado: str = "",
+    pais: str = "Mexico",
+    descripcion: str = "",
+) -> dict:
+    """Crea una nueva cuenta/empresa en 1CRM.
+    tipo: Customer | Supplier | Partner | Competitor | Press | Analyst | Other
+    """
+    if not ONECRM_BASE:
+        return {"error": "1CRM no configurado"}
+    payload: dict = {"name": nombre, "account_type": tipo}
+    if email:         payload["email1"] = email
+    if telefono:      payload["phone_office"] = telefono
+    if tel_alternativo: payload["phone_alternate"] = tel_alternativo
+    if web:           payload["website"] = web
+    if ciudad:        payload["billing_address_city"] = ciudad
+    if estado:        payload["billing_address_state"] = estado
+    if pais:          payload["billing_address_country"] = pais
+    if descripcion:   payload["description"] = descripcion
+    resp = _onecrm_post("data/Account", payload)
+    acct_id = resp.get("id", "")
+    return {
+        "ok":      bool(acct_id),
+        "id":      acct_id,
+        "nombre":  nombre,
+        "url_crm": f"{ONECRM_BASE}/index.php?module=Accounts&record={acct_id}" if acct_id else "",
+        "error":   resp.get("error", ""),
     }
 
 
@@ -826,6 +863,26 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "crear_cuenta_crm",
+        "description": "Crea una nueva cuenta/empresa en 1CRM (cliente, proveedor, socio, etc.).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "nombre":          {"type": "string", "description": "Nombre de la empresa"},
+                "tipo":            {"type": "string", "description": "Customer | Supplier | Partner | Other (default: Customer)"},
+                "email":           {"type": "string"},
+                "telefono":        {"type": "string"},
+                "tel_alternativo": {"type": "string"},
+                "web":             {"type": "string"},
+                "ciudad":          {"type": "string"},
+                "estado":          {"type": "string", "description": "Estado/provincia"},
+                "pais":            {"type": "string", "description": "Default: Mexico"},
+                "descripcion":     {"type": "string"},
+            },
+            "required": ["nombre"],
+        },
+    },
+    {
         "name": "listar_oportunidades_crm",
         "description": "Lista oportunidades/deals en 1CRM. Puede filtrar por etapa o por cuenta.",
         "input_schema": {
@@ -1001,6 +1058,7 @@ TOOL_FUNCTIONS = {
     "buscar_clientes_crm":       tool_buscar_clientes_crm,
     "buscar_contactos_crm":      tool_buscar_contactos_crm,
     "ver_contactos_cuenta_crm":  tool_ver_contactos_cuenta_crm,
+    "crear_cuenta_crm":          tool_crear_cuenta_crm,
     "listar_oportunidades_crm":  tool_listar_oportunidades_crm,
     "crear_oportunidad_crm":     tool_crear_oportunidad_crm,
     "ver_cliente_crm":           tool_ver_cliente_crm,
