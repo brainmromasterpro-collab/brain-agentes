@@ -81,6 +81,20 @@ def _onecrm_get(endpoint: str, params: dict = {}) -> dict:
         return {"error": str(e), "records": [], "total_count": 0}
 
 
+def _onecrm_post(endpoint: str, payload: dict) -> dict:
+    user = os.environ.get("ONECRM_USERNAME", "")
+    pwd  = os.environ.get("ONECRM_PASSWORD",  "")
+    try:
+        resp = httpx.post(
+            f"{ONECRM_BASE}/api.php/{endpoint}",
+            auth=(user, pwd), json={"record": payload}, timeout=20,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def tool_buscar_productos_crm(query: str, limite: int = 10) -> dict:
     """Busca productos por modelo o marca en Supabase, luego verifica su existencia real en 1CRM
     usando el crm_product_id. Así confirma que el producto está tanto en Supabase como en el CRM."""
@@ -268,6 +282,72 @@ def tool_listar_cotizaciones_crm(estado: str = "", cliente_id: str = "", limite:
             }
             for r in records
         ],
+    }
+
+
+def tool_listar_oportunidades_crm(estado: str = "", cuenta_id: str = "", limite: int = 10) -> dict:
+    """Lista oportunidades/deals en 1CRM. estado puede ser: Prospecting, Qualification,
+    Proposal/Price Quote, Negotiation, Closed Won, Closed Lost."""
+    if not ONECRM_BASE:
+        return {"error": "1CRM no configurado"}
+    params: dict = {"max_num": min(limite, 50), "order_by": "date_modified desc"}
+    if estado:
+        params["search_params[sales_stage][0]"] = estado
+    if cuenta_id:
+        params["search_params[account_id][0]"] = cuenta_id
+    data = _onecrm_get("data/Opportunity", params)
+    records = data.get("records", [])
+    return {
+        "total": len(records),
+        "oportunidades": [
+            {
+                "id":        r.get("id"),
+                "nombre":    r.get("name", ""),
+                "etapa":     r.get("sales_stage", ""),
+                "monto":     r.get("amount", ""),
+                "moneda":    r.get("currency_id", ""),
+                "cierre":    r.get("date_closed", ""),
+                "cuenta":    r.get("account_name", ""),
+                "probabilidad": r.get("probability", ""),
+                "url_crm":   f"{ONECRM_BASE}/index.php?module=Opportunities&record={r.get('id')}",
+            }
+            for r in records
+        ],
+    }
+
+
+def tool_crear_oportunidad_crm(
+    nombre: str,
+    cuenta_id: str,
+    monto: float = 0,
+    fecha_cierre: str = "",
+    etapa: str = "Prospecting",
+    descripcion: str = "",
+) -> dict:
+    """Crea una nueva oportunidad en 1CRM.
+    etapa: Prospecting | Qualification | Proposal/Price Quote | Negotiation | Closed Won | Closed Lost
+    fecha_cierre: formato YYYY-MM-DD
+    """
+    if not ONECRM_BASE:
+        return {"error": "1CRM no configurado"}
+    import datetime
+    if not fecha_cierre:
+        fecha_cierre = (datetime.date.today() + datetime.timedelta(days=30)).isoformat()
+    payload = {
+        "name":        nombre,
+        "account_id":  cuenta_id,
+        "amount":      monto,
+        "date_closed": fecha_cierre,
+        "sales_stage": etapa,
+        "description": descripcion,
+    }
+    resp = _onecrm_post("data/Opportunity", payload)
+    opp_id = resp.get("id", "")
+    return {
+        "ok":      bool(opp_id),
+        "id":      opp_id,
+        "nombre":  nombre,
+        "url_crm": f"{ONECRM_BASE}/index.php?module=Opportunities&record={opp_id}" if opp_id else "",
     }
 
 
@@ -746,6 +826,34 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "listar_oportunidades_crm",
+        "description": "Lista oportunidades/deals en 1CRM. Puede filtrar por etapa o por cuenta.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "estado":    {"type": "string", "description": "Etapa: Prospecting, Qualification, Proposal/Price Quote, Negotiation, Closed Won, Closed Lost"},
+                "cuenta_id": {"type": "string", "description": "ID de la cuenta para filtrar sus oportunidades"},
+                "limite":    {"type": "integer", "default": 10},
+            },
+        },
+    },
+    {
+        "name": "crear_oportunidad_crm",
+        "description": "Crea una nueva oportunidad/deal en 1CRM para un cliente.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "nombre":        {"type": "string",  "description": "Nombre descriptivo de la oportunidad"},
+                "cuenta_id":     {"type": "string",  "description": "ID de la cuenta/cliente en 1CRM"},
+                "monto":         {"type": "number",  "description": "Monto estimado de la oportunidad"},
+                "fecha_cierre":  {"type": "string",  "description": "Fecha estimada de cierre YYYY-MM-DD"},
+                "etapa":         {"type": "string",  "description": "Etapa inicial: Prospecting (default), Qualification, Proposal/Price Quote, etc."},
+                "descripcion":   {"type": "string",  "description": "Descripción o contexto de la oportunidad"},
+            },
+            "required": ["nombre", "cuenta_id"],
+        },
+    },
+    {
         "name": "consultar_rfqs",
         "description": "Consulta RFQs activos. Estado puede ser: recibido, buscando, busqueda_completa, foto_lista, publicado, etc.",
         "input_schema": {
@@ -893,6 +1001,8 @@ TOOL_FUNCTIONS = {
     "buscar_clientes_crm":       tool_buscar_clientes_crm,
     "buscar_contactos_crm":      tool_buscar_contactos_crm,
     "ver_contactos_cuenta_crm":  tool_ver_contactos_cuenta_crm,
+    "listar_oportunidades_crm":  tool_listar_oportunidades_crm,
+    "crear_oportunidad_crm":     tool_crear_oportunidad_crm,
     "ver_cliente_crm":           tool_ver_cliente_crm,
     "listar_cotizaciones_crm":   tool_listar_cotizaciones_crm,
     "consultar_rfqs":            tool_consultar_rfqs,
