@@ -295,6 +295,63 @@ def tool_buscar_proveedores_crm(nombre: str = "", categoria: str = "") -> dict:
     }
 
 
+def tool_buscar_contactos_crm(nombre: str = "", cuenta_id: str = "") -> dict:
+    """Busca contactos en 1CRM, opcionalmente filtrados por cuenta/cliente."""
+    if not ONECRM_BASE:
+        return {"error": "1CRM no configurado"}
+    params: list = [("max_num", 20)]
+    if nombre:
+        params.append(("filter_text", nombre))
+    if cuenta_id:
+        params.append(("search_params[primary_account_id][0]", cuenta_id))
+    data = _onecrm_get("data/Contact", dict(params))
+    records = data.get("records", [])
+    resultados = []
+    for r in records:
+        # Para obtener email y cuenta necesitamos el detalle individual
+        detalle = _onecrm_get(f"data/Contact/{r['id']}").get("record", {})
+        resultados.append({
+            "id":       r["id"],
+            "nombre":   f"{detalle.get('first_name', '')} {detalle.get('last_name', '')}".strip() or r.get("name", ""),
+            "email":    detalle.get("email1", "") or detalle.get("email2", ""),
+            "telefono": detalle.get("phone_work", "") or detalle.get("phone_mobile", ""),
+            "cargo":    detalle.get("title", ""),
+            "cuenta_id": detalle.get("primary_account_id", ""),
+            "url_crm":  f"{ONECRM_BASE}/index.php?module=Contacts&action=DetailView&record={r['id']}",
+        })
+    return {"total": len(resultados), "contactos": resultados}
+
+
+def tool_ver_contactos_cuenta_crm(cuenta_id: str) -> dict:
+    """Devuelve todos los contactos asociados a una cuenta/cliente específica en 1CRM."""
+    if not ONECRM_BASE:
+        return {"error": "1CRM no configurado"}
+    # Primero obtener datos de la cuenta
+    cuenta = _onecrm_get(f"data/Account/{cuenta_id}").get("record", {})
+    nombre_cuenta = cuenta.get("name", cuenta_id)
+    # Luego sus contactos
+    data = _onecrm_get("data/Contact", {"max_num": 50, "search_params[primary_account_id][0]": cuenta_id})
+    records = data.get("records", [])
+    contactos = []
+    for r in records:
+        detalle = _onecrm_get(f"data/Contact/{r['id']}").get("record", {})
+        contactos.append({
+            "id":       r["id"],
+            "nombre":   f"{detalle.get('first_name', '')} {detalle.get('last_name', '')}".strip() or r.get("name", ""),
+            "email":    detalle.get("email1", "") or detalle.get("email2", ""),
+            "telefono": detalle.get("phone_work", "") or detalle.get("phone_mobile", ""),
+            "cargo":    detalle.get("title", ""),
+            "ciudad":   detalle.get("primary_address_city", ""),
+            "url_crm":  f"{ONECRM_BASE}/index.php?module=Contacts&action=DetailView&record={r['id']}",
+        })
+    return {
+        "cuenta":    nombre_cuenta,
+        "cuenta_id": cuenta_id,
+        "total":     len(contactos),
+        "contactos": contactos,
+    }
+
+
 def tool_consultar_rfqs(estado: str = "", limite: int = 10) -> dict:
     try:
         q = supabase.table("rfqs").select(
@@ -663,6 +720,28 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "buscar_contactos_crm",
+        "description": "Busca contactos en 1CRM por nombre. Si tienes el ID de una cuenta, pásalo para filtrar solo sus contactos.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "nombre":    {"type": "string", "description": "Nombre del contacto a buscar"},
+                "cuenta_id": {"type": "string", "description": "ID de la cuenta para filtrar contactos de ese cliente"},
+            },
+        },
+    },
+    {
+        "name": "ver_contactos_cuenta_crm",
+        "description": "Devuelve todos los contactos de una cuenta/cliente específica en 1CRM. Usa el cuenta_id obtenido de buscar_clientes_crm.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "cuenta_id": {"type": "string", "description": "ID de la cuenta en 1CRM"},
+            },
+            "required": ["cuenta_id"],
+        },
+    },
+    {
         "name": "consultar_rfqs",
         "description": "Consulta RFQs activos. Estado puede ser: recibido, buscando, busqueda_completa, foto_lista, publicado, etc.",
         "input_schema": {
@@ -808,6 +887,8 @@ TOOL_FUNCTIONS = {
     "listar_productos_crm":      tool_listar_productos_crm,
     "buscar_proveedores_crm":    tool_buscar_proveedores_crm,
     "buscar_clientes_crm":       tool_buscar_clientes_crm,
+    "buscar_contactos_crm":      tool_buscar_contactos_crm,
+    "ver_contactos_cuenta_crm":  tool_ver_contactos_cuenta_crm,
     "ver_cliente_crm":           tool_ver_cliente_crm,
     "listar_cotizaciones_crm":   tool_listar_cotizaciones_crm,
     "consultar_rfqs":            tool_consultar_rfqs,
