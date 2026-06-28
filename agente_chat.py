@@ -186,8 +186,8 @@ def tool_buscar_clientes_crm(query: str = "", limite: int = 10) -> dict:
     if not ONECRM_BASE:
         return {"error": "1CRM no configurado"}
     params: dict = {
-        "fields": "id,name,phone_office,website,billing_address_country,account_type,industry",
-        "limit":  min(limite, 30),
+        "fields":   "id,name,phone_office,website,billing_address_country,account_type,industry",
+        "max_num":  min(limite, 100),
     }
     if query:
         params["filter_text"] = query
@@ -274,8 +274,8 @@ def tool_buscar_proveedores_crm(nombre: str = "", categoria: str = "") -> dict:
         return {"error": "1CRM no configurado"}
     params: dict = {
         "filters[account_type]": "Supplier",
-        "fields": "id,name,phone_office,website,billing_address_country",
-        "limit": 15,
+        "fields":  "id,name,phone_office,website,billing_address_country",
+        "max_num": 30,
     }
     if nombre:
         params["filter_text"] = nombre
