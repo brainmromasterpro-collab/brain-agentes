@@ -334,11 +334,25 @@ def tool_ver_contactos_cuenta_crm(cuenta_id: str) -> dict:
     nombre_cuenta = cuenta.get("name", cuenta_id)
     todos = _get_all_contacts_with_detail()
     contactos = [c for c in todos if c["cuenta_id"] == cuenta_id]
+    # Incluir email/teléfono del Account si no hay Contact records separados
+    info_cuenta: dict = {}
+    acct_email = cuenta.get("email1", "") or cuenta.get("email2", "")
+    acct_tel   = cuenta.get("phone_office", "") or cuenta.get("phone_alternate", "")
+    acct_tel2  = cuenta.get("phone_alternate", "") if cuenta.get("phone_office") else ""
+    if acct_email or acct_tel:
+        info_cuenta = {
+            "email":    acct_email,
+            "telefono": acct_tel,
+            "tel_alt":  acct_tel2,
+            "web":      cuenta.get("website", ""),
+            "nota":     "Datos de contacto registrados en la cuenta (sin contacto individual separado)" if not contactos else "",
+        }
     return {
-        "cuenta":    nombre_cuenta,
-        "cuenta_id": cuenta_id,
-        "total":     len(contactos),
-        "contactos": contactos,
+        "cuenta":      nombre_cuenta,
+        "cuenta_id":   cuenta_id,
+        "info_cuenta": info_cuenta,
+        "total":       len(contactos),
+        "contactos":   contactos,
     }
 
 
