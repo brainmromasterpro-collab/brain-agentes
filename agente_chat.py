@@ -295,55 +295,47 @@ def tool_buscar_proveedores_crm(nombre: str = "", categoria: str = "") -> dict:
     }
 
 
+def _get_all_contacts_with_detail() -> list:
+    """Obtiene todos los contactos del CRM con detalle completo. El API de 1CRM no filtra bien
+    por primary_account_id via search_params, así que traemos todo y filtramos localmente."""
+    records = _onecrm_get("data/Contact", {"max_num": 200}).get("records", [])
+    result = []
+    for r in records:
+        det = _onecrm_get(f"data/Contact/{r['id']}").get("record", {})
+        result.append({
+            "id":        r["id"],
+            "nombre":    f"{det.get('first_name', '')} {det.get('last_name', '')}".strip() or r.get("name", ""),
+            "email":     det.get("email1", "") or det.get("email2", ""),
+            "telefono":  det.get("phone_work", "") or det.get("phone_mobile", ""),
+            "cargo":     det.get("title", ""),
+            "ciudad":    det.get("primary_address_city", ""),
+            "cuenta_id": det.get("primary_account_id", ""),
+            "url_crm":   f"{ONECRM_BASE}/index.php?module=Contacts&action=DetailView&record={r['id']}",
+        })
+    return result
+
+
 def tool_buscar_contactos_crm(nombre: str = "", cuenta_id: str = "") -> dict:
-    """Busca contactos en 1CRM, opcionalmente filtrados por cuenta/cliente."""
+    """Busca contactos en 1CRM por nombre o por cuenta."""
     if not ONECRM_BASE:
         return {"error": "1CRM no configurado"}
-    params: list = [("max_num", 20)]
-    if nombre:
-        params.append(("filter_text", nombre))
+    todos = _get_all_contacts_with_detail()
     if cuenta_id:
-        params.append(("search_params[primary_account_id][0]", cuenta_id))
-    data = _onecrm_get("data/Contact", dict(params))
-    records = data.get("records", [])
-    resultados = []
-    for r in records:
-        # Para obtener email y cuenta necesitamos el detalle individual
-        detalle = _onecrm_get(f"data/Contact/{r['id']}").get("record", {})
-        resultados.append({
-            "id":       r["id"],
-            "nombre":   f"{detalle.get('first_name', '')} {detalle.get('last_name', '')}".strip() or r.get("name", ""),
-            "email":    detalle.get("email1", "") or detalle.get("email2", ""),
-            "telefono": detalle.get("phone_work", "") or detalle.get("phone_mobile", ""),
-            "cargo":    detalle.get("title", ""),
-            "cuenta_id": detalle.get("primary_account_id", ""),
-            "url_crm":  f"{ONECRM_BASE}/index.php?module=Contacts&action=DetailView&record={r['id']}",
-        })
-    return {"total": len(resultados), "contactos": resultados}
+        todos = [c for c in todos if c["cuenta_id"] == cuenta_id]
+    if nombre:
+        q = nombre.lower()
+        todos = [c for c in todos if q in c["nombre"].lower() or q in c["email"].lower()]
+    return {"total": len(todos), "contactos": todos}
 
 
 def tool_ver_contactos_cuenta_crm(cuenta_id: str) -> dict:
-    """Devuelve todos los contactos asociados a una cuenta/cliente específica en 1CRM."""
+    """Devuelve todos los contactos de una cuenta/cliente específica en 1CRM."""
     if not ONECRM_BASE:
         return {"error": "1CRM no configurado"}
-    # Primero obtener datos de la cuenta
     cuenta = _onecrm_get(f"data/Account/{cuenta_id}").get("record", {})
     nombre_cuenta = cuenta.get("name", cuenta_id)
-    # Luego sus contactos
-    data = _onecrm_get("data/Contact", {"max_num": 50, "search_params[primary_account_id][0]": cuenta_id})
-    records = data.get("records", [])
-    contactos = []
-    for r in records:
-        detalle = _onecrm_get(f"data/Contact/{r['id']}").get("record", {})
-        contactos.append({
-            "id":       r["id"],
-            "nombre":   f"{detalle.get('first_name', '')} {detalle.get('last_name', '')}".strip() or r.get("name", ""),
-            "email":    detalle.get("email1", "") or detalle.get("email2", ""),
-            "telefono": detalle.get("phone_work", "") or detalle.get("phone_mobile", ""),
-            "cargo":    detalle.get("title", ""),
-            "ciudad":   detalle.get("primary_address_city", ""),
-            "url_crm":  f"{ONECRM_BASE}/index.php?module=Contacts&action=DetailView&record={r['id']}",
-        })
+    todos = _get_all_contacts_with_detail()
+    contactos = [c for c in todos if c["cuenta_id"] == cuenta_id]
     return {
         "cuenta":    nombre_cuenta,
         "cuenta_id": cuenta_id,
