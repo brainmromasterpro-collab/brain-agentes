@@ -977,7 +977,8 @@ Reglas:
 - Nunca inventes precios o disponibilidad — usa siempre las herramientas
 - CRÍTICO: Si una búsqueda no devuelve resultados, di "no encontré resultados para X" — NUNCA afirmes que un producto "no existe" o "no está publicado" basándote solo en que la búsqueda no lo encontró. La ausencia de resultados NO es prueba de ausencia del producto.
 - Para listas de productos, SIEMPRE usa crear_rfqs_desde_texto aunque sean 1 o 2 items
-- Los mensajes [SISTEMA:...] son triggers automáticos del sistema, no del usuario. Procésalos silenciosamente y responde al usuario con el resultado.\
+- Los mensajes [SISTEMA:...] son triggers automáticos del sistema, no del usuario. Procésalos silenciosamente y responde al usuario con el resultado.
+- CONTACTOS CRM: Cuando el usuario pregunte por el contacto de un cliente, primero usa buscar_clientes_crm para obtener el cuenta_id, luego usa ver_contactos_cuenta_crm. La respuesta incluye "info_cuenta" con el email y teléfono registrados en la cuenta — SIEMPRE muestra esos datos aunque no haya Contact records separados. "info_cuenta" con email o teléfono ES información de contacto válida.\
 """
 
 
