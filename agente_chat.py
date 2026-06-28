@@ -194,14 +194,17 @@ def tool_buscar_clientes_crm(query: str = "", limite: int = 10) -> dict:
         "total": data.get("total_count", len(records)),
         "cuentas": [
             {
-                "id":       r.get("id"),
-                "nombre":   r.get("name", ""),
-                "tipo":     r.get("account_type", ""),
+                "id":        r.get("id"),
+                "nombre":    r.get("name", ""),
+                "tipo":      r.get("account_type", ""),
                 "industria": r.get("industry", ""),
-                "telefono": r.get("phone_office", ""),
-                "web":      r.get("website", ""),
-                "pais":     r.get("billing_address_country", ""),
-                "url_crm":  f"{ONECRM_BASE}/index.php?module=Accounts&record={r.get('id')}",
+                "email":     r.get("email1", "") or r.get("email2", ""),
+                "telefono":  r.get("phone_office", "") or r.get("phone_alternate", ""),
+                "tel_alt":   r.get("phone_alternate", "") if r.get("phone_office") else "",
+                "web":       r.get("website", ""),
+                "ciudad":    r.get("billing_address_city", ""),
+                "pais":      r.get("billing_address_country", ""),
+                "url_crm":   f"{ONECRM_BASE}/index.php?module=Accounts&record={r.get('id')}",
             }
             for r in records
         ],
@@ -219,8 +222,10 @@ def tool_ver_cliente_crm(cliente_id: str) -> dict:
         "nombre":    record.get("name", ""),
         "tipo":      record.get("account_type", ""),
         "industria": record.get("industry", ""),
-        "telefono":  record.get("phone_office", ""),
-        "email":     record.get("email1", ""),
+        "email":     record.get("email1", "") or record.get("email2", ""),
+        "email2":    record.get("email2", "") if record.get("email1") else "",
+        "telefono":  record.get("phone_office", "") or record.get("phone_alternate", ""),
+        "tel_alt":   record.get("phone_alternate", ""),
         "web":       record.get("website", ""),
         "direccion": {
             "calle":   record.get("billing_address_street", ""),
