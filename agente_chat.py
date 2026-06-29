@@ -159,6 +159,105 @@ def tool_buscar_email_gmail(query: str, max_emails: int = 5) -> dict:
     return tool_leer_emails_gmail(max_emails=max_emails, query=query)
 
 
+def _lookup_contact_by_email(email_addr: str) -> dict:
+    """Busca si un email pertenece a un contacto o cuenta en 1CRM."""
+    result: dict = {"contacto": None, "cuenta": None}
+    if not email_addr or not ONECRM_BASE:
+        return result
+    contactos = _onecrm_get("data/Contact", {"max_num": 5, "filter_text": email_addr}).get("records", [])
+    if contactos:
+        det = _onecrm_get(f"data/Contact/{contactos[0]['id']}").get("record", {})
+        result["contacto"] = {
+            "id":        det.get("id"),
+            "nombre":    f"{det.get('first_name','')} {det.get('last_name','')}".strip(),
+            "cargo":     det.get("title", ""),
+            "cuenta_id": det.get("primary_account_id", ""),
+        }
+        if det.get("primary_account_id"):
+            acct = _onecrm_get(f"data/Account/{det['primary_account_id']}").get("record", {})
+            result["cuenta"] = {"id": acct.get("id"), "nombre": acct.get("name", "")}
+    if not result["cuenta"] and "@" in email_addr:
+        domain = email_addr.split("@")[-1]
+        if domain not in ("gmail.com", "hotmail.com", "yahoo.com", "outlook.com", "icloud.com"):
+            keyword = domain.split(".")[0]
+            cuentas = _onecrm_get("data/Account", {"max_num": 3, "filter_text": keyword}).get("records", [])
+            if cuentas:
+                result["cuenta"] = {"id": cuentas[0].get("id"), "nombre": cuentas[0].get("name", "")}
+    return result
+
+
+def _check_products_in_crm(texto: str) -> list:
+    """Extrae posibles part-numbers del texto y verifica si están en el catálogo CRM."""
+    import re
+    patrones = re.findall(
+        r'\b([A-Z0-9]{3,}[-/][A-Z0-9]{2,}(?:[-/][A-Z0-9]+)*|[A-Z]{1,4}\d{4,}[A-Z0-9-]*)\b',
+        texto.upper()
+    )
+    resultados = []
+    vistos: set = set()
+    for pn in patrones[:8]:
+        if pn in vistos:
+            continue
+        vistos.add(pn)
+        data = _onecrm_get("data/AOS_Products_Quotes", {"max_num": 1, "filter_text": pn})
+        en_crm = len(data.get("records", [])) > 0
+        resultados.append({"part_number": pn, "en_catalogo_crm": en_crm})
+    return resultados
+
+
+def tool_escanear_emails_ventas(query: str = "newer_than:3d", max_emails: int = 10) -> dict:
+    """Escanea emails de Gmail buscando oportunidades de venta (RFQs, solicitudes de cotización).
+    Para cada email detecta: si el remitente es cliente en CRM, a qué cuenta pertenece,
+    qué productos/part-numbers menciona y si están en el catálogo.
+    """
+    import re
+    emails_raw = tool_leer_emails_gmail(max_emails=max_emails, query=query)
+    if "error" in emails_raw:
+        return emails_raw
+
+    keywords_rfq = ["rfq", "cotización", "cotizacion", "precio", "presupuesto", "quote",
+                    "disponibilidad", "solicitud", "necesitamos", "requerimos", "cuánto cuesta",
+                    "availability", "request for", "lead time"]
+
+    oportunidades = []
+    for email in emails_raw.get("emails", []):
+        de_raw = email.get("de", "")
+        match = re.search(r'[\w.+-]+@[\w.-]+\.\w+', de_raw)
+        email_addr = match.group(0).lower() if match else ""
+
+        crm_info = _lookup_contact_by_email(email_addr) if email_addr else {"contacto": None, "cuenta": None}
+
+        texto_completo = (email.get("asunto", "") + " " + email.get("cuerpo", "")).lower()
+        es_rfq = any(k in texto_completo for k in keywords_rfq)
+
+        texto_upper = email.get("asunto", "") + " " + email.get("cuerpo", "")
+        productos = _check_products_in_crm(texto_upper)
+        cantidades = re.findall(r'\b(\d+)\s*(?:pz|pzas?|piezas?|unidades?|units?|qty|pcs?)\b', texto_completo)
+
+        oportunidades.append({
+            "email_id":              email.get("id"),
+            "asunto":                email.get("asunto"),
+            "de":                    de_raw,
+            "email_remitente":       email_addr,
+            "fecha":                 email.get("fecha"),
+            "snippet":               email.get("snippet"),
+            "es_rfq":                es_rfq,
+            "cliente_crm":           crm_info["cuenta"],
+            "contacto_crm":          crm_info["contacto"],
+            "es_cliente_conocido":   crm_info["cuenta"] is not None,
+            "productos_detectados":  productos,
+            "cantidades_mencionadas": cantidades,
+            "cuerpo_resumido":       email.get("cuerpo", "")[:800],
+        })
+
+    return {
+        "total_emails":       len(oportunidades),
+        "posibles_rfqs":      len([o for o in oportunidades if o["es_rfq"]]),
+        "clientes_conocidos": len([o for o in oportunidades if o["es_cliente_conocido"]]),
+        "oportunidades":      oportunidades,
+    }
+
+
 def _onecrm_post(endpoint: str, payload: dict) -> dict:
     user = os.environ.get("ONECRM_USERNAME", "")
     pwd  = os.environ.get("ONECRM_PASSWORD",  "")
@@ -964,6 +1063,17 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "escanear_emails_ventas",
+        "description": "Escanea emails de Gmail de los últimos días buscando oportunidades de venta: RFQs, cotizaciones, solicitudes. Detecta si el remitente es cliente existente en CRM, qué productos menciona y si están en catálogo. Usar cuando el usuario pide revisar correos en busca de oportunidades o leads.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query":      {"type": "string",  "description": "Filtro Gmail (default: newer_than:3d). Ejemplos: newer_than:7d, is:unread, from:cliente.com"},
+                "max_emails": {"type": "integer", "description": "Máximo de emails a analizar (default 10, max 20)"},
+            },
+        },
+    },
+    {
         "name": "crear_cuenta_crm",
         "description": "Crea una nueva cuenta/empresa en 1CRM (cliente, proveedor, socio, etc.).",
         "input_schema": {
@@ -1161,6 +1271,7 @@ TOOL_FUNCTIONS = {
     "ver_contactos_cuenta_crm":  tool_ver_contactos_cuenta_crm,
     "leer_emails_gmail":         tool_leer_emails_gmail,
     "buscar_email_gmail":        tool_buscar_email_gmail,
+    "escanear_emails_ventas":    tool_escanear_emails_ventas,
     "crear_cuenta_crm":          tool_crear_cuenta_crm,
     "listar_oportunidades_crm":  tool_listar_oportunidades_crm,
     "crear_oportunidad_crm":     tool_crear_oportunidad_crm,
