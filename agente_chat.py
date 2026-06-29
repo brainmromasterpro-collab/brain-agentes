@@ -62,6 +62,11 @@ claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 ONECRM_BASE   = os.environ.get("ONECRM_URL", "").rstrip("/")
 POLL_INTERVAL = 5   # segundos — respuesta rápida en el chat
 
+GOOGLE_CLIENT_ID     = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
+GMAIL_USER           = "brain.mromasterpro@gmail.com"
+
 
 # ─────────────────────────────────────────────────────────────
 # HERRAMIENTAS — IMPLEMENTACIONES
@@ -79,6 +84,79 @@ def _onecrm_get(endpoint: str, params: dict = {}) -> dict:
         return resp.json()
     except Exception as e:
         return {"error": str(e), "records": [], "total_count": 0}
+
+
+def _gmail_access_token() -> str:
+    """Obtiene un access token fresco usando el refresh token de Google."""
+    resp = httpx.post("https://oauth2.googleapis.com/token", data={
+        "client_id":     GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "refresh_token": GOOGLE_REFRESH_TOKEN,
+        "grant_type":    "refresh_token",
+    }, timeout=15)
+    resp.raise_for_status()
+    return resp.json()["access_token"]
+
+
+def _gmail_decode_body(payload: dict) -> str:
+    """Extrae texto plano del payload de un mensaje de Gmail."""
+    import base64
+
+    def extract(part: dict) -> str:
+        mime = part.get("mimeType", "")
+        if mime == "text/plain":
+            data = part.get("body", {}).get("data", "")
+            if data:
+                return base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="replace")
+        for sub in part.get("parts", []):
+            result = extract(sub)
+            if result:
+                return result
+        return ""
+
+    return extract(payload).strip()
+
+
+def tool_leer_emails_gmail(max_emails: int = 10, query: str = "newer_than:1d") -> dict:
+    """Lee emails de brain.mromasterpro@gmail.com.
+    query soporta filtros de Gmail: newer_than:1d, from:alguien@mail.com, subject:tema, is:unread, etc.
+    """
+    if not GOOGLE_REFRESH_TOKEN:
+        return {"error": "GOOGLE_REFRESH_TOKEN no configurado en Railway"}
+    try:
+        token = _gmail_access_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        base = "https://gmail.googleapis.com/gmail/v1"
+
+        # Listar IDs
+        params = {"userId": "me", "maxResults": min(max_emails, 20), "q": query}
+        lista = httpx.get(f"{base}/users/me/messages", headers=headers, params=params, timeout=15).json()
+        msgs = lista.get("messages", [])
+
+        emails = []
+        for m in msgs:
+            detail = httpx.get(f"{base}/users/me/messages/{m['id']}",
+                headers=headers, params={"userId": "me", "format": "full"}, timeout=15).json()
+            hdrs = {h["name"]: h["value"] for h in detail.get("payload", {}).get("headers", [])}
+            body = _gmail_decode_body(detail.get("payload", {}))
+            emails.append({
+                "id":      m["id"],
+                "de":      hdrs.get("From", ""),
+                "para":    hdrs.get("To", ""),
+                "asunto":  hdrs.get("Subject", ""),
+                "fecha":   hdrs.get("Date", ""),
+                "snippet": detail.get("snippet", ""),
+                "cuerpo":  body[:1500] if body else detail.get("snippet", ""),
+                "leido":   "UNREAD" not in detail.get("labelIds", []),
+            })
+        return {"total": len(emails), "query": query, "emails": emails}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def tool_buscar_email_gmail(query: str, max_emails: int = 5) -> dict:
+    """Busca emails en Gmail con cualquier query: from:, subject:, has:attachment, etc."""
+    return tool_leer_emails_gmail(max_emails=max_emails, query=query)
 
 
 def _onecrm_post(endpoint: str, payload: dict) -> dict:
@@ -863,6 +941,29 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "leer_emails_gmail",
+        "description": "Lee emails de brain.mromasterpro@gmail.com. Por defecto muestra los del día de hoy. Soporta filtros Gmail: newer_than:1d, from:alguien@mail.com, subject:tema, is:unread, etc.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "max_emails": {"type": "integer", "description": "Número máximo de emails a traer (default 10, max 20)"},
+                "query":      {"type": "string",  "description": "Filtro Gmail. Default: newer_than:1d (correos de hoy)"},
+            },
+        },
+    },
+    {
+        "name": "buscar_email_gmail",
+        "description": "Busca emails específicos en Gmail por remitente, asunto, adjuntos, etc.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query":      {"type": "string",  "description": "Query de búsqueda Gmail: from:, subject:, has:attachment, etc."},
+                "max_emails": {"type": "integer", "description": "Máximo de resultados (default 5)"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
         "name": "crear_cuenta_crm",
         "description": "Crea una nueva cuenta/empresa en 1CRM (cliente, proveedor, socio, etc.).",
         "input_schema": {
@@ -1058,6 +1159,8 @@ TOOL_FUNCTIONS = {
     "buscar_clientes_crm":       tool_buscar_clientes_crm,
     "buscar_contactos_crm":      tool_buscar_contactos_crm,
     "ver_contactos_cuenta_crm":  tool_ver_contactos_cuenta_crm,
+    "leer_emails_gmail":         tool_leer_emails_gmail,
+    "buscar_email_gmail":        tool_buscar_email_gmail,
     "crear_cuenta_crm":          tool_crear_cuenta_crm,
     "listar_oportunidades_crm":  tool_listar_oportunidades_crm,
     "crear_oportunidad_crm":     tool_crear_oportunidad_crm,
