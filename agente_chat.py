@@ -970,7 +970,12 @@ def tool_crear_rfqs_desde_texto(
                 "urgente":   urgente,
                 "bulk_id":   bulk_id,
             }
-            rfq_resp = supabase.table("rfqs").insert(rfq_row).execute()
+            try:
+                rfq_resp = supabase.table("rfqs").insert(rfq_row).execute()
+            except Exception:
+                # stream_id no existe en tabla streams — reintenta sin stream
+                rfq_row["stream_id"] = None
+                rfq_resp = supabase.table("rfqs").insert(rfq_row).execute()
             rfq_id = rfq_resp.data[0]["id"]
             rfq_ids.append(rfq_id)
 
