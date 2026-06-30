@@ -1615,11 +1615,16 @@ def procesar_mensaje(msg: dict) -> None:
     # Llamar a Claude
     token_counts = {"tokens_input": 0, "tokens_output": 0}
     try:
-        log.info(f"Historial enviado a Claude: {[{'role': m['role'], 'len': len(str(m.get('content','')))} for m in historial]}")
+        import sys, traceback as _tb
+        roles = [m['role'] for m in historial]
+        print(f"[BRAIN] historial roles: {roles}", flush=True, file=sys.stderr)
         respuesta, tools_used, rfqs_created, token_counts = run_chat(historial, stream_id=str(stream_id))
     except Exception as e:
+        import sys, traceback as _tb
+        print(f"[BRAIN ERROR] {e}", flush=True, file=sys.stderr)
+        _tb.print_exc(file=sys.stderr)
         log.error(f"Error en Claude (completo): {e}")
-        respuesta    = f"Error procesando tu mensaje. Intenta de nuevo. ({str(e)[:200]})"
+        respuesta    = f"Error procesando tu mensaje. Intenta de nuevo. ({str(e)[:400]})"
         tools_used   = []
         rfqs_created = False
 
