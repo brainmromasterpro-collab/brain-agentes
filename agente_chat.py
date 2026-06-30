@@ -163,6 +163,51 @@ def tool_buscar_email_gmail(query: str, max_emails: int = 5) -> dict:
     return tool_leer_emails_gmail(max_emails=max_emails, query=query)
 
 
+def tool_enviar_email_gmail(para: str, asunto: str, cuerpo: str, thread_id: str = "", message_id: str = "") -> dict:
+    """Envía o responde un email desde brain.mromasterpro@gmail.com.
+    Si se pasa thread_id y message_id, responde en el hilo existente (Reply).
+    Si no, envía un email nuevo.
+    """
+    import base64
+    from email.mime.text import MIMEText
+
+    refresh = os.environ.get("GOOGLE_REFRESH_TOKEN", GOOGLE_REFRESH_TOKEN)
+    if not refresh:
+        return {"error": "GOOGLE_REFRESH_TOKEN no configurado en Railway"}
+    try:
+        token = _gmail_access_token()
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        msg = MIMEText(cuerpo, "plain", "utf-8")
+        msg["To"]      = para
+        msg["From"]    = GMAIL_USER
+        msg["Subject"] = asunto
+        if message_id:
+            msg["In-Reply-To"] = message_id
+            msg["References"]  = message_id
+
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        body: dict = {"raw": raw}
+        if thread_id:
+            body["threadId"] = thread_id
+
+        resp = httpx.post(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            headers=headers, json=body, timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return {
+            "ok":         True,
+            "message_id": data.get("id"),
+            "thread_id":  data.get("threadId"),
+            "enviado_a":  para,
+            "asunto":     asunto,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def tool_diagnostico_gmail() -> dict:
     """Diagnóstica el estado de la conexión Gmail — muestra si las variables están configuradas."""
     client_id  = os.environ.get("GOOGLE_CLIENT_ID", "")
@@ -1065,6 +1110,21 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "enviar_email_gmail",
+        "description": "Envía un email o responde en un hilo existente desde brain.mromasterpro@gmail.com. Usar cuando el usuario pide contestar, responder o enviar un correo a alguien.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "para":       {"type": "string", "description": "Email del destinatario"},
+                "asunto":     {"type": "string", "description": "Asunto del email"},
+                "cuerpo":     {"type": "string", "description": "Cuerpo del email en texto plano"},
+                "thread_id":  {"type": "string", "description": "threadId del email original para responder en el mismo hilo (opcional)"},
+                "message_id": {"type": "string", "description": "Message-ID del email original para el header In-Reply-To (opcional)"},
+            },
+            "required": ["para", "asunto", "cuerpo"],
+        },
+    },
+    {
         "name": "diagnostico_gmail",
         "description": "Diagnostica si las variables de Gmail están configuradas correctamente en Railway. Usar cuando Gmail no responde o hay errores de conexión.",
         "input_schema": {"type": "object", "properties": {}},
@@ -1299,6 +1359,7 @@ TOOL_FUNCTIONS = {
     "buscar_clientes_crm":       tool_buscar_clientes_crm,
     "buscar_contactos_crm":      tool_buscar_contactos_crm,
     "ver_contactos_cuenta_crm":  tool_ver_contactos_cuenta_crm,
+    "enviar_email_gmail":        tool_enviar_email_gmail,
     "diagnostico_gmail":         tool_diagnostico_gmail,
     "leer_emails_gmail":         tool_leer_emails_gmail,
     "buscar_email_gmail":        tool_buscar_email_gmail,
@@ -1391,7 +1452,8 @@ Reglas:
 - CRÍTICO: Si una búsqueda no devuelve resultados, di "no encontré resultados para X" — NUNCA afirmes que un producto "no existe" o "no está publicado" basándote solo en que la búsqueda no lo encontró. La ausencia de resultados NO es prueba de ausencia del producto.
 - Para listas de productos, SIEMPRE usa crear_rfqs_desde_texto aunque sean 1 o 2 items
 - Los mensajes [SISTEMA:...] son triggers automáticos del sistema, no del usuario. Procésalos silenciosamente y responde al usuario con el resultado.
-- CONTACTOS CRM: Cuando el usuario pregunte por el contacto de un cliente, primero usa buscar_clientes_crm para obtener el cuenta_id, luego usa ver_contactos_cuenta_crm. La respuesta incluye "info_cuenta" con el email y teléfono registrados en la cuenta — SIEMPRE muestra esos datos aunque no haya Contact records separados. "info_cuenta" con email o teléfono ES información de contacto válida.\
+- CONTACTOS CRM: Cuando el usuario pregunte por el contacto de un cliente, primero usa buscar_clientes_crm para obtener el cuenta_id, luego usa ver_contactos_cuenta_crm. La respuesta incluye "info_cuenta" con el email y teléfono registrados en la cuenta — SIEMPRE muestra esos datos aunque no haya Contact records separados. "info_cuenta" con email o teléfono ES información de contacto válida.
+- EMAILS Y ACCIÓN: Cuando el usuario te pide explícitamente enviar o responder un email (ej: "contéstale", "dile que sí", "mándale cotización"), ACTÚA DIRECTAMENTE con enviar_email_gmail sin pedir confirmación adicional. El usuario ya dio la instrucción. Solo pide confirmación si hay ambigüedad sobre a QUIÉN enviar o si el contenido puede causar un compromiso comercial incorrecto que el usuario no mencionó.\
 """
 
 
