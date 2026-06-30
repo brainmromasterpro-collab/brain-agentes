@@ -193,9 +193,16 @@ def tool_enviar_email_gmail(para: str, asunto: str, cuerpo: str, thread_id: str 
 
         resp = httpx.post(
             "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
-            headers=headers, json=body, timeout=15,
+            headers={"Authorization": f"Bearer {token}"},
+            content=json.dumps(body).encode(),
+            timeout=15,
         )
-        resp.raise_for_status()
+        if not resp.is_success:
+            return {
+                "error":        f"Gmail API {resp.status_code}",
+                "detalle":      resp.text[:500],
+                "token_prefix": token[:20],
+            }
         data = resp.json()
         return {
             "ok":         True,
