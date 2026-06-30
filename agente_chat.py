@@ -230,22 +230,32 @@ def tool_diagnostico_gmail() -> dict:
 
 
 def _lookup_contact_by_email(email_addr: str) -> dict:
-    """Busca si un email pertenece a un contacto o cuenta en 1CRM."""
+    """Busca si un email pertenece a un contacto o cuenta en 1CRM. Máximo 3 llamadas HTTP."""
     result: dict = {"contacto": None, "cuenta": None}
     if not email_addr or not ONECRM_BASE:
         return result
-    contactos = _onecrm_get("data/Contact", {"max_num": 5, "filter_text": email_addr}).get("records", [])
+
+    # 1 llamada: buscar contacto por email con fields necesarios
+    params = [
+        ("max_num", 3), ("filter_text", email_addr),
+        ("fields[]", "id"), ("fields[]", "first_name"), ("fields[]", "last_name"),
+        ("fields[]", "title"), ("fields[]", "primary_account_id"),
+    ]
+    contactos = _onecrm_get("data/Contact", dict(params)).get("records", [])
     if contactos:
-        det = _onecrm_get(f"data/Contact/{contactos[0]['id']}").get("record", {})
+        c = contactos[0]
         result["contacto"] = {
-            "id":        det.get("id"),
-            "nombre":    f"{det.get('first_name','')} {det.get('last_name','')}".strip(),
-            "cargo":     det.get("title", ""),
-            "cuenta_id": det.get("primary_account_id", ""),
+            "id":        c.get("id"),
+            "nombre":    f"{c.get('first_name','')} {c.get('last_name','')}".strip(),
+            "cargo":     c.get("title", ""),
+            "cuenta_id": c.get("primary_account_id", ""),
         }
-        if det.get("primary_account_id"):
-            acct = _onecrm_get(f"data/Account/{det['primary_account_id']}").get("record", {})
+        if c.get("primary_account_id"):
+            # 1 llamada: obtener nombre de la cuenta
+            acct = _onecrm_get(f"data/Account/{c['primary_account_id']}").get("record", {})
             result["cuenta"] = {"id": acct.get("id"), "nombre": acct.get("name", "")}
+
+    # Si no encontramos contacto, buscar por dominio (1 llamada)
     if not result["cuenta"] and "@" in email_addr:
         domain = email_addr.split("@")[-1]
         if domain not in ("gmail.com", "hotmail.com", "yahoo.com", "outlook.com", "icloud.com"):
@@ -658,23 +668,28 @@ def tool_buscar_proveedores_crm(nombre: str = "", categoria: str = "") -> dict:
 
 
 def _get_all_contacts_with_detail() -> list:
-    """Obtiene todos los contactos del CRM con detalle completo. El API de 1CRM no filtra bien
-    por primary_account_id via search_params, así que traemos todo y filtramos localmente."""
-    records = _onecrm_get("data/Contact", {"max_num": 200}).get("records", [])
-    result = []
-    for r in records:
-        det = _onecrm_get(f"data/Contact/{r['id']}").get("record", {})
-        result.append({
+    """Obtiene todos los contactos en UNA sola llamada usando fields[] para evitar N+1 queries."""
+    params = [
+        ("max_num", 200),
+        ("fields[]", "id"), ("fields[]", "first_name"), ("fields[]", "last_name"),
+        ("fields[]", "email1"), ("fields[]", "email2"), ("fields[]", "phone_work"),
+        ("fields[]", "phone_mobile"), ("fields[]", "title"),
+        ("fields[]", "primary_account_id"), ("fields[]", "primary_address_city"),
+    ]
+    records = _onecrm_get("data/Contact", dict(params)).get("records", [])
+    return [
+        {
             "id":        r["id"],
-            "nombre":    f"{det.get('first_name', '')} {det.get('last_name', '')}".strip() or r.get("name", ""),
-            "email":     det.get("email1", "") or det.get("email2", ""),
-            "telefono":  det.get("phone_work", "") or det.get("phone_mobile", ""),
-            "cargo":     det.get("title", ""),
-            "ciudad":    det.get("primary_address_city", ""),
-            "cuenta_id": det.get("primary_account_id", ""),
+            "nombre":    f"{r.get('first_name', '')} {r.get('last_name', '')}".strip() or r.get("name", ""),
+            "email":     r.get("email1", "") or r.get("email2", ""),
+            "telefono":  r.get("phone_work", "") or r.get("phone_mobile", ""),
+            "cargo":     r.get("title", ""),
+            "ciudad":    r.get("primary_address_city", ""),
+            "cuenta_id": r.get("primary_account_id", ""),
             "url_crm":   f"{ONECRM_BASE}/index.php?module=Contacts&action=DetailView&record={r['id']}",
-        })
-    return result
+        }
+        for r in records
+    ]
 
 
 def tool_buscar_contactos_crm(nombre: str = "", cuenta_id: str = "") -> dict:
