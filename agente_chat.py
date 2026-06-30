@@ -89,13 +89,16 @@ def _onecrm_get(endpoint: str, params: dict = {}) -> dict:
 def _gmail_access_token() -> str:
     """Obtiene un access token fresco usando el refresh token de Google."""
     resp = httpx.post("https://oauth2.googleapis.com/token", data={
-        "client_id":     GOOGLE_CLIENT_ID,
-        "client_secret": GOOGLE_CLIENT_SECRET,
-        "refresh_token": GOOGLE_REFRESH_TOKEN,
+        "client_id":     os.environ.get("GOOGLE_CLIENT_ID", GOOGLE_CLIENT_ID),
+        "client_secret": os.environ.get("GOOGLE_CLIENT_SECRET", GOOGLE_CLIENT_SECRET),
+        "refresh_token": os.environ.get("GOOGLE_REFRESH_TOKEN", GOOGLE_REFRESH_TOKEN),
         "grant_type":    "refresh_token",
     }, timeout=15)
     resp.raise_for_status()
-    return resp.json()["access_token"]
+    data = resp.json()
+    if "access_token" not in data:
+        raise ValueError(f"Google OAuth error: {data}")
+    return data["access_token"]
 
 
 def _gmail_decode_body(payload: dict) -> str:
@@ -121,7 +124,8 @@ def tool_leer_emails_gmail(max_emails: int = 10, query: str = "newer_than:1d") -
     """Lee emails de brain.mromasterpro@gmail.com.
     query soporta filtros de Gmail: newer_than:1d, from:alguien@mail.com, subject:tema, is:unread, etc.
     """
-    if not GOOGLE_REFRESH_TOKEN:
+    refresh = os.environ.get("GOOGLE_REFRESH_TOKEN", GOOGLE_REFRESH_TOKEN)
+    if not refresh:
         return {"error": "GOOGLE_REFRESH_TOKEN no configurado en Railway"}
     try:
         token = _gmail_access_token()
@@ -157,6 +161,27 @@ def tool_leer_emails_gmail(max_emails: int = 10, query: str = "newer_than:1d") -
 def tool_buscar_email_gmail(query: str, max_emails: int = 5) -> dict:
     """Busca emails en Gmail con cualquier query: from:, subject:, has:attachment, etc."""
     return tool_leer_emails_gmail(max_emails=max_emails, query=query)
+
+
+def tool_diagnostico_gmail() -> dict:
+    """Diagnóstica el estado de la conexión Gmail — muestra si las variables están configuradas."""
+    client_id  = os.environ.get("GOOGLE_CLIENT_ID", "")
+    client_sec = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+    refresh    = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
+    status = {
+        "GOOGLE_CLIENT_ID":     "✅ configurado" if client_id  else "❌ falta",
+        "GOOGLE_CLIENT_SECRET": "✅ configurado" if client_sec else "❌ falta",
+        "GOOGLE_REFRESH_TOKEN": "✅ configurado" if refresh    else "❌ falta",
+    }
+    if client_id and client_sec and refresh:
+        try:
+            _gmail_access_token()
+            status["conexion"] = "✅ token de acceso obtenido correctamente"
+        except Exception as e:
+            status["conexion"] = f"❌ error al obtener token: {e}"
+    else:
+        status["conexion"] = "❌ variables incompletas"
+    return status
 
 
 def _lookup_contact_by_email(email_addr: str) -> dict:
@@ -1040,6 +1065,11 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "diagnostico_gmail",
+        "description": "Diagnostica si las variables de Gmail están configuradas correctamente en Railway. Usar cuando Gmail no responde o hay errores de conexión.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "leer_emails_gmail",
         "description": "Lee emails de brain.mromasterpro@gmail.com. Por defecto muestra los del día de hoy. Soporta filtros Gmail: newer_than:1d, from:alguien@mail.com, subject:tema, is:unread, etc.",
         "input_schema": {
@@ -1269,6 +1299,7 @@ TOOL_FUNCTIONS = {
     "buscar_clientes_crm":       tool_buscar_clientes_crm,
     "buscar_contactos_crm":      tool_buscar_contactos_crm,
     "ver_contactos_cuenta_crm":  tool_ver_contactos_cuenta_crm,
+    "diagnostico_gmail":         tool_diagnostico_gmail,
     "leer_emails_gmail":         tool_leer_emails_gmail,
     "buscar_email_gmail":        tool_buscar_email_gmail,
     "escanear_emails_ventas":    tool_escanear_emails_ventas,
