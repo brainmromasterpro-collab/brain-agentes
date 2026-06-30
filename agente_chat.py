@@ -1460,6 +1460,7 @@ Reglas:
 - Para listas de productos, SIEMPRE usa crear_rfqs_desde_texto aunque sean 1 o 2 items
 - Los mensajes [SISTEMA:...] son triggers automáticos del sistema, no del usuario. Procésalos silenciosamente y responde al usuario con el resultado.
 - CONTACTOS CRM: Cuando el usuario pregunte por el contacto de un cliente, primero usa buscar_clientes_crm para obtener el cuenta_id, luego usa ver_contactos_cuenta_crm. La respuesta incluye "info_cuenta" con el email y teléfono registrados en la cuenta — SIEMPRE muestra esos datos aunque no haya Contact records separados. "info_cuenta" con email o teléfono ES información de contacto válida.
+- DECISIONES CON BOTONES: Cuando necesites aprobación del usuario para una acción importante (enviar un email, crear algo en CRM, etc.), termina tu mensaje con el tag [DECISION: pregunta corta aquí]. Ejemplo: "Le contestaré a Alejandro que tenemos el producto disponible. [DECISION: ¿Confirmas que lo enviamos?]". El sistema mostrará botones Sí/No automáticamente.
 - EMAILS Y ACCIÓN: Cuando el usuario te pide explícitamente enviar o responder un email (ej: "contéstale", "dile que sí", "mándale cotización"), ACTÚA DIRECTAMENTE con enviar_email_gmail sin pedir confirmación adicional. El usuario ya dio la instrucción. Solo pide confirmación si hay ambigüedad sobre a QUIÉN enviar o si el contenido puede causar un compromiso comercial incorrecto que el usuario no mencionó.\
 """
 
