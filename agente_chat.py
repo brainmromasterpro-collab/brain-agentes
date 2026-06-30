@@ -928,9 +928,8 @@ def tool_crear_rfqs_desde_texto(
     if not productos:
         return {"error": "Lista de productos vacía"}
 
-    if not stream_id or stream_id in ("None", ""):
-        log.error(f"stream_id inválido en crear_rfqs_desde_texto: {stream_id!r}")
-        return {"error": f"stream_id inválido: {stream_id!r}. El sistema no pudo inyectarlo correctamente."}
+    # stream_id puede ser None cuando el RFQ viene de un email — se guarda sin stream
+    clean_stream_id: str | None = stream_id if (stream_id and stream_id not in ("None", "")) else None
 
     bulk_id  = str(uuid.uuid4())
     rfq_ids  = []
@@ -948,7 +947,7 @@ def tool_crear_rfqs_desde_texto(
             suffix = str(uuid.uuid4())[:6].upper()
             rfq_id_str = f"RFQ-{now.year}-{now.month:02d}{now.day:02d}-{suffix}"
             rfq_row: dict = {
-                "stream_id": stream_id,
+                "stream_id": clean_stream_id,
                 "rfq_id":    rfq_id_str,
                 "modelo":    modelo,
                 "marca":     marca,
@@ -980,7 +979,7 @@ def tool_crear_rfqs_desde_texto(
         try:
             supabase.table("notificaciones").insert({
                 "rfq_id":    rfq_ids[0],
-                "stream_id": stream_id,
+                "stream_id": clean_stream_id,
                 "tipo":      "bulk",
                 "titulo":    f"📋 {len(creados)} productos desde chat — búsqueda iniciada",
                 "mensaje":   json.dumps({
