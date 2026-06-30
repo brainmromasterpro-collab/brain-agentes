@@ -1441,6 +1441,14 @@ Si el usuario manda un mensaje que incluye "[X productos extraídos de" o pide "
 
 Termina con: "X de Y productos están publicados en el CRM."
 
+MODO 9 — RFQ DESDE EMAIL:
+Cuando el usuario pide "busca el RFQ del email", "procesa los RFQs del correo", o similar:
+1. Usa leer_emails_gmail o buscar_email_gmail para encontrar el email con la solicitud de cotización.
+2. Extrae TODOS los part-numbers / modelos del cuerpo del email.
+3. Llama a crear_rfqs_desde_texto con esos productos — exactamente igual que si el usuario los hubiera pegado en el chat.
+4. Si el usuario también pidió responderle al remitente, usa enviar_email_gmail para contestar en el mismo hilo (thread_id del email encontrado).
+CRÍTICO: No preguntes si deben crearse los RFQs — créalos directamente. El usuario ya autorizó al pedir "busca el RFQ".
+
 MODO 7 — CHAT CONVERSACIONAL:
 Para preguntas o solicitudes de información, usa las herramientas disponibles \
 (1CRM, RFQs, métricas, internet) para responder con datos reales.
