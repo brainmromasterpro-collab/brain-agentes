@@ -1606,17 +1606,20 @@ def procesar_mensaje(msg: dict) -> None:
         log.warning(f"No se pudo cargar historial: {e}")
         historial = [{"role": "user", "content": contenido}]
 
-    # Garantizar que el historial termina con el mensaje actual del usuario
+    # Garantizar que el historial empieza con user y termina con el mensaje actual
+    while historial and historial[0]["role"] != "user":
+        historial.pop(0)
     if not historial or historial[-1].get("content") != contenido:
         historial.append({"role": "user", "content": contenido})
 
     # Llamar a Claude
     token_counts = {"tokens_input": 0, "tokens_output": 0}
     try:
+        log.info(f"Historial enviado a Claude: {[{'role': m['role'], 'len': len(str(m.get('content','')))} for m in historial]}")
         respuesta, tools_used, rfqs_created, token_counts = run_chat(historial, stream_id=str(stream_id))
     except Exception as e:
-        log.error(f"Error en Claude: {e}")
-        respuesta    = f"Error procesando tu mensaje. Intenta de nuevo. ({str(e)[:80]})"
+        log.error(f"Error en Claude (completo): {e}")
+        respuesta    = f"Error procesando tu mensaje. Intenta de nuevo. ({str(e)[:200]})"
         tools_used   = []
         rfqs_created = False
 
