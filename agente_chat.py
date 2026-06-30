@@ -1595,11 +1595,12 @@ def procesar_mensaje(msg: dict) -> None:
                 continue
             if r["content"].startswith("[SISTEMA:"):
                 continue
-            # Reemplazar contenido de mensajes de usuario ya procesados para que
-            # Claude no re-extraiga productos de turnos anteriores
             content = r["content"]
             if r["role"] == "user" and r.get("procesado") and content != contenido:
                 content = "[mensaje anterior — ya procesado]"
+            # Evitar mensajes consecutivos del mismo rol (causa 400 en API de Claude)
+            if historial and historial[-1]["role"] == r["role"]:
+                continue
             historial.append({"role": r["role"], "content": content})
     except Exception as e:
         log.warning(f"No se pudo cargar historial: {e}")
