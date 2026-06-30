@@ -1593,9 +1593,12 @@ def procesar_mensaje(msg: dict) -> None:
         for r in reversed(hist_resp.data or []):
             if r["role"] not in ("user", "assistant"):
                 continue
-            if r["content"].startswith("[SISTEMA:"):
+            raw_content = r.get("content") or ""
+            if not raw_content or not isinstance(raw_content, str):
                 continue
-            content = r["content"]
+            if raw_content.startswith("[SISTEMA:"):
+                continue
+            content = raw_content
             if r["role"] == "user" and r.get("procesado") and content != contenido:
                 content = "[mensaje anterior — ya procesado]"
             # Evitar mensajes consecutivos del mismo rol (causa 400 en API de Claude)
@@ -1615,14 +1618,13 @@ def procesar_mensaje(msg: dict) -> None:
     # Llamar a Claude
     token_counts = {"tokens_input": 0, "tokens_output": 0}
     try:
-        import sys, traceback as _tb
         roles = [m['role'] for m in historial]
-        print(f"[BRAIN] historial roles: {roles}", flush=True, file=sys.stderr)
+        print(f"[BRAIN] historial roles={roles} n={len(historial)}", flush=True)
         respuesta, tools_used, rfqs_created, token_counts = run_chat(historial, stream_id=str(stream_id))
     except Exception as e:
-        import sys, traceback as _tb
-        print(f"[BRAIN ERROR] {e}", flush=True, file=sys.stderr)
-        _tb.print_exc(file=sys.stderr)
+        import traceback as _tb
+        print(f"[BRAIN ERROR] {e}", flush=True)
+        _tb.print_exc()
         log.error(f"Error en Claude (completo): {e}")
         respuesta    = f"Error procesando tu mensaje. Intenta de nuevo. ({str(e)[:400]})"
         tools_used   = []
