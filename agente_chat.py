@@ -86,8 +86,15 @@ def _onecrm_get(endpoint: str, params: dict = {}) -> dict:
         return {"error": str(e), "records": [], "total_count": 0}
 
 
+_gmail_token_cache: dict = {"token": None, "exp": 0.0}
+
+
 def _gmail_access_token() -> str:
-    """Obtiene un access token fresco usando el refresh token de Google."""
+    """Obtiene un access token de Google. Lo cachea en memoria hasta ~5 min antes de expirar,
+    para no hacer un round-trip OAuth (~300ms) en cada llamada dentro de un mismo request."""
+    import time
+    if _gmail_token_cache["token"] and time.time() < _gmail_token_cache["exp"]:
+        return _gmail_token_cache["token"]
     resp = httpx.post("https://oauth2.googleapis.com/token", data={
         "client_id":     os.environ.get("GOOGLE_CLIENT_ID", GOOGLE_CLIENT_ID),
         "client_secret": os.environ.get("GOOGLE_CLIENT_SECRET", GOOGLE_CLIENT_SECRET),
@@ -98,6 +105,8 @@ def _gmail_access_token() -> str:
     data = resp.json()
     if "access_token" not in data:
         raise ValueError(f"Google OAuth error: {data}")
+    _gmail_token_cache["token"] = data["access_token"]
+    _gmail_token_cache["exp"]   = time.time() + data.get("expires_in", 3600) - 300
     return data["access_token"]
 
 
@@ -1820,7 +1829,10 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool
         response = claude.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=4096,
-            system=SYSTEM_PROMPT,
+            # cache_control cachea el prefijo estático (tools + system prompt). En el loop de
+            # tools (hasta 10 vueltas) las llamadas siguientes leen de caché en vez de
+            # reprocesar ~30 tools + 11 modos cada vez → mucha menos latencia y costo.
+            system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
             tools=TOOLS,
             messages=current_messages,
         )
