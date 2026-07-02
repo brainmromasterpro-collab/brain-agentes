@@ -1614,17 +1614,23 @@ Cuando el usuario pida "genera la oportunidad del correo", "arma la oportunidad 
    - Contacto: nombre, correo y whatsapp de la persona.
    - Dirección de envío.
 
-3. SI FALTA CUALQUIER BLOQUE → NO crees nada. Redacta un correo de respuesta cortés (mismo hilo, thread_id del email) \
-   pidiendo ÚNICAMENTE los datos faltantes, con este formato:
+3. SI FALTA CUALQUIER BLOQUE → NO crees nada. Haz estas 3 cosas, en orden:
 
-   "Estimado/a [nombre]:
-   Gracias por su solicitud. Para procesar su cotización necesitamos completar la siguiente información:
-   - [dato faltante 1]
-   - [dato faltante 2]
-   Quedamos atentos. Saludos."
+   (a) AVISA al usuario del chat que la oportunidad está INCOMPLETA y enumera exactamente qué bloque(s) faltan. \
+       Ejemplo: "⚠️ La oportunidad de <remitente/cuenta> está incompleta. Faltan: cantidad (Qty) y dirección de envío."
 
-   Muestra el borrador al usuario y termina con [DECISION: ¿Envío esta solicitud de información?]. \
-   Solo tras el "Sí" del usuario llama a enviar_email_gmail. Nunca envíes sin aprobación.
+   (b) REDACTA un correo de respuesta cortés (mismo hilo, thread_id del email) pidiendo ÚNICAMENTE los datos faltantes, \
+       con este formato, y muéstraselo al usuario del chat como borrador:
+
+       "Estimado/a [nombre]:
+       Gracias por su solicitud. Para procesar su cotización necesitamos completar la siguiente información:
+       - [dato faltante 1]
+       - [dato faltante 2]
+       Quedamos atentos. Saludos."
+
+   (c) Termina con [DECISION: ¿Envío esta solicitud de información a <remitente>?]. \
+       El correo queda SUJETO A LA APROBACIÓN del usuario: solo tras el "Sí" llamas a enviar_email_gmail. \
+       Nunca envíes sin aprobación, y nunca crees la oportunidad mientras falte información.
 
 4. SI ESTÁN LOS 4 BLOQUES COMPLETOS → coteja con el CRM (escanear_emails_ventas o buscar_clientes_crm por el correo/dominio del remitente):
 
