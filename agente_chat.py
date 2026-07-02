@@ -193,7 +193,7 @@ def tool_enviar_email_gmail(para: str, asunto: str, cuerpo: str, thread_id: str 
 
         resp = httpx.post(
             "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
-            headers={"Authorization": f"Bearer {token}"},
+            headers=headers,  # incluye Content-Type: application/json (sin esto Gmail da 400 INVALID_ARGUMENT)
             content=json.dumps(body).encode(),
             timeout=15,
         )
