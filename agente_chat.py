@@ -1623,10 +1623,11 @@ Cuando el usuario pida "genera la oportunidad del correo", "arma la oportunidad 
        con este formato, y muéstraselo al usuario del chat como borrador:
 
        "Estimado/a [nombre]:
-       Gracias por su solicitud. Para procesar su cotización necesitamos completar la siguiente información:
+       Gracias por su solicitud. Le confirmamos que ya estamos procesando su requerimiento y muy pronto le avisamos. \
+       Mientras tanto, para poder completar su cotización, le agradeceríamos nos comparta la siguiente información:
        - [dato faltante 1]
        - [dato faltante 2]
-       Quedamos atentos. Saludos."
+       Quedamos atentos y con gusto avanzamos en cuanto la recibamos. Saludos."
 
    (c) Termina con [DECISION: ¿Envío esta solicitud de información a <remitente>?]. \
        El correo queda SUJETO A LA APROBACIÓN del usuario: solo tras el "Sí" llamas a enviar_email_gmail. \
