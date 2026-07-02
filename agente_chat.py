@@ -282,7 +282,7 @@ def _check_products_in_crm(texto: str) -> list:
     )
     resultados = []
     vistos: set = set()
-    for pn in patrones[:8]:
+    for pn in patrones[:5]:
         if pn in vistos:
             continue
         vistos.add(pn)
@@ -312,13 +312,19 @@ def tool_escanear_emails_ventas(query: str = "newer_than:3d", max_emails: int = 
         match = re.search(r'[\w.+-]+@[\w.-]+\.\w+', de_raw)
         email_addr = match.group(0).lower() if match else ""
 
-        crm_info = _lookup_contact_by_email(email_addr) if email_addr else {"contacto": None, "cuenta": None}
-
         texto_completo = (email.get("asunto", "") + " " + email.get("cuerpo", "")).lower()
         es_rfq = any(k in texto_completo for k in keywords_rfq)
 
-        texto_upper = email.get("asunto", "") + " " + email.get("cuerpo", "")
-        productos = _check_products_in_crm(texto_upper)
+        # Los lookups a 1CRM son caros (~0.5s c/u). Solo se corren en correos que SÍ son RFQ;
+        # así el escaneo de una bandeja normal no dispara ~90 llamadas secuenciales al CRM.
+        if es_rfq:
+            crm_info = _lookup_contact_by_email(email_addr) if email_addr else {"contacto": None, "cuenta": None}
+            texto_upper = email.get("asunto", "") + " " + email.get("cuerpo", "")
+            productos = _check_products_in_crm(texto_upper)
+        else:
+            crm_info = {"contacto": None, "cuenta": None}
+            productos = []
+
         cantidades = re.findall(r'\b(\d+)\s*(?:pz|pzas?|piezas?|unidades?|units?|qty|pcs?)\b', texto_completo)
 
         oportunidades.append({
@@ -343,6 +349,21 @@ def tool_escanear_emails_ventas(query: str = "newer_than:3d", max_emails: int = 
         "clientes_conocidos": len([o for o in oportunidades if o["es_cliente_conocido"]]),
         "oportunidades":      oportunidades,
     }
+
+
+def tool_notificar_sistema(titulo: str, mensaje: str = "", tipo: str = "oportunidad",
+                           stream_id: str = "") -> dict:
+    """Publica una notificación en el sistema (campana/toast del dashboard).
+    Úsala para avisar que hay oportunidades detectadas en el correo.
+    """
+    try:
+        payload: dict = {"tipo": tipo, "titulo": titulo, "mensaje": mensaje or "", "leida": False}
+        if stream_id:
+            payload["stream_id"] = stream_id
+        supabase.table("notificaciones").insert(payload).execute()
+        return {"ok": True, "titulo": titulo}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 def _onecrm_post(endpoint: str, payload: dict) -> dict:
@@ -626,9 +647,15 @@ def tool_crear_cuenta_crm(
     estado: str = "",
     pais: str = "Mexico",
     descripcion: str = "",
+    envio_calle: str = "",
+    envio_ciudad: str = "",
+    envio_estado: str = "",
+    envio_cp: str = "",
+    envio_pais: str = "",
 ) -> dict:
     """Crea una nueva cuenta/empresa en 1CRM.
     tipo: Customer | Supplier | Partner | Competitor | Press | Analyst | Other
+    Los campos envio_* llenan la dirección de envío (shipping) de la cuenta.
     """
     if not ONECRM_BASE:
         return {"error": "1CRM no configurado"}
@@ -641,6 +668,12 @@ def tool_crear_cuenta_crm(
     if estado:        payload["billing_address_state"] = estado
     if pais:          payload["billing_address_country"] = pais
     if descripcion:   payload["description"] = descripcion
+    # Dirección de envío (shipping) — donde vive la "dirección de envío" del RFQ
+    if envio_calle:   payload["shipping_address_street"] = envio_calle
+    if envio_ciudad:  payload["shipping_address_city"] = envio_ciudad
+    if envio_estado:  payload["shipping_address_state"] = envio_estado
+    if envio_cp:      payload["shipping_address_postalcode"] = envio_cp
+    if envio_pais:    payload["shipping_address_country"] = envio_pais
     resp = _onecrm_post("data/Account", payload)
     acct_id = resp.get("id", "")
     return {
@@ -649,6 +682,41 @@ def tool_crear_cuenta_crm(
         "nombre":  nombre,
         "url_crm": f"{ONECRM_BASE}/index.php?module=Accounts&record={acct_id}" if acct_id else "",
         "error":   resp.get("error", ""),
+    }
+
+
+def tool_crear_contacto_crm(
+    nombre: str,
+    apellido: str = "",
+    cuenta_id: str = "",
+    email: str = "",
+    whatsapp: str = "",
+    telefono: str = "",
+    cargo: str = "",
+    descripcion: str = "",
+) -> dict:
+    """Crea un contacto (persona) en 1CRM, opcionalmente ligado a una cuenta/empresa.
+    whatsapp se guarda en phone_mobile (1CRM no tiene campo de WhatsApp dedicado).
+    cuenta_id liga el contacto a su empresa mediante primary_account_id.
+    """
+    if not ONECRM_BASE:
+        return {"error": "1CRM no configurado"}
+    payload: dict = {"first_name": nombre, "last_name": apellido or nombre}
+    if cuenta_id:    payload["primary_account_id"] = cuenta_id
+    if email:        payload["email1"] = email
+    if whatsapp:     payload["phone_mobile"] = whatsapp
+    if telefono:     payload["phone_work"] = telefono
+    if cargo:        payload["title"] = cargo
+    if descripcion:  payload["description"] = descripcion
+    resp = _onecrm_post("data/Contact", payload)
+    contacto_id = resp.get("id", "")
+    return {
+        "ok":         bool(contacto_id),
+        "id":         contacto_id,
+        "nombre":     f"{nombre} {apellido}".strip(),
+        "cuenta_id":  cuenta_id,
+        "url_crm":    f"{ONECRM_BASE}/index.php?module=Contacts&record={contacto_id}" if contacto_id else "",
+        "error":      resp.get("error", ""),
     }
 
 
@@ -1190,6 +1258,18 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "notificar_sistema",
+        "description": "Publica una notificación en el sistema (campana/toast del dashboard) para avisar al equipo. Usar para avisar que se detectaron oportunidades en el correo. El stream_id se inyecta automáticamente.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "titulo":  {"type": "string", "description": "Título corto de la notificación"},
+                "mensaje": {"type": "string", "description": "Detalle (opcional): resumen de las oportunidades detectadas"},
+            },
+            "required": ["titulo"],
+        },
+    },
+    {
         "name": "crear_cuenta_crm",
         "description": "Crea una nueva cuenta/empresa en 1CRM (cliente, proveedor, socio, etc.).",
         "input_schema": {
@@ -1205,6 +1285,29 @@ TOOLS: list[dict] = [
                 "estado":          {"type": "string", "description": "Estado/provincia"},
                 "pais":            {"type": "string", "description": "Default: Mexico"},
                 "descripcion":     {"type": "string"},
+                "envio_calle":     {"type": "string", "description": "Dirección de envío: calle y número"},
+                "envio_ciudad":    {"type": "string", "description": "Dirección de envío: ciudad"},
+                "envio_estado":    {"type": "string", "description": "Dirección de envío: estado/provincia"},
+                "envio_cp":        {"type": "string", "description": "Dirección de envío: código postal"},
+                "envio_pais":      {"type": "string", "description": "Dirección de envío: país"},
+            },
+            "required": ["nombre"],
+        },
+    },
+    {
+        "name": "crear_contacto_crm",
+        "description": "Crea un contacto (persona) en 1CRM ligado a una cuenta. Usar tras crear_cuenta_crm para registrar a la persona (nombre, correo, whatsapp) de la empresa.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "nombre":      {"type": "string", "description": "Nombre(s) de la persona"},
+                "apellido":    {"type": "string", "description": "Apellido(s)"},
+                "cuenta_id":   {"type": "string", "description": "ID de la cuenta/empresa a la que se liga el contacto"},
+                "email":       {"type": "string"},
+                "whatsapp":    {"type": "string", "description": "Número de WhatsApp (se guarda en phone_mobile)"},
+                "telefono":    {"type": "string", "description": "Teléfono de trabajo"},
+                "cargo":       {"type": "string", "description": "Puesto/cargo"},
+                "descripcion": {"type": "string"},
             },
             "required": ["nombre"],
         },
@@ -1390,7 +1493,9 @@ TOOL_FUNCTIONS = {
     "leer_emails_gmail":         tool_leer_emails_gmail,
     "buscar_email_gmail":        tool_buscar_email_gmail,
     "escanear_emails_ventas":    tool_escanear_emails_ventas,
+    "notificar_sistema":         tool_notificar_sistema,
     "crear_cuenta_crm":          tool_crear_cuenta_crm,
+    "crear_contacto_crm":        tool_crear_contacto_crm,
     "listar_oportunidades_crm":  tool_listar_oportunidades_crm,
     "crear_oportunidad_crm":     tool_crear_oportunidad_crm,
     "ver_cliente_crm":           tool_ver_cliente_crm,
@@ -1475,6 +1580,75 @@ Cuando el usuario pide "busca el RFQ del email", "procesa los RFQs del correo", 
 4. Si el usuario también pidió responderle al remitente, usa enviar_email_gmail para contestar en el mismo hilo (thread_id del email encontrado).
 CRÍTICO: No preguntes si deben crearse los RFQs — créalos directamente. El usuario ya autorizó al pedir "busca el RFQ".
 
+MODO 10 — GENERAR OPORTUNIDAD DESDE RFQ (correo):
+Cuando el usuario pida "genera la oportunidad del correo", "arma la oportunidad de este RFQ", \
+"da de alta esta solicitud", o similar sobre un email de cotización:
+
+1. Lee el email con leer_emails_gmail / buscar_email_gmail (o usa escanear_emails_ventas para el cotejo con CRM).
+
+2. Verifica los 4 BLOQUES OBLIGATORIOS para crear la oportunidad:
+   - RFQ + Qty: al menos un part-number/modelo Y su cantidad de unidades.
+   - Cuenta: nombre del cliente/empresa.
+   - Contacto: nombre, correo y whatsapp de la persona.
+   - Dirección de envío.
+
+3. SI FALTA CUALQUIER BLOQUE → NO crees nada. Redacta un correo de respuesta cortés (mismo hilo, thread_id del email) \
+   pidiendo ÚNICAMENTE los datos faltantes, con este formato:
+
+   "Estimado/a [nombre]:
+   Gracias por su solicitud. Para procesar su cotización necesitamos completar la siguiente información:
+   - [dato faltante 1]
+   - [dato faltante 2]
+   Quedamos atentos. Saludos."
+
+   Muestra el borrador al usuario y termina con [DECISION: ¿Envío esta solicitud de información?]. \
+   Solo tras el "Sí" del usuario llama a enviar_email_gmail. Nunca envíes sin aprobación.
+
+4. SI ESTÁN LOS 4 BLOQUES COMPLETOS → coteja con el CRM (escanear_emails_ventas o buscar_clientes_crm por el correo/dominio del remitente):
+
+   4a. YA ES CLIENTE (la cuenta existe en CRM): termina con [DECISION: ¿Creo la oportunidad para <cuenta>?]. \
+       Tras el "Sí": crea la oportunidad con crear_oportunidad_crm — pon en descripcion el detalle "RFQ: <part-numbers> | Qty: <cantidades>" \
+       y usa el cuenta_id del CRM. Confirma con el link de la oportunidad creada.
+
+   4b. NO ES CLIENTE (no hay cuenta en CRM): termina con [DECISION: ¿Doy de alta la cuenta + contacto y creo la oportunidad?]. \
+       Tras el "Sí", en orden:
+       (i)   crear_cuenta_crm con nombre, email, teléfono y los campos envio_* de la dirección de envío.
+       (ii)  crear_contacto_crm ligado con cuenta_id (el id devuelto en i), con nombre, apellido, email y whatsapp.
+       (iii) crear_oportunidad_crm con ese cuenta_id y descripcion "RFQ: <part-numbers> | Qty: <cantidades>".
+       Confirma con los links de cuenta, contacto y oportunidad creados.
+
+CRÍTICO: en este modo nunca creas nada en el CRM ni envías correos sin el [DECISION] aprobado por el usuario. \
+Si faltan datos, primero se piden; solo con los 4 bloques completos se procede a cotejar y crear.
+
+MODO 11 — REVISAR OPORTUNIDADES DEL CORREO (lote):
+Cuando el usuario pida "lee los correos", "revisa el correo y detecta oportunidades", \
+"escanea oportunidades", "qué oportunidades hay", o similar (varios correos a la vez):
+
+1. Llama a escanear_emails_ventas. Toma solo los que tengan es_rfq = true; ésas son las oportunidades.
+
+2. Para CADA oportunidad, evalúa los mismos 4 BLOQUES OBLIGATORIOS del MODO 10 \
+   (RFQ+Qty, Cuenta, Contacto con nombre/correo/whatsapp, Dirección de envío) usando el contenido del correo \
+   y el cotejo con CRM (es_cliente_conocido / cliente_crm). Anota qué falta en cada una.
+
+3. Avisa en el sistema con notificar_sistema: titulo tipo "🔔 N oportunidades detectadas en el correo", \
+   mensaje con un resumen breve (cuántas completas y cuántas incompletas).
+
+4. Presenta al usuario un TRIAGE en tabla con TODAS las oportunidades:
+
+   | # | Remitente | Cuenta CRM | Producto(s) | Qty | Falta para crear | Acción sugerida |
+   |---|-----------|------------|-------------|-----|------------------|-----------------|
+   | 1 | juan@x.com | ✅ Aceros del Norte | Q0120 | 20 | — (completa) | Crear oportunidad |
+   | 2 | maria@y.com | ❌ No es cliente | ABC123 | ? | Contacto, Dirección, Qty | Pedir datos al cliente |
+
+   Debajo resume: "X completas listas para crear, Y incompletas que requieren pedir datos."
+
+5. Luego procesa UNA por una, empezando por la #1, aplicando el flujo del MODO 10:
+   - Si está completa → [DECISION: ¿Creo la oportunidad para <cuenta>?] y al aprobar, créala (con contacto/cuenta si es cliente nuevo).
+   - Si le falta info → muestra el borrador de correo pidiendo SOLO lo faltante y [DECISION: ¿Envío la solicitud a <remitente>?].
+   Tras resolver una, continúa con la siguiente. Nunca crees ni envíes sin el [DECISION] aprobado.
+
+Si no hay oportunidades (ningún es_rfq), dilo claramente y no notifiques nada.
+
 MODO 7 — CHAT CONVERSACIONAL:
 Para preguntas o solicitudes de información, usa las herramientas disponibles \
 (1CRM, RFQs, métricas, internet) para responder con datos reales.
@@ -1535,8 +1709,8 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool
                 tools_used.append(tool_name)
                 log.info(f"Tool: {tool_name}({json.dumps(tool_input)[:120]})")
 
-                # Inyectar stream_id automáticamente en crear_rfqs_desde_texto
-                if tool_name == "crear_rfqs_desde_texto" and not tool_input.get("stream_id"):
+                # Inyectar stream_id automáticamente en tools que lo necesitan
+                if tool_name in ("crear_rfqs_desde_texto", "notificar_sistema") and not tool_input.get("stream_id"):
                     tool_input["stream_id"] = stream_id
 
                 fn = TOOL_FUNCTIONS.get(tool_name)
