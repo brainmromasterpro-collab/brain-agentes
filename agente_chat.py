@@ -1831,7 +1831,10 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool
     total_input_tokens  = 0
     total_output_tokens = 0
 
-    for _ in range(10):
+    import time as _time
+    _t_start = _time.time()
+    for _ronda in range(10):
+        _t_llm = _time.time()
         response = claude.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=4096,
@@ -1842,15 +1845,23 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool
             tools=TOOLS,
             messages=current_messages,
         )
+        _dt_llm = _time.time() - _t_llm
 
         if hasattr(response, "usage") and response.usage:
             total_input_tokens  += getattr(response.usage, "input_tokens",  0)
             total_output_tokens += getattr(response.usage, "output_tokens", 0)
+            _u = response.usage
+            print(f"[PERF] ronda={_ronda} llm={_dt_llm:.1f}s stop={response.stop_reason} "
+                  f"in={getattr(_u,'input_tokens',0)} out={getattr(_u,'output_tokens',0)} "
+                  f"cache_read={getattr(_u,'cache_read_input_tokens',0)} "
+                  f"cache_write={getattr(_u,'cache_creation_input_tokens',0)}", flush=True)
 
         if response.stop_reason == "end_turn":
             text = next(
                 (b.text for b in response.content if hasattr(b, "text")), ""
             )
+            print(f"[PERF] TOTAL run_chat={_time.time()-_t_start:.1f}s rondas={_ronda+1} "
+                  f"tools={tools_used}", flush=True)
             token_counts = {"tokens_input": total_input_tokens, "tokens_output": total_output_tokens}
             return text, tools_used, rfqs_created, token_counts
 
@@ -1872,12 +1883,14 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool
                     tool_input["stream_id"] = stream_id
 
                 fn = TOOL_FUNCTIONS.get(tool_name)
+                _t_tool = _time.time()
                 try:
                     result = fn(**tool_input) if fn else {"error": f"Tool '{tool_name}' no existe"}
                     if tool_name == "crear_rfqs_desde_texto" and result.get("creados", 0) > 0:
                         rfqs_created = True
                 except Exception as e:
                     result = {"error": str(e)}
+                print(f"[PERF] tool={tool_name} dt={_time.time()-_t_tool:.1f}s", flush=True)
 
                 # Registrar la acción en el log del stream (UI global + por-stream)
                 _msg_log, _tipo_log = _mensaje_log_tool(tool_name, tool_input, result)
