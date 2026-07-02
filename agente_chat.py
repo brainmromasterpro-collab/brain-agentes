@@ -120,6 +120,28 @@ def _gmail_decode_body(payload: dict) -> str:
     return extract(payload).strip()
 
 
+def _gmail_ultimo_mensaje_nuestro(thread_id: str, token: str) -> bool:
+    """True si el ÚLTIMO mensaje del hilo lo enviamos NOSOTROS (label SENT) — o sea, ya
+    respondimos y estamos esperando al cliente, por lo que la oportunidad NO es nueva.
+    False si el último mensaje es del cliente (hay algo nuevo que atender) o si no se puede
+    determinar (ante la duda, se trata como accionable)."""
+    if not thread_id:
+        return False
+    try:
+        th = httpx.get(
+            f"https://gmail.googleapis.com/gmail/v1/users/me/threads/{thread_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"format": "minimal"}, timeout=15,
+        ).json()
+        msgs = th.get("messages", [])
+        if not msgs:
+            return False
+        # Gmail devuelve los mensajes en orden ascendente; el último es el más reciente.
+        return "SENT" in msgs[-1].get("labelIds", [])
+    except Exception:
+        return False
+
+
 def tool_leer_emails_gmail(max_emails: int = 10, query: str = "newer_than:1d") -> dict:
     """Lee emails de brain.mromasterpro@gmail.com.
     query soporta filtros de Gmail: newer_than:1d, from:alguien@mail.com, subject:tema, is:unread, etc.
@@ -144,14 +166,15 @@ def tool_leer_emails_gmail(max_emails: int = 10, query: str = "newer_than:1d") -
             hdrs = {h["name"]: h["value"] for h in detail.get("payload", {}).get("headers", [])}
             body = _gmail_decode_body(detail.get("payload", {}))
             emails.append({
-                "id":      m["id"],
-                "de":      hdrs.get("From", ""),
-                "para":    hdrs.get("To", ""),
-                "asunto":  hdrs.get("Subject", ""),
-                "fecha":   hdrs.get("Date", ""),
-                "snippet": detail.get("snippet", ""),
-                "cuerpo":  body[:1500] if body else detail.get("snippet", ""),
-                "leido":   "UNREAD" not in detail.get("labelIds", []),
+                "id":        m["id"],
+                "thread_id": detail.get("threadId", ""),
+                "de":        hdrs.get("From", ""),
+                "para":      hdrs.get("To", ""),
+                "asunto":    hdrs.get("Subject", ""),
+                "fecha":     hdrs.get("Date", ""),
+                "snippet":   detail.get("snippet", ""),
+                "cuerpo":    body[:1500] if body else detail.get("snippet", ""),
+                "leido":     "UNREAD" not in detail.get("labelIds", []),
             })
         return {"total": len(emails), "query": query, "emails": emails}
     except Exception as e:
@@ -306,6 +329,10 @@ def tool_escanear_emails_ventas(query: str = "newer_than:3d", max_emails: int = 
                     "disponibilidad", "solicitud", "necesitamos", "requerimos", "cuánto cuesta",
                     "availability", "request for", "lead time"]
 
+    # Token de Gmail para revisar hilos (se toma una sola vez; _gmail_access_token no cachea).
+    _gmail_token = None
+    omitidas_ya_atendidas = 0
+
     oportunidades = []
     for email in emails_raw.get("emails", []):
         de_raw = email.get("de", "")
@@ -314,6 +341,19 @@ def tool_escanear_emails_ventas(query: str = "newer_than:3d", max_emails: int = 
 
         texto_completo = (email.get("asunto", "") + " " + email.get("cuerpo", "")).lower()
         es_rfq = any(k in texto_completo for k in keywords_rfq)
+
+        # Una oportunidad YA no es "nueva" si ya la atendimos: es decir, si el último mensaje del
+        # hilo lo enviamos nosotros (ya respondimos y esperamos al cliente). Si el cliente contestó
+        # después (último mensaje suyo), sigue siendo accionable.
+        if es_rfq:
+            try:
+                if _gmail_token is None:
+                    _gmail_token = _gmail_access_token()
+                if _gmail_ultimo_mensaje_nuestro(email.get("thread_id", ""), _gmail_token):
+                    omitidas_ya_atendidas += 1
+                    continue  # ya atendida — no aparece como nueva
+            except Exception:
+                pass  # ante la duda, se trata como accionable
 
         # Los lookups a 1CRM son caros (~0.5s c/u). Solo se corren en correos que SÍ son RFQ;
         # así el escaneo de una bandeja normal no dispara ~90 llamadas secuenciales al CRM.
@@ -329,6 +369,7 @@ def tool_escanear_emails_ventas(query: str = "newer_than:3d", max_emails: int = 
 
         oportunidades.append({
             "email_id":              email.get("id"),
+            "thread_id":             email.get("thread_id", ""),
             "asunto":                email.get("asunto"),
             "de":                    de_raw,
             "email_remitente":       email_addr,
@@ -344,10 +385,11 @@ def tool_escanear_emails_ventas(query: str = "newer_than:3d", max_emails: int = 
         })
 
     return {
-        "total_emails":       len(oportunidades),
-        "posibles_rfqs":      len([o for o in oportunidades if o["es_rfq"]]),
-        "clientes_conocidos": len([o for o in oportunidades if o["es_cliente_conocido"]]),
-        "oportunidades":      oportunidades,
+        "total_emails":          len(oportunidades),
+        "posibles_rfqs":         len([o for o in oportunidades if o["es_rfq"]]),
+        "clientes_conocidos":    len([o for o in oportunidades if o["es_cliente_conocido"]]),
+        "omitidas_ya_atendidas": omitidas_ya_atendidas,
+        "oportunidades":         oportunidades,
     }
 
 
@@ -1666,7 +1708,10 @@ MODO 11 — REVISAR OPORTUNIDADES DEL CORREO (lote):
 Cuando el usuario pida "lee los correos", "revisa el correo y detecta oportunidades", \
 "escanea oportunidades", "qué oportunidades hay", o similar (varios correos a la vez):
 
-1. Llama a escanear_emails_ventas. Toma solo los que tengan es_rfq = true; ésas son las oportunidades.
+1. Llama a escanear_emails_ventas. Toma solo los que tengan es_rfq = true; ésas son las oportunidades. \
+   El escaneo YA excluye las oportunidades atendidas (hilos donde nuestro último correo espera respuesta del cliente); \
+   NUNCA vuelvas a listar como "nueva" una que ya se procesó. Si "omitidas_ya_atendidas" > 0, \
+   menciónalo al final en una línea (ej: "Omití N que ya están en proceso, esperando respuesta del cliente").
 
 2. Para CADA oportunidad, evalúa los mismos 5 DATOS OBLIGATORIOS del MODO 10 \
    (Contacto, Empresa, RFQ+Qty, Correo, Dirección de envío; el whatsapp NO es obligatorio) usando el contenido \
