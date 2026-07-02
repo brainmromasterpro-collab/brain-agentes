@@ -615,6 +615,28 @@ def tool_crear_oportunidad_crm(
     """
     if not ONECRM_BASE:
         return {"error": "1CRM no configurado"}
+    # CANDADO DE INFO OBLIGATORIA: no se crea la oportunidad sin cuenta ni sin RFQ+cantidad.
+    # La cantidad debe venir en la descripción (formato "RFQ: <parts> | Qty: <n>"). Si falta,
+    # se rechaza para forzar al agente a pedir la información faltante antes de crear.
+    import re as _re
+    faltantes = []
+    if not cuenta_id or not str(cuenta_id).strip():
+        faltantes.append("cuenta")
+    # Cantidad real: un token de cantidad (qty/cant/unidad/pieza/pz/pcs) seguido de número.
+    # No basta con "hay un dígito" porque los part-numbers (ej. Q0120) ya traen dígitos.
+    _tiene_qty = bool(descripcion) and _re.search(
+        r'(?:(?:qty|cant)\w*\W*\d|\d\s*(?:unidad|pieza|\bpz|pcs|units?))',
+        descripcion, _re.I)
+    if not _tiene_qty:
+        faltantes.append("RFQ + cantidad (Qty)")
+    if faltantes:
+        return {
+            "error":     "INFO_INCOMPLETA",
+            "faltantes": faltantes,
+            "mensaje":   "No se puede crear la oportunidad: falta información obligatoria. "
+                         "Pide al cliente los datos faltantes (con [DECISION] para enviar el correo) "
+                         "en lugar de crear la oportunidad.",
+        }
     import datetime
     if not fecha_cierre:
         fecha_cierre = (datetime.date.today() + datetime.timedelta(days=30)).isoformat()
@@ -1658,6 +1680,10 @@ Reglas:
 - Sé conciso y directo
 - Nunca inventes precios o disponibilidad — usa siempre las herramientas
 - CRÍTICO: Si una búsqueda no devuelve resultados, di "no encontré resultados para X" — NUNCA afirmes que un producto "no existe" o "no está publicado" basándote solo en que la búsqueda no lo encontró. La ausencia de resultados NO es prueba de ausencia del producto.
+- OPORTUNIDADES — REGLA ABSOLUTA: NUNCA crees una oportunidad (crear_oportunidad_crm) si falta \
+cualquiera de los 4 bloques obligatorios (RFQ+Qty, Cuenta, Contacto con whatsapp, Dirección de envío). \
+Si falta algo, PRIMERO pides la información al cliente (borrador de correo + [DECISION]); solo con todo \
+completo creas. Si la tool devuelve "INFO_INCOMPLETA", NO reintentes crear: pide lo faltante.
 - Para listas de productos, SIEMPRE usa crear_rfqs_desde_texto aunque sean 1 o 2 items
 - Los mensajes [SISTEMA:...] son triggers automáticos del sistema, no del usuario. Procésalos silenciosamente y responde al usuario con el resultado.
 - CONTACTOS CRM: Cuando el usuario pregunte por el contacto de un cliente, primero usa buscar_clientes_crm para obtener el cuenta_id, luego usa ver_contactos_cuenta_crm. La respuesta incluye "info_cuenta" con el email y teléfono registrados en la cuenta — SIEMPRE muestra esos datos aunque no haya Contact records separados. "info_cuenta" con email o teléfono ES información de contacto válida.
