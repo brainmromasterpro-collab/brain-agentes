@@ -2002,10 +2002,14 @@ def procesar_mensaje(msg: dict) -> None:
         log.info("RFQs creados exitosamente — widget maneja UI, omitiendo respuesta")
         return
 
-    # No insertar respuesta vacía
+    # Respuesta vacía: NO dejar al usuario sin nada (antes se hacía return y el mensaje
+    # quedaba "procesado" sin respuesta → parecía que el chat no contestaba). Insertar un
+    # fallback salvo que se hayan creado RFQs (ese caso ya se manejó arriba).
     if not respuesta.strip():
-        log.info("Respuesta vacía — omitiendo inserción")
-        return
+        log.warning("Respuesta vacía del modelo — insertando fallback")
+        print(f"[PERF] respuesta VACÍA tras tools={tools_used}", flush=True)
+        respuesta = ("Procesé tu solicitud pero no generé un mensaje de respuesta. "
+                     "¿Puedes reformular o intentar de nuevo?")
 
     # Guardar respuesta del asistente
     log.info(f"Insertando respuesta | stream_id={str(stream_id)!r} | len={len(respuesta)}")
