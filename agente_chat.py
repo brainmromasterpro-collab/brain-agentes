@@ -1621,9 +1621,13 @@ Cuando el usuario pida "genera la oportunidad del correo", "arma la oportunidad 
 
    (b) REDACTA un correo de respuesta cortés (mismo hilo, thread_id del email) pidiendo ÚNICAMENTE los datos faltantes, \
        y muéstraselo al usuario del chat como borrador. \
+       OBLIGATORIO — NUNCA lo omitas ni lo abrevies, aunque reformules el resto del correo: \
+       el mensaje SIEMPRE debe incluir, ANTES de pedir los datos, una frase que confirme que YA se está \
+       trabajando en su requerimiento y que muy pronto se le avisa. Es crítico para mantener el interés del prospecto. \
        IDIOMA: detecta el idioma del correo ORIGINAL del cliente y redacta la respuesta en ESE mismo idioma \
        (si el RFQ llegó en inglés, contesta en inglés; si en portugués, en portugués; etc.). \
-       La plantilla de abajo está en español SOLO como modelo — tradúcela al idioma del cliente:
+       La plantilla de abajo está en español SOLO como modelo — tradúcela al idioma del cliente y conserva SIEMPRE \
+       la frase de "ya estamos procesando su requerimiento y muy pronto le avisamos":
 
        "Estimado/a [nombre]:
        Gracias por su solicitud. Le confirmamos que ya estamos procesando su requerimiento y muy pronto le avisamos. \
