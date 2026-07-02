@@ -1761,6 +1761,52 @@ Todo correo saliente (borrador o envío) debe ir en el MISMO idioma del correo o
 
 
 # ─────────────────────────────────────────────────────────────
+# LOG DEL STREAM (alimenta los logs del UI: global y por-stream)
+# ─────────────────────────────────────────────────────────────
+def _log_stream(stream_id: str, msg: str, tipo: str = "ok") -> None:
+    """Escribe una entrada en stream_logs. El dashboard lee de aquí tanto el
+    log global como el log por-stream. Best-effort: nunca rompe el flujo."""
+    if not stream_id or not msg:
+        return
+    try:
+        supabase.table("stream_logs").insert({
+            "stream_id": str(stream_id),
+            "msg":       str(msg)[:500],
+            "type":      tipo,
+        }).execute()
+    except Exception as e:
+        log.warning(f"No se pudo escribir en stream_logs: {e}")
+
+
+def _mensaje_log_tool(tool_name: str, tool_input: dict, result) -> tuple[str, str]:
+    """Convierte una llamada de tool + su resultado en (mensaje, tipo) legible para el log del UI."""
+    err = isinstance(result, dict) and (result.get("error") or result.get("faltantes"))
+    tipo = "error" if err else "ok"
+    ti = tool_input or {}
+    if tool_name == "enviar_email_gmail":
+        msg = f"Correo enviado a {ti.get('para','')}" if not err else \
+              f"Falló envío de correo: {(result.get('error') or result.get('detalle',''))[:120]}"
+    elif tool_name == "crear_oportunidad_crm":
+        msg = f"Oportunidad creada: {ti.get('nombre','')}" if not err else \
+              f"No se creó oportunidad — falta info: {result.get('faltantes') or result.get('mensaje','')}"
+    elif tool_name == "crear_cuenta_crm":
+        msg = f"Cuenta creada en CRM: {ti.get('nombre','')}" if not err else f"No se creó la cuenta: {result.get('error','')}"
+    elif tool_name == "crear_contacto_crm":
+        msg = f"Contacto creado: {(ti.get('nombre','')+' '+ti.get('apellido','')).strip()}" if not err else \
+              f"No se creó el contacto: {result.get('error','')}"
+    elif tool_name == "escanear_emails_ventas":
+        msg = f"Correos escaneados: {result.get('posibles_rfqs','?')} oportunidad(es) nueva(s)" if not err else \
+              f"Error escaneando correos: {result.get('error','')}"
+    elif tool_name == "crear_rfqs_desde_texto":
+        msg = f"RFQs creados: {result.get('creados','?')}"
+    elif tool_name == "notificar_sistema":
+        msg = f"Notificación: {ti.get('titulo','')}"
+    else:
+        msg = tool_name.replace("_", " ").capitalize()
+    return msg, tipo
+
+
+# ─────────────────────────────────────────────────────────────
 # LOOP DE CLAUDE CON TOOL_USE
 # ─────────────────────────────────────────────────────────────
 def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool, dict]:
@@ -1814,6 +1860,10 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool
                         rfqs_created = True
                 except Exception as e:
                     result = {"error": str(e)}
+
+                # Registrar la acción en el log del stream (UI global + por-stream)
+                _msg_log, _tipo_log = _mensaje_log_tool(tool_name, tool_input, result)
+                _log_stream(stream_id, _msg_log, _tipo_log)
 
                 tool_results.append({
                     "type":        "tool_result",
@@ -1883,6 +1933,9 @@ def procesar_mensaje(msg: dict) -> None:
     if not historial or historial[-1].get("content") != contenido:
         historial.append({"role": "user", "content": contenido})
 
+    # Log del stream: registrar la solicitud entrante (alimenta el log del UI)
+    _log_stream(stream_id, f'Solicitud recibida: "{contenido[:80]}"', "info")
+
     # Llamar a Claude
     token_counts = {"tokens_input": 0, "tokens_output": 0}
     try:
@@ -1894,6 +1947,7 @@ def procesar_mensaje(msg: dict) -> None:
         print(f"[BRAIN ERROR] {e}", flush=True)
         _tb.print_exc()
         log.error(f"Error en Claude (completo): {e}")
+        _log_stream(stream_id, f"Error procesando el mensaje: {str(e)[:150]}", "error")
         respuesta    = f"Error procesando tu mensaje. Intenta de nuevo. ({str(e)[:400]})"
         tools_used   = []
         rfqs_created = False
