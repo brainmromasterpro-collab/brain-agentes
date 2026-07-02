@@ -1623,18 +1623,22 @@ Cuando el usuario pida "genera la oportunidad del correo", "arma la oportunidad 
        y muéstraselo al usuario del chat como borrador. \
        OBLIGATORIO — NUNCA lo omitas ni lo abrevies, aunque reformules el resto del correo: \
        el mensaje SIEMPRE debe incluir, ANTES de pedir los datos, una frase que confirme que YA se está \
-       trabajando en su requerimiento y que muy pronto se le avisa. Es crítico para mantener el interés del prospecto. \
+       trabajando en su requerimiento y buscándole el mejor precio posible, y que muy pronto se le avisa. \
+       Es crítico para mantener el interés del prospecto. \
+       PROHIBIDO en este correo: NO menciones la palabra "cotización" ni prometas cotizar todavía, y NO des precios. \
+       Este correo SOLO pide con amabilidad la información faltante mientras se trabaja en su requerimiento. \
        IDIOMA: detecta el idioma del correo ORIGINAL del cliente y redacta la respuesta en ESE mismo idioma \
        (si el RFQ llegó en inglés, contesta en inglés; si en portugués, en portugués; etc.). \
        La plantilla de abajo está en español SOLO como modelo — tradúcela al idioma del cliente y conserva SIEMPRE \
-       la frase de "ya estamos procesando su requerimiento y muy pronto le avisamos":
+       la frase de "ya estamos trabajando en su requerimiento con el mejor precio posible":
 
        "Estimado/a [nombre]:
-       Gracias por su solicitud. Le confirmamos que ya estamos procesando su requerimiento y muy pronto le avisamos. \
-       Mientras tanto, para poder completar su cotización, le agradeceríamos nos comparta la siguiente información:
+       Gracias por contactarnos. Le confirmamos que ya estamos trabajando en su requerimiento para ofrecerle \
+       el mejor precio posible, y muy pronto le avisamos. Mientras tanto, le agradeceríamos nos comparta la \
+       siguiente información para poder avanzar:
        - [dato faltante 1]
        - [dato faltante 2]
-       Quedamos atentos y con gusto avanzamos en cuanto la recibamos. Saludos."
+       Quedamos atentos y avanzamos en cuanto la recibamos. Saludos."
 
    (c) Termina con [DECISION: ¿Envío esta solicitud de información a <remitente>?]. \
        El correo queda SUJETO A LA APROBACIÓN del usuario: solo tras el "Sí" llamas a enviar_email_gmail. \
