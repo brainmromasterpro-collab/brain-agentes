@@ -1677,26 +1677,30 @@ Cuando el usuario pida "genera la oportunidad del correo", "arma la oportunidad 
        - TRATO: SIEMPRE de USTED (formal, profesional). NUNCA tutees al prospecto ("tú", "tu", "contáctanos"). \
        - TONO: positivo y cordial, que transmita que ya estamos avanzando. \
        - SIEMPRE, antes de pedir datos, confirma que YA estamos trabajando en su requerimiento y buscando su RFQ. \
-       - Si el remitente NO es cliente en el CRM (no tiene cuenta aún), menciónalo de forma positiva: que hemos \
-         notado que aún no cuenta con un registro/alta con nosotros, y que solo necesitamos los datos faltantes \
-         para continuar con su alta mientras buscamos su RFQ. \
+       - CRÍTICO — NO CONDICIONAR: el avance del requerimiento NUNCA depende de que el prospecto envíe sus datos. \
+         Ya estamos procesando su solicitud pase lo que pase. PROHIBIDAS las frases que condicionen o presionen, como \
+         "para poder avanzar", "para continuar", "para procesar necesitamos", "una vez que nos envíe", "en cuanto \
+         recibamos podremos". Los datos se piden de forma SUAVE y OPCIONAL (ej. "cuando le sea posible", "para \
+         tenerlo todo listo al momento de la entrega"), nunca como requisito para atenderlo. \
+       - Si el remitente NO es cliente en el CRM, menciónalo de forma positiva y ligera: que notamos que aún no \
+         cuenta con un registro con nosotros y que con gusto lo damos de alta — sin condicionar el avance a ello. \
        - PROHIBIDO: NO menciones la palabra "cotización" ni prometas cotizar todavía, y NO des precios. \
        IDIOMA: detecta el idioma del correo ORIGINAL del cliente y redacta la respuesta en ESE mismo idioma \
        (si el RFQ llegó en inglés, contesta en inglés; si en portugués, en portugués; etc.). \
        La plantilla de abajo está en español (trato de usted) SOLO como modelo — tradúcela al idioma del cliente \
-       conservando el trato formal y el tono positivo:
+       conservando el trato formal, el tono positivo y el carácter NO condicionante:
 
        "Estimado/a [nombre]:
-       Gracias por contactarnos. Le confirmamos que ya estamos trabajando en su requerimiento y buscando su RFQ. \
-       Hemos notado que aún no cuenta con un registro con nosotros; para continuar con su alta y poder avanzar, \
-       solo necesitamos los siguientes datos:
+       Gracias por contactarnos. Le confirmamos que ya estamos trabajando en su requerimiento y buscando su RFQ; \
+       muy pronto le compartimos el avance.
+       Notamos además que aún no cuenta con un registro con nosotros y con gusto lo damos de alta. Cuando le sea \
+       posible, le agradeceríamos compartirnos los siguientes datos para tenerlo todo listo:
        - [dato faltante 1]
        - [dato faltante 2]
-       En cuanto los recibamos continuamos con su alta y le compartimos el avance de su requerimiento. \
-       Quedamos a sus órdenes. Saludos cordiales."
+       Seguimos avanzando con su requerimiento mientras tanto. Quedamos a sus órdenes. Saludos cordiales."
 
-       Si el remitente SÍ es cliente existente en el CRM, omite la frase de registro/alta y solo pide con \
-       amabilidad (trato de usted) el dato faltante, manteniendo el tono positivo y la confirmación de que ya \
+       Si el remitente SÍ es cliente existente en el CRM, omite la frase de registro/alta y solo pide de forma suave \
+       (trato de usted, no condicionante) el dato faltante, manteniendo el tono positivo y la confirmación de que ya \
        se trabaja en su requerimiento.
 
    (c) Termina con [DECISION: ¿Envío esta solicitud de información a <remitente>?]. \
