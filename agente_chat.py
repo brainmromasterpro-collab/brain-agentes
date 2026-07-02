@@ -52,6 +52,10 @@ from supabase import create_client, Client
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("agente_chat")
+# Silenciar el flood de "HTTP Request: GET ..." (cada poll de los 5 agentes) para que los
+# logs sean legibles y se puedan ver los [PERF] y demás mensajes importantes.
+for _noisy in ("httpx", "httpcore", "anthropic", "hpack"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 supabase: Client = create_client(
     os.environ["SUPABASE_URL"],
@@ -1855,17 +1859,17 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool
             total_input_tokens  += getattr(response.usage, "input_tokens",  0)
             total_output_tokens += getattr(response.usage, "output_tokens", 0)
             _u = response.usage
-            print(f"[PERF] ronda={_ronda} llm={_dt_llm:.1f}s stop={response.stop_reason} "
-                  f"in={getattr(_u,'input_tokens',0)} out={getattr(_u,'output_tokens',0)} "
-                  f"cache_read={getattr(_u,'cache_read_input_tokens',0)} "
-                  f"cache_write={getattr(_u,'cache_creation_input_tokens',0)}", flush=True)
+            log.info(f"[PERF] ronda={_ronda} llm={_dt_llm:.1f}s stop={response.stop_reason} "
+                     f"in={getattr(_u,'input_tokens',0)} out={getattr(_u,'output_tokens',0)} "
+                     f"cache_read={getattr(_u,'cache_read_input_tokens',0)} "
+                     f"cache_write={getattr(_u,'cache_creation_input_tokens',0)}")
 
         if response.stop_reason == "end_turn":
             text = next(
                 (b.text for b in response.content if hasattr(b, "text")), ""
             )
-            print(f"[PERF] TOTAL run_chat={_time.time()-_t_start:.1f}s rondas={_ronda+1} "
-                  f"tools={tools_used}", flush=True)
+            log.info(f"[PERF] TOTAL run_chat={_time.time()-_t_start:.1f}s rondas={_ronda+1} "
+                     f"tools={tools_used}")
             token_counts = {"tokens_input": total_input_tokens, "tokens_output": total_output_tokens}
             return text, tools_used, rfqs_created, token_counts
 
@@ -1894,7 +1898,7 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool
                         rfqs_created = True
                 except Exception as e:
                     result = {"error": str(e)}
-                print(f"[PERF] tool={tool_name} dt={_time.time()-_t_tool:.1f}s", flush=True)
+                log.info(f"[PERF] tool={tool_name} dt={_time.time()-_t_tool:.1f}s")
 
                 # Registrar la acción en el log del stream (UI global + por-stream)
                 _msg_log, _tipo_log = _mensaje_log_tool(tool_name, tool_input, result)
@@ -2011,7 +2015,7 @@ def procesar_mensaje(msg: dict) -> None:
     # fallback salvo que se hayan creado RFQs (ese caso ya se manejó arriba).
     if not respuesta.strip():
         log.warning("Respuesta vacía del modelo — insertando fallback")
-        print(f"[PERF] respuesta VACÍA tras tools={tools_used}", flush=True)
+        log.warning(f"[PERF] respuesta VACÍA tras tools={tools_used}")
         respuesta = ("Procesé tu solicitud pero no generé un mensaje de respuesta. "
                      "¿Puedes reformular o intentar de nuevo?")
 
