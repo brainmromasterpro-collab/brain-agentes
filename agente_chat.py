@@ -62,6 +62,8 @@ supabase: Client = create_client(
     os.environ["SUPABASE_SERVICE_KEY"],
 )
 claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+# Modelo del chat. Configurable por env var para poder cambiar/revertir sin re-deploy.
+CHAT_MODEL = os.environ.get("CHAT_MODEL", "claude-sonnet-5")
 
 ONECRM_BASE   = os.environ.get("ONECRM_URL", "").rstrip("/")
 POLL_INTERVAL = 5   # segundos — respuesta rápida en el chat
@@ -1844,7 +1846,7 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool
     for _ronda in range(10):
         _t_llm = _time.time()
         response = claude.messages.create(
-            model="claude-sonnet-4-6",
+            model=CHAT_MODEL,
             max_tokens=4096,
             # cache_control cachea el prefijo estático (tools + system prompt). En el loop de
             # tools (hasta 10 vueltas) las llamadas siguientes leen de caché en vez de
