@@ -731,10 +731,20 @@ def tool_crear_cuenta_crm(
     envio_estado: str = "",
     envio_cp: str = "",
     envio_pais: str = "",
+    fact_calle: str = "",
+    fact_cp: str = "",
+    razon_social: str = "",
+    rfc: str = "",
+    regimen_fiscal: str = "",
+    condiciones_pago: str = "",
+    industria: str = "",
 ) -> dict:
     """Crea una nueva cuenta/empresa en 1CRM.
     tipo: Customer | Supplier | Partner | Competitor | Press | Analyst | Other
-    Los campos envio_* llenan la dirección de envío (shipping) de la cuenta.
+    Los campos envio_* llenan la dirección de envío (shipping) y fact_* la de facturación.
+    Datos fiscales para alta formal de cliente: razon_social, rfc, regimen_fiscal
+    (ej. 'Persona Moral - General', 'Persona Física - General'), condiciones_pago
+    (ej. 'advance_100%', 'Net_15', 'Net_30').
     """
     if not ONECRM_BASE:
         return {"error": "1CRM no configurado"}
@@ -743,8 +753,10 @@ def tool_crear_cuenta_crm(
     if telefono:      payload["phone_office"] = telefono
     if tel_alternativo: payload["phone_alternate"] = tel_alternativo
     if web:           payload["website"] = web
+    if fact_calle:    payload["billing_address_street"] = fact_calle
     if ciudad:        payload["billing_address_city"] = ciudad
     if estado:        payload["billing_address_state"] = estado
+    if fact_cp:       payload["billing_address_postalcode"] = fact_cp
     if pais:          payload["billing_address_country"] = pais
     if descripcion:   payload["description"] = descripcion
     # Dirección de envío (shipping) — donde vive la "dirección de envío" del RFQ
@@ -753,6 +765,12 @@ def tool_crear_cuenta_crm(
     if envio_estado:  payload["shipping_address_state"] = envio_estado
     if envio_cp:      payload["shipping_address_postalcode"] = envio_cp
     if envio_pais:    payload["shipping_address_country"] = envio_pais
+    # Datos fiscales (alta formal de cliente)
+    if razon_social:     payload["razon_social"] = razon_social
+    if rfc:              payload["rfc"] = rfc
+    if regimen_fiscal:   payload["fiscal_regime"] = regimen_fiscal
+    if condiciones_pago: payload["payment_terms"] = condiciones_pago
+    if industria:        payload["industry"] = industria
     resp = _onecrm_post("data/Account", payload)
     acct_id = resp.get("id", "")
     return {
@@ -1369,6 +1387,13 @@ TOOLS: list[dict] = [
                 "envio_estado":    {"type": "string", "description": "Dirección de envío: estado/provincia"},
                 "envio_cp":        {"type": "string", "description": "Dirección de envío: código postal"},
                 "envio_pais":      {"type": "string", "description": "Dirección de envío: país"},
+                "fact_calle":      {"type": "string", "description": "Dirección de facturación: calle y número"},
+                "fact_cp":         {"type": "string", "description": "Dirección de facturación: código postal"},
+                "razon_social":    {"type": "string", "description": "Razón social (alta fiscal)"},
+                "rfc":             {"type": "string", "description": "RFC del cliente"},
+                "regimen_fiscal":  {"type": "string", "description": "Régimen fiscal: 'Persona Moral - General', 'Persona Moral - RESICO', 'Persona Física - General', etc."},
+                "condiciones_pago":{"type": "string", "description": "Condiciones de pago: advance_100%, advance_50%, Net_15, Net_30, Net_45, Net_60"},
+                "industria":       {"type": "string", "description": "Industria (opcional)"},
             },
             "required": ["nombre"],
         },
@@ -1727,12 +1752,10 @@ Cuando el usuario pida "genera la oportunidad del correo", "arma la oportunidad 
        Tras el "Sí": crea la oportunidad con crear_oportunidad_crm — pon en descripcion el detalle "RFQ: <part-numbers> | Qty: <cantidades>" \
        y usa el cuenta_id del CRM. Confirma con el link de la oportunidad creada.
 
-   4b. NO ES CLIENTE (no hay cuenta en CRM): termina con [DECISION: ¿Doy de alta la cuenta + contacto y creo la oportunidad?]. \
-       Tras el "Sí", en orden:
-       (i)   crear_cuenta_crm con nombre, email, teléfono y los campos envio_* de la dirección de envío.
-       (ii)  crear_contacto_crm ligado con cuenta_id (el id devuelto en i), con nombre, apellido, email y whatsapp.
-       (iii) crear_oportunidad_crm con ese cuenta_id y descripcion "RFQ: <part-numbers> | Qty: <cantidades>".
-       Confirma con los links de cuenta, contacto y oportunidad creados.
+   4b. NO ES CLIENTE (no hay cuenta en CRM): hay que DAR DE ALTA al cliente primero. Sigue el MODO 12 (alta de \
+       cliente): reúne los datos del alta (razón social, RFC, régimen fiscal, dirección, contacto), créalo con \
+       [DECISION], y SOLO cuando el alta esté completa crea la oportunidad ligada con crear_oportunidad_crm \
+       (cuenta_id de la cuenta recién creada, descripcion "RFQ: <part-numbers> | Qty: <cantidades>").
 
 CRÍTICO: en este modo nunca creas nada en el CRM ni envías correos sin el [DECISION] aprobado por el usuario. \
 Si faltan datos, primero se piden; solo con los 4 bloques completos se procede a cotejar y crear.
@@ -1768,6 +1791,36 @@ Cuando el usuario pida "lee los correos", "revisa el correo y detecta oportunida
    Tras resolver una, continúa con la siguiente. Nunca crees ni envíes sin el [DECISION] aprobado.
 
 Si no hay oportunidades (ningún es_rfq), dilo claramente y no notifiques nada.
+
+MODO 12 — ALTA DE CLIENTE NUEVO (onboarding):
+Se dispara cuando un prospecto con RFQ NO es cliente en el CRM (desde el MODO 10/11), o cuando el usuario \
+pide "da de alta a <cliente>". Objetivo: registrar formalmente la cuenta + su contacto antes de crear la oportunidad.
+
+1. DATOS DEL ALTA. Reúne (del RFQ, del cotejo, o preguntando):
+   - Empresa / Razón social.
+   - RFC.
+   - Régimen fiscal (valores: "Persona Moral - General", "Persona Moral - RESICO", "Persona Física - General", etc.).
+   - Contacto: nombre y correo (whatsapp/teléfono si hay).
+   - Dirección de facturación y dirección de envío.
+   - (Opcional) condiciones de pago (advance_100%, Net_15, Net_30...) e industria.
+
+2. FALTANTES — DOBLE FUENTE (igual que en oportunidades): lo que falte para el alta se puede obtener por \
+   (1) pedírselo al prospecto por correo/WhatsApp (borrador cortés, trato de usted, no condicionante, con [DECISION] \
+   antes de enviar — mismas reglas del MODO 10 paso 3), o (2) que el usuario del chat te lo proporcione directamente. \
+   Avisa en el chat exactamente qué falta para completar el alta.
+
+3. CREAR (solo con [DECISION] aprobado): [DECISION: ¿Doy de alta a <empresa> como cliente?]. Tras el "Sí":
+   (i)  crear_cuenta_crm con tipo="Customer": nombre/razón social, rfc, regimen_fiscal, email, teléfono, \
+        fact_* (facturación), envio_* (envío), condiciones_pago.
+   (ii) crear_contacto_crm ligado con cuenta_id (el id de i): nombre, apellido, email, whatsapp.
+   Confirma el alta con los links de cuenta y contacto.
+
+4. ENCADENAR CON LA OPORTUNIDAD: si el alta vino de un RFQ (MODO 10/11), en cuanto quede creada la cuenta, \
+   crea la oportunidad ligada (crear_oportunidad_crm con ese cuenta_id) — con su propio [DECISION] si no se aprobó ya.
+
+NOTA: mínimo indispensable para crear la cuenta en el CRM es el nombre; pero para un alta FORMAL de cliente \
+solicita razón social, RFC y régimen fiscal. Si el usuario del chat dice explícitamente "créala con lo que hay", \
+procede con los datos disponibles y marca los fiscales como pendientes.
 
 MODO 7 — CHAT CONVERSACIONAL:
 Para preguntas o solicitudes de información, usa las herramientas disponibles \
