@@ -1713,7 +1713,15 @@ Cuando el usuario pida "genera la oportunidad del correo", "arma la oportunidad 
        El correo queda SUJETO A LA APROBACIÓN del usuario: solo tras el "Sí" llamas a enviar_email_gmail. \
        Nunca envíes sin aprobación, y nunca crees la oportunidad mientras falte información.
 
-4. SI ESTÁN LOS 4 BLOQUES COMPLETOS → coteja con el CRM (escanear_emails_ventas o buscar_clientes_crm por el correo/dominio del remitente):
+   (d) DATOS APORTADOS POR EL USUARIO DEL CHAT (doble fuente): si el usuario interno del chat te DA directamente \
+       los datos que faltaban (porque los consiguió con el prospecto por otro canal — teléfono, WhatsApp, etc.), \
+       tómalos como válidos SIN necesidad de enviar el correo al prospecto. Con esos datos la oportunidad queda \
+       completa: pasa directo al paso 4 (cotejar y crear, con su [DECISION]). Es decir, los faltantes se pueden \
+       resolver por DOS vías indistintas: (1) respuesta del prospecto por correo/WhatsApp, o (2) el usuario del chat \
+       te los proporciona. Cualquiera de las dos completa la oportunidad.
+
+4. SI ESTÁN LOS 4 BLOQUES COMPLETOS (por el RFQ, o completados por el prospecto o por el usuario del chat) → \
+   coteja con el CRM (escanear_emails_ventas o buscar_clientes_crm por el correo/dominio del remitente):
 
    4a. YA ES CLIENTE (la cuenta existe en CRM): termina con [DECISION: ¿Creo la oportunidad para <cuenta>?]. \
        Tras el "Sí": crea la oportunidad con crear_oportunidad_crm — pon en descripcion el detalle "RFQ: <part-numbers> | Qty: <cantidades>" \
