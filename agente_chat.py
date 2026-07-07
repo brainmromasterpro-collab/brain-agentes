@@ -1987,38 +1987,21 @@ Cuando el usuario pida "lee los correos", "revisa el correo y detecta oportunida
    (Contacto, Empresa, RFQ+Qty, Correo, Dirección de envío; el whatsapp NO es obligatorio) usando el contenido \
    del correo y el cotejo con CRM (es_cliente_conocido / cliente_crm). Anota qué falta en cada una.
 
-3. Avisa en el sistema con notificar_sistema: titulo tipo "🔔 N oportunidades detectadas en el correo", \
-   mensaje con un resumen breve (cuántas completas y cuántas incompletas).
+3. Si hay al menos una oportunidad, avisa con notificar_sistema (titulo "🔔 N oportunidades detectadas en el correo").
 
-4. Presenta primero un TRIAGE en tabla con TODAS las oportunidades (vista general de un vistazo):
+4. Presenta TODAS las oportunidades emitiendo EXACTAMENTE este marcador, en UNA sola línea y con JSON VÁLIDO \
+   (el frontend lo convierte en un widget visual — NO escribas tabla, tarjetas ni texto con los datos): \
+   [OPORTUNIDADES]{"total":N,"resumen":"X completas, Y incompletas","omitidas":M,"oportunidades":[{"remitente":"Nombre","correo":"a@b.com","empresa":"Empresa","es_cliente":true,"productos":["Q0120 · 2 pz"],"faltan":["Dirección de envío"],"completa":false}],"correos_no_rfq":[]} \
+   Reglas del JSON: "faltan" = lista de datos obligatorios que faltan (vacío [] si está completa); "completa" = true si no falta nada; \
+   "omitidas" = valor de omitidas_ya_atendidas. Si NO hay oportunidades (total 0), emite igual el marcador con \
+   "total":0, "oportunidades":[] y "correos_no_rfq":["asunto/resumen corto de cada correo revisado"], y NO notifiques. \
+   NUNCA repitas los datos en texto aparte del marcador: el widget ya los muestra.
 
-   | # | Remitente | Cuenta CRM | Producto(s) | Qty | Falta para crear | Acción sugerida |
-   |---|-----------|------------|-------------|-----|------------------|-----------------|
-   | 1 | juan@x.com | ✅ Aceros del Norte | Q0120 | 20 | — (completa) | Crear oportunidad |
-   | 2 | maria@y.com | ❌ No es cliente | ABC123 | ? | Contacto, Dirección, Qty | Pedir datos al cliente |
-
-   Debajo resume en una línea: "X completas listas para crear, Y incompletas que requieren pedir datos."
-
-5. Luego procesa UNA por una, empezando por la #1. Para CADA oportunidad, PRIMERO preséntala con este \
-   FORMATO VISUAL ESTRUCTURADO (tarjeta con encabezado, negritas y lista de productos — NO en párrafo plano):
-
-   ## 🔵 Oportunidad #N — <asunto o título corto del requerimiento>
-   **Remitente:** <nombre de la persona> · <correo>
-   **Empresa:** <empresa> — <✅ cliente en CRM / ❌ no es cliente aún>
-   **Productos:**
-   - <part-number> — <descripción breve> · <qty> pz
-   - <part-number> — <descripción breve> · <qty> pz
-   **Faltan:** <lista de datos faltantes, o "nada — completa ✅">
-
-   Y JUSTO DESPUÉS de la tarjeta, el paso de decisión:
-   - Si está completa → [DECISION: ¿Creo la oportunidad para <cuenta>?] y al aprobar, créala (con alta de cuenta/contacto si es cliente nuevo, MODO 12).
-   - Si le falta info → muestra el borrador de correo pidiendo SOLO lo faltante (reglas del MODO 10 paso 3) y [DECISION: ¿Envío la solicitud a <remitente>?].
-   Tras resolver una, continúa con la siguiente tarjeta. Nunca crees ni envíes sin el [DECISION] aprobado.
-
-FORMATO — SIEMPRE presenta las oportunidades con estructura visual (tabla de triage + tarjetas con encabezado, \
-negritas y bullets), NUNCA como un párrafo corrido. Usa emojis de estado (✅ ❌ 🔵 ⚠️) con moderación para que se lea claro.
-
-Si no hay oportunidades (ningún es_rfq), dilo claramente y no notifiques nada.
+5. DESPUÉS del marcador, procesa las oportunidades UNA por una (solo las que tengan faltan/creación pendiente), \
+   empezando por la #1, aplicando el flujo del MODO 10: si está completa → [DECISION: ¿Creo la oportunidad para <empresa>?] \
+   (crea con alta de cuenta/contacto si es cliente nuevo, MODO 12); si le falta info → borrador de correo pidiendo SOLO \
+   lo faltante (reglas del MODO 10 paso 3) + [DECISION: ¿Envío la solicitud a <remitente>?]. Tras resolver una, sigue con \
+   la siguiente. Nunca crees ni envíes sin el [DECISION] aprobado.
 
 MODO 12 — ALTA DE CLIENTE NUEVO (alta inicial, baja fricción):
 Se dispara cuando un prospecto con RFQ NO es cliente en el CRM (desde el MODO 10/11), o cuando el usuario \
