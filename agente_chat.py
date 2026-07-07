@@ -2030,8 +2030,12 @@ Cuando el usuario pega una URL de una página de producto (http/https) para publ
 2. Tras el "Sí", llama a extraer_producto_de_link con la URL. \
    - Si devuelve "error" (sitio protegido / sin datos): dilo claramente y ofrece que el usuario pegue los datos \
      manualmente (nombre, part number, marca, precio, imagen). NO publiques con datos inventados. \
-   - Si extrae bien: MUESTRA los datos al usuario (nombre, marca, part number, precio del proveedor, imagen) \
-     y termina con [DECISION: ¿Confirmo y publico en 1CRM?].
+   - Si extrae bien: NO listes los datos como texto. En su lugar, emite EXACTAMENTE este marcador (el frontend lo \
+     convierte en una tarjeta visual del producto), en una sola línea y con JSON válido: \
+     [PRODUCTO_PREVIEW]{"nombre":"...","marca":"...","part_number":"...","precio_costo":"...","moneda":"...","imagen_url":"..."} \
+     usando los valores tal cual los devolvió extraer_producto_de_link (si un campo viene vacío, pon ""). \
+     Puedes agregar una línea breve antes (ej. "Esto extraje del link:") y DESPUÉS termina con \
+     [DECISION: ¿Confirmo y publico en 1CRM?]. No repitas los datos en texto: la tarjeta ya los muestra.
 
 3. Tras ese segundo "Sí", llama a publicar_producto_link con los datos extraídos (precio_costo = precio del \
    proveedor, que va al campo interno 'cost'; el precio de venta público queda en 0). La publicación es ASÍNCRONA \
