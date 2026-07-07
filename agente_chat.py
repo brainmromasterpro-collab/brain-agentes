@@ -2146,6 +2146,19 @@ def _mensaje_log_tool(tool_name: str, tool_input: dict, result) -> tuple[str, st
     return msg, tipo
 
 
+# Mensaje que se muestra en la burbuja "procesando" ANTES de ejecutar una tarea larga,
+# con el estimado de tiempo, para que el usuario sepa que hay que esperar y que se le avisará.
+_LOG_INICIO_TOOL = {
+    "escanear_emails_ventas":   "🔎 Reviso tu correo en busca de oportunidades… (~1 min). Te aviso al terminar.",
+    "publicar_producto_link":   "📦 Publicando en 1CRM… (~30s). Te aviso cuando el producto esté listo.",
+    "crear_rfqs_desde_texto":   "🔍 Buscando proveedores (~1-2 min por producto)… Te aviso al terminar.",
+    "publicar_rfq":             "📦 Publicando en 1CRM… (~30s). Te aviso cuando esté listo.",
+    "publicar_sin_imagen_rfq":  "📦 Publicando en 1CRM… (~30s). Te aviso cuando esté listo.",
+    "extraer_producto_de_link": "🔎 Reviso el link del producto…",
+    "buscar_internet":          "🌐 Buscando en internet…",
+}
+
+
 # ─────────────────────────────────────────────────────────────
 # LOOP DE CLAUDE CON TOOL_USE
 # ─────────────────────────────────────────────────────────────
@@ -2207,6 +2220,11 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool
                 # Inyectar stream_id automáticamente en tools que lo necesitan
                 if tool_name in ("crear_rfqs_desde_texto", "notificar_sistema", "publicar_producto_link") and not tool_input.get("stream_id"):
                     tool_input["stream_id"] = stream_id
+
+                # Aviso de inicio con estimado (la burbuja "procesando" lo muestra en vivo)
+                _ini = _LOG_INICIO_TOOL.get(tool_name)
+                if _ini:
+                    _log_stream(stream_id, _ini, "info")
 
                 fn = TOOL_FUNCTIONS.get(tool_name)
                 _t_tool = _time.time()
