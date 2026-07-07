@@ -1221,6 +1221,51 @@ def tool_extraer_producto_de_link(url: str) -> dict:
     return _extraer_producto_link(url)
 
 
+def _rehost_imagen(imagen_url: str, part_number: str = "") -> str:
+    """Descarga la imagen y la re-hospeda en Supabase Storage, para que el publicador pueda
+    subirla a 1CRM. Sitios como Festo bloquean la descarga directa desde IPs de datacenter
+    (Railway) → si el directo falla, se reintenta vía ScrapingAnt (proxy residencial). Si todo
+    falla, devuelve la URL original (el publicador hará su propio fallback)."""
+    if not imagen_url:
+        return imagen_url
+    from urllib.parse import quote_plus
+
+    def _dl(via_scraper: bool):
+        try:
+            if via_scraper:
+                sc = os.environ.get("SCRAPER_API_URL", "").strip()
+                if not sc:
+                    return None
+                fetch = sc.replace("browser=true", "browser=false").replace("render_js=true", "render_js=false")
+                return httpx.get(fetch.replace("{url}", quote_plus(imagen_url)), timeout=40)
+            return httpx.get(imagen_url, timeout=20, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"})
+        except Exception:
+            return None
+
+    def _ok(r):
+        return r is not None and r.status_code == 200 and "image" in r.headers.get("content-type", "").lower()
+
+    try:
+        r = _dl(False)
+        if not _ok(r):
+            r = _dl(True)  # bloqueado → proxy residencial
+        if not _ok(r):
+            return imagen_url
+        ct = r.headers.get("content-type", "image/jpeg").lower()
+        ext = "png" if "png" in ct else ("webp" if "webp" in ct else "jpg")
+        safe = (part_number or "producto").replace("/", "-").replace(" ", "_")
+        path = f"link/{safe}_{str(uuid.uuid4())[:6]}.{ext}"
+        supabase.storage.from_("product-images").upload(
+            path=path, file=r.content, file_options={"content-type": ct, "upsert": "true"},
+        )
+        url = supabase.storage.from_("product-images").get_public_url(path)
+        log.info(f"Imagen re-hospedada en Supabase: {url[:70]}")
+        return url
+    except Exception as e:
+        log.warning(f"No se pudo re-hospedar la imagen, se usa la original: {e}")
+        return imagen_url
+
+
 def tool_publicar_producto_link(
     nombre: str,
     part_number: str,
@@ -1244,13 +1289,16 @@ def tool_publicar_producto_link(
         now = datetime.now(timezone.utc)
         bulk_id = str(uuid.uuid4())  # bulk de 1 producto → dispara el BulkWidget (widget "Ver en CRM")
         rfq_id_str = f"LINK-{now.year}-{now.month:02d}{now.day:02d}-{str(uuid.uuid4())[:6].upper()}"
+        # Re-hospedar la imagen en Supabase (sitios como Festo bloquean la descarga directa del
+        # publicador) para que sí se suba a 1CRM.
+        foto_final = _rehost_imagen(imagen_url, part_number) if imagen_url else None
         rfq_row: dict = {
             "stream_id": clean_stream,
             "rfq_id":    rfq_id_str,
             "modelo":    part_number or nombre,
             "marca":     marca or "",
             "estado":    "publicando",
-            "foto_url":  imagen_url or None,
+            "foto_url":  foto_final,
             "bulk_id":   bulk_id,
         }
         try:
