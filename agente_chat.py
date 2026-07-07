@@ -2090,9 +2090,9 @@ vuelvas a traducir ni los reescribas. El nombre también en inglés si el tool l
 2. Tras el "Sí", llama a publicar_producto_link con TODOS los datos extraídos (incluye descripcion y el \
    arreglo caracteristicas para que queden en la ficha del producto en 1CRM) (precio_costo = precio del \
    proveedor, que va al campo interno 'cost'; el precio de venta público queda en 0). La publicación es ASÍNCRONA \
-   (el worker publica en unos segundos y el widget producto_publicado — el que trae el link "Ver en CRM" — aparece \
-   solo). Responde breve, tipo "Publicando en 1CRM… en un momento te muestro el producto." NO afirmes "Publicado ✅" \
-   ni describas el resultado con texto largo: el widget lo maneja.
+   y el widget del sistema (BulkWidget con "Ver en CRM") muestra el producto solo. NO agregues NINGÚN texto después \
+   de llamar a publicar_producto_link — nada de "Publicando…" ni "Publicado ✅": sería redundante con el widget. \
+   Devuelve exactamente una cadena vacía como respuesta final.
 
 CRÍTICO: nunca publiques sin el [DECISION] aprobado. El precio del proveedor es interno (cost), no público.
 
@@ -2251,6 +2251,10 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool
                 try:
                     result = fn(**tool_input) if fn else {"error": f"Tool '{tool_name}' no existe"}
                     if tool_name == "crear_rfqs_desde_texto" and result.get("creados", 0) > 0:
+                        rfqs_created = True
+                    # Publicar desde link: el widget negro (BulkWidget) ya muestra el resultado →
+                    # suprimir la respuesta de texto redundante ("Publicando…").
+                    if tool_name == "publicar_producto_link" and isinstance(result, dict) and result.get("ok"):
                         rfqs_created = True
                 except Exception as e:
                     result = {"error": str(e)}
