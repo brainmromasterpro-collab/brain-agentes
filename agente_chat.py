@@ -2294,14 +2294,16 @@ def procesar_mensaje(msg: dict) -> None:
 def main() -> None:
     log.info("Agente Chat iniciado — escuchando tabla `mensajes`...")
 
-    # Recuperar mensajes huérfanos (procesado=false de sesiones anteriores)
+    # Al arrancar, descartar SOLO el backlog realmente viejo (>5 min) para no responder a
+    # mensajes de sesiones pasadas. Los mensajes recientes (<5 min) NO se descartan: así, si
+    # el worker reinicia justo después de que el usuario envió algo, ese mensaje SÍ se procesa
+    # en lugar de quedar "procesado" sin respuesta (antes se marcaban TODOS → se perdían).
     try:
+        from datetime import timedelta
+        corte = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
         supabase.table("mensajes").update({"procesado": True}).filter(
             "procesado", "is", "false"
-        ).eq("role", "user").lt(
-            "created_at",
-            datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        ).execute()
+        ).eq("role", "user").lt("created_at", corte).execute()
     except Exception:
         pass
 
