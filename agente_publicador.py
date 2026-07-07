@@ -397,6 +397,9 @@ def crear_producto_en_crm(ficha: dict, modelo: str) -> str:
     log.info(f"Creando producto en 1CRM: {ficha['nombre']}")
     precio = round(float(ficha.get("precio_referencia") or 0), 2)
     precio_str = f"{precio:.2f}"
+    # cost = costo interno (precio del proveedor en el flujo "publicar desde link"); NO se expone al público
+    costo = round(float(ficha.get("cost") or 0), 2)
+    costo_str = f"{costo:.2f}"
 
     # Campos que enrutan a aos_products (ProductCatalog) — NO usar price/unit_price
     # que son columnas de la tabla products (line items de cotizaciones)
@@ -409,8 +412,8 @@ def crear_producto_en_crm(ficha: dict, modelo: str) -> str:
         "list_usdollar":         precio_str,
         "purchase_price":        "0.00",
         "purchase_usdollar":     "0.00",
-        "cost":                  "0.00",
-        "cost_usdollar":         "0.00",
+        "cost":                  costo_str,
+        "cost_usdollar":         costo_str,
         "support_cost":          "0.00",
         "support_cost_usdollar": "0.00",
         "support_list_price":    "0.00",
@@ -650,26 +653,41 @@ def procesar_job_publicador(job: dict) -> None:
 
         log.info(f"Publicando: {marca} {modelo} | foto={'sí' if foto_url else 'no'}")
 
-        # ── Obtener opciones ─────────────────────────────────────────────
-        opts = supabase.table("opciones").select("*").eq("rfq_id", rfq_uuid)\
-            .order("rank").execute().data or []
-        log.info(f"{len(opts)} opciones encontradas")
+        # ── Ficha pre-extraída (flujo "publicar desde link") vs búsqueda ──
+        job_input = job.get("input") or {}
+        ficha_manual = job_input.get("ficha") if isinstance(job_input, dict) else None
 
-        # Usar la opción que el usuario seleccionó (guardada como UUID en rfqs.opcion_seleccionada)
-        opcion_id = rfq.get("opcion_seleccionada")
-        if opcion_id:
-            opts_para_ficha = [op for op in opts if op.get("id") == opcion_id]
-            if not opts_para_ficha:
-                log.warning(f"opcion_seleccionada={opcion_id} no encontrada en opciones, usando rank 1")
-                opts_para_ficha = opts[:1]
+        if ficha_manual:
+            # El producto viene de un link ya extraído: usar esa ficha directamente,
+            # sin opciones ni generación por Claude. cost = precio del proveedor (interno).
+            log.info("Ficha pre-extraída (origen=link) — se omite búsqueda/generación")
+            ficha = {
+                "nombre":            ficha_manual.get("nombre") or f"{marca} {modelo}".strip(),
+                "descripcion":       ficha_manual.get("descripcion", ""),
+                "precio_referencia": ficha_manual.get("list_price", 0),  # precio público (0 por defecto)
+                "cost":              ficha_manual.get("cost", 0),        # costo interno (proveedor)
+            }
         else:
-            log.warning("No hay opcion_seleccionada en el RFQ, usando rank 1")
-            opts_para_ficha = opts[:1]
-        op_elegida = opts_para_ficha[0]
-        log.info(f"Publicando con opción seleccionada: {op_elegida.get('proveedor','?')} @ {op_elegida.get('precio_orig','?')} {op_elegida.get('moneda','')}")
+            # ── Obtener opciones ─────────────────────────────────────────
+            opts = supabase.table("opciones").select("*").eq("rfq_id", rfq_uuid)\
+                .order("rank").execute().data or []
+            log.info(f"{len(opts)} opciones encontradas")
 
-        # ── Claude genera ficha ──────────────────────────────────────────
-        ficha = generar_ficha_producto(marca, modelo, opts_para_ficha)
+            # Usar la opción que el usuario seleccionó (guardada como UUID en rfqs.opcion_seleccionada)
+            opcion_id = rfq.get("opcion_seleccionada")
+            if opcion_id:
+                opts_para_ficha = [op for op in opts if op.get("id") == opcion_id]
+                if not opts_para_ficha:
+                    log.warning(f"opcion_seleccionada={opcion_id} no encontrada en opciones, usando rank 1")
+                    opts_para_ficha = opts[:1]
+            else:
+                log.warning("No hay opcion_seleccionada en el RFQ, usando rank 1")
+                opts_para_ficha = opts[:1]
+            op_elegida = opts_para_ficha[0]
+            log.info(f"Publicando con opción seleccionada: {op_elegida.get('proveedor','?')} @ {op_elegida.get('precio_orig','?')} {op_elegida.get('moneda','')}")
+
+            # ── Claude genera ficha ──────────────────────────────────────
+            ficha = generar_ficha_producto(marca, modelo, opts_para_ficha)
 
         # ── Crear producto en 1CRM ───────────────────────────────────────
         # crear_producto_en_crm raises RuntimeError with full response if 1CRM fails

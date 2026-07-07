@@ -1079,6 +1079,129 @@ def tool_publicar_sin_imagen_rfq(rfq_id: str) -> dict:
         return {"error": str(e)}
 
 
+def _extraer_producto_link(url: str) -> dict:
+    """Extrae datos de producto de la página (og tags + JSON-LD). Funciona en sitios estándar
+    (Shopify/e-commerce). Sitios con protección anti-bots (ej. Festo) devuelven error 403 →
+    requieren navegador headless (fase 2, aún no disponible)."""
+    import re as _re
+    hdrs = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+    }
+    try:
+        r = httpx.get(url, headers=hdrs, timeout=25, follow_redirects=True)
+    except Exception as e:
+        return {"error": f"No se pudo acceder al link: {e}"}
+    if r.status_code != 200:
+        return {"error": f"HTTP {r.status_code} — el sitio bloquea el acceso automático "
+                         f"(requiere navegador headless, aún no disponible). Pega los datos manualmente."}
+    html = r.text
+
+    def meta(prop):
+        m = _re.search(rf'<meta[^>]+(?:property|name)=["\']{_re.escape(prop)}["\'][^>]+content=["\']([^"\']+)', html, _re.I) \
+            or _re.search(rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']{_re.escape(prop)}["\']', html, _re.I)
+        return m.group(1) if m else None
+
+    ld: dict = {}
+    for m in _re.finditer(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>', html, _re.S | _re.I):
+        try:
+            data = json.loads(m.group(1))
+            for obj in (data if isinstance(data, list) else [data]):
+                if isinstance(obj, dict) and obj.get("@type") == "Product":
+                    ld = obj
+                    break
+        except Exception:
+            pass
+        if ld:
+            break
+
+    offers = ld.get("offers", {}) or {}
+    if isinstance(offers, list):
+        offers = offers[0] if offers else {}
+    brand = ld.get("brand")
+    brand = brand.get("name") if isinstance(brand, dict) else brand
+    img = ld.get("image")
+    if isinstance(img, list):
+        img = img[0] if img else None
+
+    nombre = ld.get("name") or meta("og:title")
+    if not nombre:
+        return {"error": "No encontré datos de producto en el link (¿es una página de producto?)."}
+    return {
+        "ok":           True,
+        "url":          url,
+        "nombre":       nombre,
+        "marca":        brand or "",
+        "part_number":  ld.get("sku") or ld.get("mpn") or "",
+        "precio_costo": meta("product:price:amount") or offers.get("price") or "",
+        "moneda":       meta("product:price:currency") or offers.get("priceCurrency") or "",
+        "descripcion":  (ld.get("description") or meta("og:description") or "")[:500],
+        "imagen_url":   img or meta("og:image") or "",
+    }
+
+
+def tool_extraer_producto_de_link(url: str) -> dict:
+    """Extrae nombre, marca, part number, precio del proveedor, descripción e imagen de la
+    página de un producto (para publicarlo en 1CRM desde un link)."""
+    return _extraer_producto_link(url)
+
+
+def tool_publicar_producto_link(
+    nombre: str,
+    part_number: str,
+    marca: str = "",
+    descripcion: str = "",
+    precio_costo: float = 0,
+    imagen_url: str = "",
+    url_origen: str = "",
+    stream_id: str = "",
+) -> dict:
+    """Publica en 1CRM un producto extraído de un link. El precio_costo (del proveedor) va al
+    campo INTERNO 'cost' (no se expone al público); el precio de venta (list_price) queda en 0
+    para definirlo después. Reutiliza el pipeline del publicador y su widget producto_publicado."""
+    try:
+        clean_stream = stream_id if (stream_id and stream_id not in ("None", "")) else None
+        now = datetime.now(timezone.utc)
+        rfq_id_str = f"LINK-{now.year}-{now.month:02d}{now.day:02d}-{str(uuid.uuid4())[:6].upper()}"
+        rfq_row: dict = {
+            "stream_id": clean_stream,
+            "rfq_id":    rfq_id_str,
+            "modelo":    part_number or nombre,
+            "marca":     marca or "",
+            "estado":    "publicando",
+            "foto_url":  imagen_url or None,
+        }
+        try:
+            rfq_resp = supabase.table("rfqs").insert(rfq_row).execute()
+        except Exception:
+            rfq_row["stream_id"] = None
+            rfq_resp = supabase.table("rfqs").insert(rfq_row).execute()
+        rfq_id = rfq_resp.data[0]["id"]
+        job = supabase.table("jobs").insert({
+            "rfq_id":     rfq_id,
+            "agente":     "publicador",
+            "estado":     "pendiente",
+            "created_at": now.isoformat(),
+            "input": {
+                "origen": "link",
+                "url":    url_origen,
+                "ficha": {
+                    "nombre":      nombre,
+                    "descripcion": descripcion or nombre,
+                    "cost":        float(precio_costo or 0),
+                    "list_price":  0,
+                },
+            },
+        }).execute()
+        job_id = (job.data or [{}])[0].get("id", "?")
+        log.info(f"Job publicador (link) creado: {job_id} para '{nombre}'")
+        return {"ok": True, "rfq_id": rfq_id, "job_publicador": job_id, "nombre": nombre}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def tool_verificar_lista_productos(modelos: list) -> dict:
     """Verifica si una lista de modelos/partes está publicada en el CRM."""
     resultados = []
@@ -1367,6 +1490,34 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "extraer_producto_de_link",
+        "description": "Extrae los datos de un producto (nombre, marca, part number, precio del proveedor, descripción, imagen) desde la URL de una página de producto. Usar cuando el usuario pega un link de producto para publicarlo.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL de la página del producto"},
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "publicar_producto_link",
+        "description": "Publica en 1CRM un producto extraído de un link (tras aprobación del usuario). El precio del proveedor va al campo interno 'cost' (no público). Reutiliza el pipeline del publicador; el widget producto_publicado muestra el resultado. El stream_id se inyecta automáticamente.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "nombre":       {"type": "string", "description": "Nombre del producto"},
+                "part_number":  {"type": "string", "description": "Número de parte / SKU / modelo"},
+                "marca":        {"type": "string", "description": "Marca/fabricante"},
+                "descripcion":  {"type": "string", "description": "Descripción del producto"},
+                "precio_costo": {"type": "number", "description": "Precio del proveedor (va a 'cost', interno, no público)"},
+                "imagen_url":   {"type": "string", "description": "URL de la imagen del producto"},
+                "url_origen":   {"type": "string", "description": "URL original del link"},
+            },
+            "required": ["nombre", "part_number"],
+        },
+    },
+    {
         "name": "crear_cuenta_crm",
         "description": "Crea una nueva cuenta/empresa en 1CRM (cliente, proveedor, socio, etc.).",
         "input_schema": {
@@ -1598,6 +1749,8 @@ TOOL_FUNCTIONS = {
     "buscar_email_gmail":        tool_buscar_email_gmail,
     "escanear_emails_ventas":    tool_escanear_emails_ventas,
     "notificar_sistema":         tool_notificar_sistema,
+    "extraer_producto_de_link":  tool_extraer_producto_de_link,
+    "publicar_producto_link":    tool_publicar_producto_link,
     "crear_cuenta_crm":          tool_crear_cuenta_crm,
     "crear_contacto_crm":        tool_crear_contacto_crm,
     "listar_oportunidades_crm":  tool_listar_oportunidades_crm,
@@ -1822,6 +1975,24 @@ El onboarding fiscal formal ocurre DESPUÉS, cuando el cliente manda la ORDEN DE
 NOTA: los campos fiscales (razon_social, rfc, regimen_fiscal, condiciones_pago) EXISTEN en crear_cuenta_crm pero \
 solo se llenan en el onboarding formal posterior (orden de compra), NO en esta alta inicial.
 
+MODO 13 — PUBLICAR PRODUCTO DESDE UN LINK:
+Cuando el usuario pega una URL de una página de producto (http/https) para publicarla, en DOS pasos:
+
+1. Al recibir el link, NO extraigas todavía. Confirma primero: termina con \
+   [DECISION: ¿Publico el producto de este link?]. Muestra la URL.
+
+2. Tras el "Sí", llama a extraer_producto_de_link con la URL. \
+   - Si devuelve "error" (sitio protegido / sin datos): dilo claramente y ofrece que el usuario pegue los datos \
+     manualmente (nombre, part number, marca, precio, imagen). NO publiques con datos inventados. \
+   - Si extrae bien: MUESTRA los datos al usuario (nombre, marca, part number, precio del proveedor, imagen) \
+     y termina con [DECISION: ¿Confirmo y publico en 1CRM?].
+
+3. Tras ese segundo "Sí", llama a publicar_producto_link con los datos extraídos (precio_costo = precio del \
+   proveedor, que va al campo interno 'cost'; el precio de venta público queda en 0). El widget producto_publicado \
+   del sistema mostrará el producto publicado — NO describas el resultado con texto largo, el widget lo maneja.
+
+CRÍTICO: nunca publiques sin los DOS [DECISION] aprobados. El precio del proveedor es interno (cost), no público.
+
 MODO 7 — CHAT CONVERSACIONAL:
 Para preguntas o solicitudes de información, usa las herramientas disponibles \
 (1CRM, RFQs, métricas, internet) para responder con datos reales.
@@ -1950,7 +2121,7 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool
                 log.info(f"Tool: {tool_name}({json.dumps(tool_input)[:120]})")
 
                 # Inyectar stream_id automáticamente en tools que lo necesitan
-                if tool_name in ("crear_rfqs_desde_texto", "notificar_sistema") and not tool_input.get("stream_id"):
+                if tool_name in ("crear_rfqs_desde_texto", "notificar_sistema", "publicar_producto_link") and not tool_input.get("stream_id"):
                     tool_input["stream_id"] = stream_id
 
                 fn = TOOL_FUNCTIONS.get(tool_name)
