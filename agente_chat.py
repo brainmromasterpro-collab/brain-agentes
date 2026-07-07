@@ -1153,6 +1153,37 @@ def _extraer_producto_link(url: str) -> dict:
     # (browser=true / render_js=true) es LENTO (~35-56s); por eso se intenta PRIMERO sin render
     # (rápido, ~4s, sirve para la mayoría) y solo se cae al render si no trae datos (sitios JS
     # como Festo). Sin la env var → fetch directo (sitios abiertos).
+    def _traducir(prod):
+        """Traduce descripción + características al INGLÉS con Haiku (rápido), para NO cargar la
+        llamada principal del chat (que tiene el system prompt gigante). Fallback: datos originales."""
+        if not prod or not prod.get("ok"):
+            return prod
+        prod["caracteristicas"] = (prod.get("caracteristicas") or [])[:8]  # menos specs = más rápido
+        desc = prod.get("descripcion") or ""
+        carac = prod.get("caracteristicas") or []
+        if not desc and not carac:
+            return prod
+        try:
+            payload = json.dumps({"descripcion": desc, "caracteristicas": carac}, ensure_ascii=False)
+            resp = claude.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=1200,
+                timeout=25,
+                system=("Traduce al INGLÉS los textos del JSON de producto. Conserva intactos part numbers, "
+                        "códigos, números y unidades (420 bar, 18.58 kg, R900938249, ISO 7368, NBR). Responde "
+                        "SOLO JSON válido con las MISMAS claves: descripcion (string) y caracteristicas (array)."),
+                messages=[{"role": "user", "content": payload}],
+            )
+            txt = resp.content[0].text if resp.content else ""
+            m = _re.search(r'\{[\s\S]*\}', txt)
+            if m:
+                data = json.loads(m.group(0))
+                if data.get("descripcion"):    prod["descripcion"] = data["descripcion"]
+                if data.get("caracteristicas"): prod["caracteristicas"] = data["caracteristicas"]
+        except Exception as e:
+            log.warning(f"Traducción de producto falló, se usa original: {e}")
+        return prod
+
     scraper_tmpl = os.environ.get("SCRAPER_API_URL", "").strip()
 
     if scraper_tmpl:
@@ -1163,14 +1194,15 @@ def _extraer_producto_link(url: str) -> dict:
             if r is not None and r.status_code == 200:
                 parsed = _parse(r.text)
                 if parsed:
-                    return parsed
+                    return _traducir(parsed)
         # Intento 2 — CON RENDER (lento pero pasa sitios JS/anti-bot como Festo)
         r = _fetch(scraper_tmpl.replace("{url}", quote_plus(url)), 90)
         if r is None:
             return {"error": "El scraper no respondió a tiempo. Reintenta o pega los datos manualmente."}
         if r.status_code != 200:
             return {"error": f"HTTP {r.status_code} — el sitio bloquea el acceso. Pega los datos manualmente."}
-        return _parse(r.text) or {"error": "No encontré datos de producto en el link (¿es una página de producto?)."}
+        parsed = _parse(r.text)
+        return _traducir(parsed) if parsed else {"error": "No encontré datos de producto en el link (¿es una página de producto?)."}
 
     # Sin scraper: fetch directo
     r = _fetch(url, 25, headers=hdrs)
@@ -1179,7 +1211,8 @@ def _extraer_producto_link(url: str) -> dict:
     if r.status_code != 200:
         return {"error": f"HTTP {r.status_code} — el sitio bloquea el acceso automático "
                          f"(sin SCRAPER_API_URL configurado). Pega los datos manualmente."}
-    return _parse(r.text) or {"error": "No encontré datos de producto en el link (¿es una página de producto?)."}
+    parsed = _parse(r.text)
+    return _traducir(parsed) if parsed else {"error": "No encontré datos de producto en el link (¿es una página de producto?)."}
 
 
 def tool_extraer_producto_de_link(url: str) -> dict:
@@ -2037,12 +2070,9 @@ MODO 13 — PUBLICAR PRODUCTO DESDE UN LINK:
 Cuando el usuario pega una URL de una página de producto (http/https) para publicarla: primero EXTRAES y \
 muestras la tarjeta, y con UNA sola aprobación publicas.
 
-IDIOMA DEL PRODUCTO — REGLA FIJA: los productos del catálogo SIEMPRE van en INGLÉS. Si los datos extraídos \
-vienen en otro idioma (alemán, español, etc.), TRADUCE al inglés el nombre, la descripción y las características \
-(tanto las etiquetas como los valores de texto: ej. "Anschlussart: Plattenaufbau" → "Connection type: Plate mounting", \
-"Betriebsdruck, max.: 420 bar" → "Operating pressure, max.: 420 bar") ANTES de emitir el marcador [PRODUCTO_PREVIEW] \
-y ANTES de llamar a publicar_producto_link. NO traduzcas: part numbers, códigos, números ni unidades \
-(R900938249, 420 bar, 18.58 kg, ISO 7368, NBR se quedan igual). La tarjeta y el producto en 1CRM quedan en inglés.
+IDIOMA DEL PRODUCTO: la descripción y las características que devuelve extraer_producto_de_link YA vienen en \
+INGLÉS (el tool las traduce). Solo COPIA esos valores tal cual al marcador y a publicar_producto_link — NO los \
+vuelvas a traducir ni los reescribas. El nombre también en inglés si el tool lo trae así.
 
 1. Al recibir el link, EXTRAE DE INMEDIATO con extraer_producto_de_link (una línea breve antes está bien, \
    ej. "Reviso el link, dame un momento…"). NO preguntes antes de extraer — el usuario quiere ver los datos \
