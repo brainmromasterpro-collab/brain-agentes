@@ -1159,25 +1159,28 @@ def _extraer_producto_link(url: str) -> dict:
         if not prod or not prod.get("ok"):
             return prod
         prod["caracteristicas"] = (prod.get("caracteristicas") or [])[:8]  # menos specs = más rápido
+        nombre = prod.get("nombre") or ""
         desc = prod.get("descripcion") or ""
         carac = prod.get("caracteristicas") or []
-        if not desc and not carac:
+        if not nombre and not desc and not carac:
             return prod
         try:
-            payload = json.dumps({"descripcion": desc, "caracteristicas": carac}, ensure_ascii=False)
+            payload = json.dumps({"nombre": nombre, "descripcion": desc, "caracteristicas": carac}, ensure_ascii=False)
             resp = claude.messages.create(
                 model="claude-haiku-4-5-20251001",
                 max_tokens=1200,
                 timeout=25,
                 system=("Traduce al INGLÉS los textos del JSON de producto. Conserva intactos part numbers, "
-                        "códigos, números y unidades (420 bar, 18.58 kg, R900938249, ISO 7368, NBR). Responde "
-                        "SOLO JSON válido con las MISMAS claves: descripcion (string) y caracteristicas (array)."),
+                        "códigos, números y unidades (420 bar, 18.58 kg, R900938249, ISO 7368, NBR, SIEH-M12B-NS-K-L-CR). "
+                        "Responde SOLO JSON válido con las MISMAS claves: nombre (string), descripcion (string) y "
+                        "caracteristicas (array)."),
                 messages=[{"role": "user", "content": payload}],
             )
             txt = resp.content[0].text if resp.content else ""
             m = _re.search(r'\{[\s\S]*\}', txt)
             if m:
                 data = json.loads(m.group(0))
+                if data.get("nombre"):         prod["nombre"] = data["nombre"]
                 if data.get("descripcion"):    prod["descripcion"] = data["descripcion"]
                 if data.get("caracteristicas"): prod["caracteristicas"] = data["caracteristicas"]
         except Exception as e:
