@@ -2002,8 +2002,10 @@ Cuando el usuario pega una URL de una página de producto (http/https) para publ
      y termina con [DECISION: ¿Confirmo y publico en 1CRM?].
 
 3. Tras ese segundo "Sí", llama a publicar_producto_link con los datos extraídos (precio_costo = precio del \
-   proveedor, que va al campo interno 'cost'; el precio de venta público queda en 0). El widget producto_publicado \
-   del sistema mostrará el producto publicado — NO describas el resultado con texto largo, el widget lo maneja.
+   proveedor, que va al campo interno 'cost'; el precio de venta público queda en 0). La publicación es ASÍNCRONA \
+   (el worker publica en unos segundos y el widget producto_publicado — el que trae el link "Ver en CRM" — aparece \
+   solo). Responde breve, tipo "Publicando en 1CRM… en un momento te muestro el producto." NO afirmes "Publicado ✅" \
+   ni describas el resultado con texto largo: el widget lo maneja.
 
 CRÍTICO: nunca publiques sin los DOS [DECISION] aprobados. El precio del proveedor es interno (cost), no público.
 

@@ -727,12 +727,16 @@ def procesar_job_publicador(job: dict) -> None:
             )
             tipo = "producto_publicado_sin_imagen"
 
+        # stream_id: el front lo necesita para renderizar el widget "producto publicado"
+        # (con el link Ver en CRM) dentro del chat correcto. Sin él la notificación no
+        # se asocia a ningún stream y el widget no aparece en la conversación.
         supabase.table("notificaciones").insert({
-            "tipo":    tipo,
-            "titulo":  titulo,
-            "mensaje": mensaje,
-            "rfq_id":  rfq_uuid,
-            "leida":   False,
+            "tipo":      tipo,
+            "titulo":    titulo,
+            "mensaje":   mensaje,
+            "rfq_id":    rfq_uuid,
+            "stream_id": rfq.get("stream_id"),
+            "leida":     False,
         }).execute()
 
         # ── Cerrar job ───────────────────────────────────────────────────
