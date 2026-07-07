@@ -1,13 +1,22 @@
 """
 BRAIN MRO Master Pro — Worker Principal
 ========================================
-Corre ambos agentes en paralelo en un solo proceso de Railway.
-  - agente_buscador: procesa jobs de búsqueda y ranking
-  - agente_imagen:   procesa jobs de fotos y optimización
+Corre los agentes en Railway. QUÉ agentes corren se controla con la env var AGENTS,
+para poder AISLAR el chat en su propio proceso/servicio (evita que el GIL y los
+picos del publicador/Chromium lo congelen o lo tumben).
+
+  AGENTS no seteada  → corre los 5 (comportamiento actual, sin cambios)
+  AGENTS=chat        → corre SOLO el chat (para un servicio dedicado y liviano)
+  AGENTS=buscador,imagen,publicador,monitor → corre los workers pesados (sin chat)
+
+Recomendado: dos servicios en Railway (mismo repo/imagen):
+  - Servicio "chat"     → AGENTS=chat
+  - Servicio "workers"  → AGENTS=buscador,imagen,publicador,monitor
 
 Start command en Railway: python main.py
 """
 
+import os
 import threading
 import logging
 
@@ -21,23 +30,31 @@ if __name__ == "__main__":
     import agente_chat
     import agente_monitor
 
-    log.info("Iniciando Brain MRO Master Pro workers...")
+    disponibles = {
+        "buscador":   agente_buscador.main,
+        "imagen":     agente_imagen.main,
+        "publicador": agente_publicador.main,
+        "chat":       agente_chat.main,
+        "monitor":    agente_monitor.main,
+    }
 
-    t1 = threading.Thread(target=agente_buscador.main,   name="buscador",   daemon=True)
-    t2 = threading.Thread(target=agente_imagen.main,     name="imagen",     daemon=True)
-    t3 = threading.Thread(target=agente_publicador.main, name="publicador", daemon=True)
-    t4 = threading.Thread(target=agente_chat.main,       name="chat",       daemon=True)
-    t5 = threading.Thread(target=agente_monitor.main,    name="monitor",    daemon=True)
+    agents_env = os.environ.get("AGENTS", "").strip().lower()
+    if not agents_env or agents_env == "all":
+        seleccionados = list(disponibles.keys())
+    else:
+        seleccionados = [a.strip() for a in agents_env.split(",") if a.strip() in disponibles]
+        if not seleccionados:
+            log.warning(f"AGENTS='{agents_env}' no coincide con ninguno; corriendo TODOS por defecto")
+            seleccionados = list(disponibles.keys())
 
-    t1.start()
-    t2.start()
-    t3.start()
-    t4.start()
-    t5.start()
+    log.info(f"Iniciando Brain MRO Master Pro — agentes: {seleccionados}")
 
-    log.info("5 agentes corriendo: buscador, imagen, publicador, chat, monitor. Esperando...")
-    t1.join()
-    t2.join()
-    t3.join()
-    t4.join()
-    t5.join()
+    hilos = []
+    for nombre in seleccionados:
+        t = threading.Thread(target=disponibles[nombre], name=nombre, daemon=True)
+        t.start()
+        hilos.append(t)
+
+    log.info(f"{len(hilos)} agente(s) corriendo: {seleccionados}. Esperando...")
+    for t in hilos:
+        t.join()
