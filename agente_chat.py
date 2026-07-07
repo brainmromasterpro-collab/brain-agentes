@@ -1943,19 +1943,33 @@ Cuando el usuario pida "lee los correos", "revisa el correo y detecta oportunida
 3. Avisa en el sistema con notificar_sistema: titulo tipo "🔔 N oportunidades detectadas en el correo", \
    mensaje con un resumen breve (cuántas completas y cuántas incompletas).
 
-4. Presenta al usuario un TRIAGE en tabla con TODAS las oportunidades:
+4. Presenta primero un TRIAGE en tabla con TODAS las oportunidades (vista general de un vistazo):
 
    | # | Remitente | Cuenta CRM | Producto(s) | Qty | Falta para crear | Acción sugerida |
    |---|-----------|------------|-------------|-----|------------------|-----------------|
    | 1 | juan@x.com | ✅ Aceros del Norte | Q0120 | 20 | — (completa) | Crear oportunidad |
    | 2 | maria@y.com | ❌ No es cliente | ABC123 | ? | Contacto, Dirección, Qty | Pedir datos al cliente |
 
-   Debajo resume: "X completas listas para crear, Y incompletas que requieren pedir datos."
+   Debajo resume en una línea: "X completas listas para crear, Y incompletas que requieren pedir datos."
 
-5. Luego procesa UNA por una, empezando por la #1, aplicando el flujo del MODO 10:
-   - Si está completa → [DECISION: ¿Creo la oportunidad para <cuenta>?] y al aprobar, créala (con contacto/cuenta si es cliente nuevo).
-   - Si le falta info → muestra el borrador de correo pidiendo SOLO lo faltante y [DECISION: ¿Envío la solicitud a <remitente>?].
-   Tras resolver una, continúa con la siguiente. Nunca crees ni envíes sin el [DECISION] aprobado.
+5. Luego procesa UNA por una, empezando por la #1. Para CADA oportunidad, PRIMERO preséntala con este \
+   FORMATO VISUAL ESTRUCTURADO (tarjeta con encabezado, negritas y lista de productos — NO en párrafo plano):
+
+   ## 🔵 Oportunidad #N — <asunto o título corto del requerimiento>
+   **Remitente:** <nombre de la persona> · <correo>
+   **Empresa:** <empresa> — <✅ cliente en CRM / ❌ no es cliente aún>
+   **Productos:**
+   - <part-number> — <descripción breve> · <qty> pz
+   - <part-number> — <descripción breve> · <qty> pz
+   **Faltan:** <lista de datos faltantes, o "nada — completa ✅">
+
+   Y JUSTO DESPUÉS de la tarjeta, el paso de decisión:
+   - Si está completa → [DECISION: ¿Creo la oportunidad para <cuenta>?] y al aprobar, créala (con alta de cuenta/contacto si es cliente nuevo, MODO 12).
+   - Si le falta info → muestra el borrador de correo pidiendo SOLO lo faltante (reglas del MODO 10 paso 3) y [DECISION: ¿Envío la solicitud a <remitente>?].
+   Tras resolver una, continúa con la siguiente tarjeta. Nunca crees ni envíes sin el [DECISION] aprobado.
+
+FORMATO — SIEMPRE presenta las oportunidades con estructura visual (tabla de triage + tarjetas con encabezado, \
+negritas y bullets), NUNCA como un párrafo corrido. Usa emojis de estado (✅ ❌ 🔵 ⚠️) con moderación para que se lea claro.
 
 Si no hay oportunidades (ningún es_rfq), dilo claramente y no notifiques nada.
 
