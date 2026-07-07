@@ -1088,76 +1088,90 @@ def _extraer_producto_link(url: str) -> dict:
     (Shopify/e-commerce). Sitios con protección anti-bots (ej. Festo) devuelven error 403 →
     requieren navegador headless (fase 2, aún no disponible)."""
     import re as _re
+    from urllib.parse import quote_plus
     hdrs = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
         "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
     }
-    # Muchos sitios (Vercel/Akamai) bloquean IPs de datacenter (Railway) con 403/429. Para pasar
-    # eso se puede usar un proxy/scraper que devuelva el HTML. Configuración por env var (agnóstico):
-    #   SCRAPER_API_URL = plantilla con {url}, ej. ScrapingBee/ScrapingAnt/ScraperAPI:
-    #     https://app.scrapingbee.com/api/v1/?api_key=XXX&render_js=true&url={url}
-    #     https://api.scrapingant.com/v2/general?browser=true&x-api-key=XXX&url={url}
-    #   El servicio debe devolver el HTML crudo. Sin la env var → fetch directo (sitios abiertos).
-    from urllib.parse import quote_plus
-    scraper_tmpl = os.environ.get("SCRAPER_API_URL", "").strip()
-    usando_scraper = bool(scraper_tmpl)
-    try:
-        if usando_scraper:
-            fetch_url = scraper_tmpl.replace("{url}", quote_plus(url))
-            r = httpx.get(fetch_url, timeout=75, follow_redirects=True)
-        else:
-            r = httpx.get(url, headers=hdrs, timeout=25, follow_redirects=True)
-    except Exception as e:
-        return {"error": f"No se pudo acceder al link: {e}"}
-    if r.status_code != 200:
-        via = "" if usando_scraper else " (sin SCRAPER_API_URL configurado — muchos sitios bloquean la IP del servidor)"
-        return {"error": f"HTTP {r.status_code} — el sitio bloquea el acceso automático{via}. "
-                         f"Pega los datos manualmente y los publico igual."}
-    html = r.text
 
-    def meta(prop):
-        m = _re.search(rf'<meta[^>]+(?:property|name)=["\']{_re.escape(prop)}["\'][^>]+content=["\']([^"\']+)', html, _re.I) \
-            or _re.search(rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']{_re.escape(prop)}["\']', html, _re.I)
-        return m.group(1) if m else None
+    def _parse(html: str):
+        """Extrae los datos del producto del HTML (og tags + JSON-LD). None si no hay producto."""
+        def meta(prop):
+            m = _re.search(rf'<meta[^>]+(?:property|name)=["\']{_re.escape(prop)}["\'][^>]+content=["\']([^"\']+)', html, _re.I) \
+                or _re.search(rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']{_re.escape(prop)}["\']', html, _re.I)
+            return m.group(1) if m else None
+        ld: dict = {}
+        for m in _re.finditer(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>', html, _re.S | _re.I):
+            try:
+                data = json.loads(m.group(1))
+                for obj in (data if isinstance(data, list) else [data]):
+                    if isinstance(obj, dict) and obj.get("@type") == "Product":
+                        ld = obj
+                        break
+            except Exception:
+                pass
+            if ld:
+                break
+        offers = ld.get("offers", {}) or {}
+        if isinstance(offers, list):
+            offers = offers[0] if offers else {}
+        brand = ld.get("brand")
+        brand = brand.get("name") if isinstance(brand, dict) else brand
+        img = ld.get("image")
+        if isinstance(img, list):
+            img = img[0] if img else None
+        nombre = ld.get("name") or meta("og:title")
+        if not nombre:
+            return None
+        return {
+            "ok": True, "url": url, "nombre": nombre, "marca": brand or "",
+            "part_number":  ld.get("sku") or ld.get("mpn") or "",
+            "precio_costo": meta("product:price:amount") or offers.get("price") or "",
+            "moneda":       meta("product:price:currency") or offers.get("priceCurrency") or "",
+            "descripcion":  (ld.get("description") or meta("og:description") or "")[:500],
+            "imagen_url":   img or meta("og:image") or "",
+        }
 
-    ld: dict = {}
-    for m in _re.finditer(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>', html, _re.S | _re.I):
+    def _fetch(fetch_url, timeout, headers=None):
         try:
-            data = json.loads(m.group(1))
-            for obj in (data if isinstance(data, list) else [data]):
-                if isinstance(obj, dict) and obj.get("@type") == "Product":
-                    ld = obj
-                    break
+            return httpx.get(fetch_url, headers=headers, timeout=timeout, follow_redirects=True)
         except Exception:
-            pass
-        if ld:
-            break
+            return None
 
-    offers = ld.get("offers", {}) or {}
-    if isinstance(offers, list):
-        offers = offers[0] if offers else {}
-    brand = ld.get("brand")
-    brand = brand.get("name") if isinstance(brand, dict) else brand
-    img = ld.get("image")
-    if isinstance(img, list):
-        img = img[0] if img else None
+    # Muchos sitios (Vercel/Akamai) bloquean IPs de datacenter con 403/429. SCRAPER_API_URL
+    # (ScrapingAnt/ScrapingBee/...) devuelve el HTML vía proxy residencial. El render de JS
+    # (browser=true / render_js=true) es LENTO (~35-56s); por eso se intenta PRIMERO sin render
+    # (rápido, ~4s, sirve para la mayoría) y solo se cae al render si no trae datos (sitios JS
+    # como Festo). Sin la env var → fetch directo (sitios abiertos).
+    scraper_tmpl = os.environ.get("SCRAPER_API_URL", "").strip()
 
-    nombre = ld.get("name") or meta("og:title")
-    if not nombre:
-        return {"error": "No encontré datos de producto en el link (¿es una página de producto?)."}
-    return {
-        "ok":           True,
-        "url":          url,
-        "nombre":       nombre,
-        "marca":        brand or "",
-        "part_number":  ld.get("sku") or ld.get("mpn") or "",
-        "precio_costo": meta("product:price:amount") or offers.get("price") or "",
-        "moneda":       meta("product:price:currency") or offers.get("priceCurrency") or "",
-        "descripcion":  (ld.get("description") or meta("og:description") or "")[:500],
-        "imagen_url":   img or meta("og:image") or "",
-    }
+    if scraper_tmpl:
+        # Intento 1 — RÁPIDO (sin render): solo si el template traía render activado
+        fast_tmpl = scraper_tmpl.replace("browser=true", "browser=false").replace("render_js=true", "render_js=false")
+        if fast_tmpl != scraper_tmpl:
+            r = _fetch(fast_tmpl.replace("{url}", quote_plus(url)), 30)
+            if r is not None and r.status_code == 200:
+                parsed = _parse(r.text)
+                if parsed:
+                    return parsed
+        # Intento 2 — CON RENDER (lento pero pasa sitios JS/anti-bot como Festo)
+        r = _fetch(scraper_tmpl.replace("{url}", quote_plus(url)), 90)
+        if r is None:
+            return {"error": "El scraper no respondió a tiempo. Reintenta o pega los datos manualmente."}
+        if r.status_code != 200:
+            return {"error": f"HTTP {r.status_code} — el sitio bloquea el acceso. Pega los datos manualmente."}
+        return _parse(r.text) or {"error": "No encontré datos de producto en el link (¿es una página de producto?)."}
+
+    # Sin scraper: fetch directo
+    r = _fetch(url, 25, headers=hdrs)
+    if r is None:
+        return {"error": "No se pudo acceder al link."}
+    if r.status_code != 200:
+        return {"error": f"HTTP {r.status_code} — el sitio bloquea el acceso automático "
+                         f"(sin SCRAPER_API_URL configurado). Pega los datos manualmente."}
+    return _parse(r.text) or {"error": "No encontré datos de producto en el link (¿es una página de producto?)."}
 
 
 def tool_extraer_producto_de_link(url: str) -> dict:
