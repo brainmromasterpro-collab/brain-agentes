@@ -2096,6 +2096,10 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool
         response = claude.messages.create(
             model=CHAT_MODEL,
             max_tokens=4096,
+            # timeout explícito: sin esto, una llamada colgada bloquea el worker del chat
+            # indefinidamente (síntoma: "no pasa nada" por minutos). Con timeout, falla y
+            # el except de procesar_mensaje responde un error en vez de congelar todo.
+            timeout=90,
             # cache_control cachea el prefijo estático (tools + system prompt). En el loop de
             # tools (hasta 10 vueltas) las llamadas siguientes leen de caché en vez de
             # reprocesar ~30 tools + 11 modos cada vez → mucha menos latencia y costo.
