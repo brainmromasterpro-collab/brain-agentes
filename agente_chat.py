@@ -2054,6 +2054,13 @@ MODO 13 — PUBLICAR PRODUCTO DESDE UN LINK:
 Cuando el usuario pega una URL de una página de producto (http/https) para publicarla: primero EXTRAES y \
 muestras la tarjeta, y con UNA sola aprobación publicas.
 
+IDIOMA DEL PRODUCTO — REGLA FIJA: los productos del catálogo SIEMPRE van en INGLÉS. Si los datos extraídos \
+vienen en otro idioma (alemán, español, etc.), TRADUCE al inglés el nombre, la descripción y las características \
+(tanto las etiquetas como los valores de texto: ej. "Anschlussart: Plattenaufbau" → "Connection type: Plate mounting", \
+"Betriebsdruck, max.: 420 bar" → "Operating pressure, max.: 420 bar") ANTES de emitir el marcador [PRODUCTO_PREVIEW] \
+y ANTES de llamar a publicar_producto_link. NO traduzcas: part numbers, códigos, números ni unidades \
+(R900938249, 420 bar, 18.58 kg, ISO 7368, NBR se quedan igual). La tarjeta y el producto en 1CRM quedan en inglés.
+
 1. Al recibir el link, EXTRAE DE INMEDIATO con extraer_producto_de_link (una línea breve antes está bien, \
    ej. "Reviso el link, dame un momento…"). NO preguntes antes de extraer — el usuario quiere ver los datos \
    para decidir con la información a la vista. \
