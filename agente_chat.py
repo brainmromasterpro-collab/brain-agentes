@@ -1209,6 +1209,7 @@ def tool_publicar_producto_link(
             desc_full += "\n\nFicha técnica:\n" + "\n".join(f"• {c}" for c in caracteristicas)
         clean_stream = stream_id if (stream_id and stream_id not in ("None", "")) else None
         now = datetime.now(timezone.utc)
+        bulk_id = str(uuid.uuid4())  # bulk de 1 producto → dispara el BulkWidget (widget "Ver en CRM")
         rfq_id_str = f"LINK-{now.year}-{now.month:02d}{now.day:02d}-{str(uuid.uuid4())[:6].upper()}"
         rfq_row: dict = {
             "stream_id": clean_stream,
@@ -1217,6 +1218,7 @@ def tool_publicar_producto_link(
             "marca":     marca or "",
             "estado":    "publicando",
             "foto_url":  imagen_url or None,
+            "bulk_id":   bulk_id,
         }
         try:
             rfq_resp = supabase.table("rfqs").insert(rfq_row).execute()
@@ -1241,6 +1243,19 @@ def tool_publicar_producto_link(
             },
         }).execute()
         job_id = (job.data or [{}])[0].get("id", "?")
+        # Notificación tipo='bulk' → el frontend renderiza el BulkWidget (tarjeta negra con
+        # "Ver en CRM"). Se usa el stream real del chat (no el del rfq, que puede caer a None por FK).
+        try:
+            supabase.table("notificaciones").insert({
+                "tipo":      "bulk",
+                "titulo":    f"📦 Publicando {nombre}",
+                "mensaje":   json.dumps({"bulk_id": bulk_id, "lista": f"• {nombre}", "total": 1}),
+                "rfq_id":    rfq_id,
+                "stream_id": clean_stream,
+                "leida":     False,
+            }).execute()
+        except Exception as e:
+            log.warning(f"No se pudo crear notificación bulk del link: {e}")
         log.info(f"Job publicador (link) creado: {job_id} para '{nombre}'")
         return {"ok": True, "rfq_id": rfq_id, "job_publicador": job_id, "nombre": nombre}
     except Exception as e:
