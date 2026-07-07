@@ -1125,12 +1125,20 @@ def _extraer_producto_link(url: str) -> dict:
         nombre = ld.get("name") or meta("og:title")
         if not nombre:
             return None
+        # Ficha técnica: JSON-LD additionalProperty (PropertyValue) → "nombre: valor unidad"
+        caracteristicas = []
+        for prop in (ld.get("additionalProperty") or []):
+            if isinstance(prop, dict) and prop.get("name"):
+                val = prop.get("value", "")
+                unit = prop.get("unitText") or ""
+                caracteristicas.append(f"{prop['name']}: {val}{(' ' + unit) if unit else ''}".strip())
         return {
             "ok": True, "url": url, "nombre": nombre, "marca": brand or "",
             "part_number":  ld.get("sku") or ld.get("mpn") or "",
             "precio_costo": meta("product:price:amount") or offers.get("price") or "",
             "moneda":       meta("product:price:currency") or offers.get("priceCurrency") or "",
-            "descripcion":  (ld.get("description") or meta("og:description") or "")[:500],
+            "descripcion":  (ld.get("description") or meta("og:description") or "")[:600],
+            "caracteristicas": caracteristicas[:14],
             "imagen_url":   img or meta("og:image") or "",
         }
 
@@ -1185,6 +1193,7 @@ def tool_publicar_producto_link(
     part_number: str,
     marca: str = "",
     descripcion: str = "",
+    caracteristicas: list | None = None,
     precio_costo: float = 0,
     imagen_url: str = "",
     url_origen: str = "",
@@ -1194,6 +1203,10 @@ def tool_publicar_producto_link(
     campo INTERNO 'cost' (no se expone al público); el precio de venta (list_price) queda en 0
     para definirlo después. Reutiliza el pipeline del publicador y su widget producto_publicado."""
     try:
+        # Descripción completa para 1CRM = descripción + ficha técnica (características)
+        desc_full = descripcion or nombre
+        if caracteristicas:
+            desc_full += "\n\nFicha técnica:\n" + "\n".join(f"• {c}" for c in caracteristicas)
         clean_stream = stream_id if (stream_id and stream_id not in ("None", "")) else None
         now = datetime.now(timezone.utc)
         rfq_id_str = f"LINK-{now.year}-{now.month:02d}{now.day:02d}-{str(uuid.uuid4())[:6].upper()}"
@@ -1221,7 +1234,7 @@ def tool_publicar_producto_link(
                 "url":    url_origen,
                 "ficha": {
                     "nombre":      nombre,
-                    "descripcion": descripcion or nombre,
+                    "descripcion": desc_full,
                     "cost":        float(precio_costo or 0),
                     "list_price":  0,
                 },
@@ -1542,6 +1555,7 @@ TOOLS: list[dict] = [
                 "part_number":  {"type": "string", "description": "Número de parte / SKU / modelo"},
                 "marca":        {"type": "string", "description": "Marca/fabricante"},
                 "descripcion":  {"type": "string", "description": "Descripción del producto"},
+                "caracteristicas": {"type": "array", "items": {"type": "string"}, "description": "Ficha técnica: lista de 'nombre: valor unidad' extraída del link"},
                 "precio_costo": {"type": "number", "description": "Precio del proveedor (va a 'cost', interno, no público)"},
                 "imagen_url":   {"type": "string", "description": "URL de la imagen del producto"},
                 "url_origen":   {"type": "string", "description": "URL original del link"},
@@ -2032,12 +2046,14 @@ muestras la tarjeta, y con UNA sola aprobación publicas.
      manualmente (nombre, part number, marca, precio, imagen). NO publiques con datos inventados. \
    - Si extrae bien: NO listes los datos como texto. En su lugar, emite EXACTAMENTE este marcador (el frontend lo \
      convierte en una tarjeta visual del producto), en una sola línea y con JSON válido: \
-     [PRODUCTO_PREVIEW]{"nombre":"...","marca":"...","part_number":"...","precio_costo":"...","moneda":"...","imagen_url":"..."} \
-     usando los valores tal cual los devolvió extraer_producto_de_link (si un campo viene vacío, pon ""). \
+     [PRODUCTO_PREVIEW]{"nombre":"...","marca":"...","part_number":"...","precio_costo":"...","moneda":"...","descripcion":"...","caracteristicas":["...","..."],"imagen_url":"..."} \
+     usando los valores tal cual los devolvió extraer_producto_de_link (copia el arreglo "caracteristicas" \
+     completo tal como vino; si un campo viene vacío, pon "" o []). \
      Y DESPUÉS de la tarjeta termina con [DECISION: ¿Publico este producto en 1CRM?]. \
      No repitas los datos en texto: la tarjeta ya los muestra.
 
-2. Tras el "Sí", llama a publicar_producto_link con los datos extraídos (precio_costo = precio del \
+2. Tras el "Sí", llama a publicar_producto_link con TODOS los datos extraídos (incluye descripcion y el \
+   arreglo caracteristicas para que queden en la ficha del producto en 1CRM) (precio_costo = precio del \
    proveedor, que va al campo interno 'cost'; el precio de venta público queda en 0). La publicación es ASÍNCRONA \
    (el worker publica en unos segundos y el widget producto_publicado — el que trae el link "Ver en CRM" — aparece \
    solo). Responde breve, tipo "Publicando en 1CRM… en un momento te muestro el producto." NO afirmes "Publicado ✅" \
