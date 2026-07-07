@@ -1090,23 +1090,25 @@ def _extraer_producto_link(url: str) -> dict:
         "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
         "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
     }
-    # Muchos sitios (Vercel/Akamai) bloquean IPs de datacenter (Railway) con 403/429. Si hay
-    # SCRAPER_API_KEY, se fetchea vía ScraperAPI (proxies residenciales + render de JS) que
-    # pasa esas protecciones. Sin la key, se intenta fetch directo (sirve para sitios abiertos).
-    scraper_key = os.environ.get("SCRAPER_API_KEY", "").strip()
+    # Muchos sitios (Vercel/Akamai) bloquean IPs de datacenter (Railway) con 403/429. Para pasar
+    # eso se puede usar un proxy/scraper que devuelva el HTML. Configuración por env var (agnóstico):
+    #   SCRAPER_API_URL = plantilla con {url}, ej. ScrapingBee/ScrapingAnt/ScraperAPI:
+    #     https://app.scrapingbee.com/api/v1/?api_key=XXX&render_js=true&url={url}
+    #     https://api.scrapingant.com/v2/general?browser=true&x-api-key=XXX&url={url}
+    #   El servicio debe devolver el HTML crudo. Sin la env var → fetch directo (sitios abiertos).
+    from urllib.parse import quote_plus
+    scraper_tmpl = os.environ.get("SCRAPER_API_URL", "").strip()
+    usando_scraper = bool(scraper_tmpl)
     try:
-        if scraper_key:
-            r = httpx.get(
-                "https://api.scraperapi.com/",
-                params={"api_key": scraper_key, "url": url, "render": "true", "country_code": "us"},
-                timeout=70,
-            )
+        if usando_scraper:
+            fetch_url = scraper_tmpl.replace("{url}", quote_plus(url))
+            r = httpx.get(fetch_url, timeout=75, follow_redirects=True)
         else:
             r = httpx.get(url, headers=hdrs, timeout=25, follow_redirects=True)
     except Exception as e:
         return {"error": f"No se pudo acceder al link: {e}"}
     if r.status_code != 200:
-        via = "" if scraper_key else " (sin SCRAPER_API_KEY configurada — muchos sitios bloquean la IP del servidor)"
+        via = "" if usando_scraper else " (sin SCRAPER_API_URL configurado — muchos sitios bloquean la IP del servidor)"
         return {"error": f"HTTP {r.status_code} — el sitio bloquea el acceso automático{via}. "
                          f"Pega los datos manualmente y los publico igual."}
     html = r.text
