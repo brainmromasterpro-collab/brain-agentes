@@ -1090,13 +1090,25 @@ def _extraer_producto_link(url: str) -> dict:
         "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
         "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
     }
+    # Muchos sitios (Vercel/Akamai) bloquean IPs de datacenter (Railway) con 403/429. Si hay
+    # SCRAPER_API_KEY, se fetchea vía ScraperAPI (proxies residenciales + render de JS) que
+    # pasa esas protecciones. Sin la key, se intenta fetch directo (sirve para sitios abiertos).
+    scraper_key = os.environ.get("SCRAPER_API_KEY", "").strip()
     try:
-        r = httpx.get(url, headers=hdrs, timeout=25, follow_redirects=True)
+        if scraper_key:
+            r = httpx.get(
+                "https://api.scraperapi.com/",
+                params={"api_key": scraper_key, "url": url, "render": "true", "country_code": "us"},
+                timeout=70,
+            )
+        else:
+            r = httpx.get(url, headers=hdrs, timeout=25, follow_redirects=True)
     except Exception as e:
         return {"error": f"No se pudo acceder al link: {e}"}
     if r.status_code != 200:
-        return {"error": f"HTTP {r.status_code} — el sitio bloquea el acceso automático "
-                         f"(requiere navegador headless, aún no disponible). Pega los datos manualmente."}
+        via = "" if scraper_key else " (sin SCRAPER_API_KEY configurada — muchos sitios bloquean la IP del servidor)"
+        return {"error": f"HTTP {r.status_code} — el sitio bloquea el acceso automático{via}. "
+                         f"Pega los datos manualmente y los publico igual."}
     html = r.text
 
     def meta(prop):
