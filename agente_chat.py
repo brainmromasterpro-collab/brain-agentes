@@ -1304,6 +1304,71 @@ def _rehost_imagen(imagen_url: str, part_number: str = "") -> str:
         return imagen_url
 
 
+def _publicar_producto_uno(
+    bulk_id: str, clean_stream, nombre: str, part_number: str, marca: str = "",
+    descripcion: str = "", caracteristicas: list | None = None, precio_costo: float = 0,
+    imagen_url: str = "", url_origen: str = "",
+) -> dict:
+    """Crea el rfq + job del publicador para UN producto extraído de link, bajo el bulk_id dado.
+    Lo comparten el flujo de 1 link y el de N links (bulk). Devuelve {rfq_id, job_id, nombre_crm}."""
+    # Nombre para 1CRM en formato consistente: "número de parte / nombre / marca"
+    # (se omiten partes vacías o repetidas — p.ej. si el nombre extraído == part number).
+    _seen: set = set()
+    _partes: list = []
+    for _p in (part_number, nombre, marca):
+        _p = (_p or "").strip()
+        if _p and _p.lower() not in _seen:
+            _seen.add(_p.lower())
+            _partes.append(_p)
+    nombre_crm = " / ".join(_partes) if _partes else (nombre or part_number or "Producto")
+
+    # Descripción completa para 1CRM = descripción + ficha técnica (características)
+    desc_full = descripcion or nombre
+    if caracteristicas:
+        desc_full += "\n\nFicha técnica:\n" + "\n".join(f"• {c}" for c in caracteristicas)
+    now = datetime.now(timezone.utc)
+    rfq_id_str = f"LINK-{now.year}-{now.month:02d}{now.day:02d}-{str(uuid.uuid4())[:6].upper()}"
+    # Re-hospedar la imagen en Supabase (sitios como Festo bloquean la descarga directa del
+    # publicador) para que sí se suba a 1CRM.
+    foto_final = _rehost_imagen(imagen_url, part_number) if imagen_url else None
+    rfq_row: dict = {
+        "stream_id": clean_stream, "rfq_id": rfq_id_str,
+        "modelo": part_number or nombre, "marca": marca or "",
+        "estado": "publicando", "foto_url": foto_final, "bulk_id": bulk_id,
+    }
+    try:
+        rfq_resp = supabase.table("rfqs").insert(rfq_row).execute()
+    except Exception:
+        rfq_row["stream_id"] = None
+        rfq_resp = supabase.table("rfqs").insert(rfq_row).execute()
+    rfq_id = rfq_resp.data[0]["id"]
+    job = supabase.table("jobs").insert({
+        "rfq_id": rfq_id, "agente": "publicador", "estado": "pendiente",
+        "created_at": now.isoformat(),
+        "input": {"origen": "link", "url": url_origen,
+                  "ficha": {"nombre": nombre_crm, "descripcion": desc_full,
+                            "cost": float(precio_costo or 0), "list_price": 0}},
+    }).execute()
+    job_id = (job.data or [{}])[0].get("id", "?")
+    return {"rfq_id": rfq_id, "job_id": job_id, "nombre_crm": nombre_crm}
+
+
+def _crear_notificacion_bulk(clean_stream, bulk_id: str, nombres: list, rfq_id) -> None:
+    """Notificación tipo='bulk' → el frontend renderiza el BulkWidget (tarjeta negra con "Ver en
+    CRM"). Sirve para 1 o N productos (el widget lee todos los rfqs con ese bulk_id)."""
+    try:
+        total = len(nombres)
+        titulo = f"📦 Publicando {nombres[0]}" if total == 1 else f"📦 Publicando {total} productos"
+        lista = "\n".join(f"• {n}" for n in nombres)
+        supabase.table("notificaciones").insert({
+            "tipo": "bulk", "titulo": titulo,
+            "mensaje": json.dumps({"bulk_id": bulk_id, "lista": lista, "total": total}),
+            "rfq_id": rfq_id, "stream_id": clean_stream, "leida": False,
+        }).execute()
+    except Exception as e:
+        log.warning(f"No se pudo crear notificación bulk del link: {e}")
+
+
 def tool_publicar_producto_link(
     nombre: str,
     part_number: str,
@@ -1315,79 +1380,54 @@ def tool_publicar_producto_link(
     url_origen: str = "",
     stream_id: str = "",
 ) -> dict:
-    """Publica en 1CRM un producto extraído de un link. El precio_costo (del proveedor) va al
+    """Publica en 1CRM UN producto extraído de un link. El precio_costo (del proveedor) va al
     campo INTERNO 'cost' (no se expone al público); el precio de venta (list_price) queda en 0
     para definirlo después. Reutiliza el pipeline del publicador y su widget producto_publicado."""
     try:
-        # Nombre para 1CRM en formato consistente: "número de parte / nombre / marca"
-        # (se omiten partes vacías o repetidas — p.ej. si el nombre extraído == part number).
-        _seen: set = set()
-        _partes: list = []
-        for _p in (part_number, nombre, marca):
-            _p = (_p or "").strip()
-            if _p and _p.lower() not in _seen:
-                _seen.add(_p.lower())
-                _partes.append(_p)
-        nombre_crm = " / ".join(_partes) if _partes else (nombre or part_number or "Producto")
-
-        # Descripción completa para 1CRM = descripción + ficha técnica (características)
-        desc_full = descripcion or nombre
-        if caracteristicas:
-            desc_full += "\n\nFicha técnica:\n" + "\n".join(f"• {c}" for c in caracteristicas)
         clean_stream = stream_id if (stream_id and stream_id not in ("None", "")) else None
-        now = datetime.now(timezone.utc)
         bulk_id = str(uuid.uuid4())  # bulk de 1 producto → dispara el BulkWidget (widget "Ver en CRM")
-        rfq_id_str = f"LINK-{now.year}-{now.month:02d}{now.day:02d}-{str(uuid.uuid4())[:6].upper()}"
-        # Re-hospedar la imagen en Supabase (sitios como Festo bloquean la descarga directa del
-        # publicador) para que sí se suba a 1CRM.
-        foto_final = _rehost_imagen(imagen_url, part_number) if imagen_url else None
-        rfq_row: dict = {
-            "stream_id": clean_stream,
-            "rfq_id":    rfq_id_str,
-            "modelo":    part_number or nombre,
-            "marca":     marca or "",
-            "estado":    "publicando",
-            "foto_url":  foto_final,
-            "bulk_id":   bulk_id,
-        }
-        try:
-            rfq_resp = supabase.table("rfqs").insert(rfq_row).execute()
-        except Exception:
-            rfq_row["stream_id"] = None
-            rfq_resp = supabase.table("rfqs").insert(rfq_row).execute()
-        rfq_id = rfq_resp.data[0]["id"]
-        job = supabase.table("jobs").insert({
-            "rfq_id":     rfq_id,
-            "agente":     "publicador",
-            "estado":     "pendiente",
-            "created_at": now.isoformat(),
-            "input": {
-                "origen": "link",
-                "url":    url_origen,
-                "ficha": {
-                    "nombre":      nombre_crm,
-                    "descripcion": desc_full,
-                    "cost":        float(precio_costo or 0),
-                    "list_price":  0,
-                },
-            },
-        }).execute()
-        job_id = (job.data or [{}])[0].get("id", "?")
-        # Notificación tipo='bulk' → el frontend renderiza el BulkWidget (tarjeta negra con
-        # "Ver en CRM"). Se usa el stream real del chat (no el del rfq, que puede caer a None por FK).
-        try:
-            supabase.table("notificaciones").insert({
-                "tipo":      "bulk",
-                "titulo":    f"📦 Publicando {nombre}",
-                "mensaje":   json.dumps({"bulk_id": bulk_id, "lista": f"• {nombre}", "total": 1}),
-                "rfq_id":    rfq_id,
-                "stream_id": clean_stream,
-                "leida":     False,
-            }).execute()
-        except Exception as e:
-            log.warning(f"No se pudo crear notificación bulk del link: {e}")
-        log.info(f"Job publicador (link) creado: {job_id} para '{nombre}'")
-        return {"ok": True, "rfq_id": rfq_id, "job_publicador": job_id, "nombre": nombre}
+        res = _publicar_producto_uno(bulk_id, clean_stream, nombre, part_number, marca,
+                                     descripcion, caracteristicas, precio_costo, imagen_url, url_origen)
+        _crear_notificacion_bulk(clean_stream, bulk_id, [nombre], res["rfq_id"])
+        log.info(f"Job publicador (link) creado: {res['job_id']} para '{nombre}'")
+        return {"ok": True, "rfq_id": res["rfq_id"], "job_publicador": res["job_id"], "nombre": nombre}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def tool_publicar_productos_desde_links(productos: list | None = None, stream_id: str = "") -> dict:
+    """Publica en 1CRM VARIOS productos extraídos de links, en UN SOLO BulkWidget (bulk_id
+    compartido). `productos` es una lista de objetos con las MISMAS claves que publicar_producto_link
+    (nombre, part_number, marca, descripcion, caracteristicas, precio_costo, imagen_url, url_origen)."""
+    try:
+        if not productos or not isinstance(productos, list):
+            return {"error": "productos vacío o no es una lista"}
+        clean_stream = stream_id if (stream_id and stream_id not in ("None", "")) else None
+        bulk_id = str(uuid.uuid4())
+        nombres: list = []
+        first_rfq = None
+        ok = 0
+        errores: list = []
+        for p in productos:
+            if not isinstance(p, dict):
+                continue
+            try:
+                res = _publicar_producto_uno(
+                    bulk_id, clean_stream,
+                    p.get("nombre", ""), p.get("part_number", ""), p.get("marca", ""),
+                    p.get("descripcion", ""), p.get("caracteristicas"),
+                    p.get("precio_costo", 0), p.get("imagen_url", ""), p.get("url_origen", ""),
+                )
+                nombres.append(p.get("nombre") or p.get("part_number") or "Producto")
+                first_rfq = first_rfq or res["rfq_id"]
+                ok += 1
+            except Exception as e:
+                errores.append(f"{p.get('part_number') or p.get('nombre') or '?'}: {e}")
+        if ok == 0:
+            return {"error": "no se pudo publicar ninguno", "detalles": errores}
+        _crear_notificacion_bulk(clean_stream, bulk_id, nombres, first_rfq)
+        log.info(f"Bulk link: {ok}/{len(productos)} publicados, bulk_id={bulk_id}, errores={len(errores)}")
+        return {"ok": True, "publicados": ok, "total": len(productos), "bulk_id": bulk_id, "errores": errores}
     except Exception as e:
         return {"error": str(e)}
 
@@ -1709,6 +1749,34 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "publicar_productos_desde_links",
+        "description": "Publica en 1CRM VARIOS productos (extraídos de links) de una sola vez, en UN SOLO widget/lote compartido. Úsalo cuando el usuario pega MÚLTIPLES links (o vienen de un .txt/screenshot) y ya aprobó publicarlos. Cada item usa las mismas claves que publicar_producto_link. El stream_id se inyecta automáticamente.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "productos": {
+                    "type": "array",
+                    "description": "Lista de productos ya extraídos a publicar juntos",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "nombre":          {"type": "string"},
+                            "part_number":     {"type": "string"},
+                            "marca":           {"type": "string"},
+                            "descripcion":     {"type": "string"},
+                            "caracteristicas": {"type": "array", "items": {"type": "string"}},
+                            "precio_costo":    {"type": "number"},
+                            "imagen_url":      {"type": "string"},
+                            "url_origen":      {"type": "string"},
+                        },
+                        "required": ["nombre", "part_number"],
+                    },
+                },
+            },
+            "required": ["productos"],
+        },
+    },
+    {
         "name": "crear_cuenta_crm",
         "description": "Crea una nueva cuenta/empresa en 1CRM (cliente, proveedor, socio, etc.).",
         "input_schema": {
@@ -1942,6 +2010,7 @@ TOOL_FUNCTIONS = {
     "notificar_sistema":         tool_notificar_sistema,
     "extraer_producto_de_link":  tool_extraer_producto_de_link,
     "publicar_producto_link":    tool_publicar_producto_link,
+    "publicar_productos_desde_links": tool_publicar_productos_desde_links,
     "crear_cuenta_crm":          tool_crear_cuenta_crm,
     "crear_contacto_crm":        tool_crear_contacto_crm,
     "listar_oportunidades_crm":  tool_listar_oportunidades_crm,
@@ -2204,6 +2273,16 @@ vuelvas a traducir ni los reescribas. El nombre también en inglés si el tool l
    de llamar a publicar_producto_link — nada de "Publicando…" ni "Publicado ✅": sería redundante con el widget. \
    Devuelve exactamente una cadena vacía como respuesta final.
 
+MÚLTIPLES LINKS (bulk): si el usuario pega VARIOS links, o vienen dentro de un .txt / imagen / mensaje \
+(uno o más), EXTRAE cada uno con extraer_producto_de_link (puedes llamarlo varias veces en la MISMA \
+respuesta, en paralelo). Muestra UNA tarjeta [PRODUCTO_PREVIEW] por producto (una por línea) y termina con \
+UN SOLO [DECISION: ¿Publico estos N productos en 1CRM?]. Tras el "Sí", llama UNA sola vez a \
+publicar_productos_desde_links con el arreglo "productos" — cada objeto con los datos tal cual los devolvió \
+el extractor (nombre, part_number, marca, descripcion, caracteristicas, precio_costo, imagen_url, url_origen). \
+NO llames a publicar_producto_link varias veces: el tool plural hace que todos caigan en UN SOLO widget. \
+Igual que con uno: no agregues texto después de publicar; respuesta final vacía. Si algún link falla al \
+extraer, dilo y sigue con los demás (no inventes datos).
+
 CRÍTICO: nunca publiques sin el [DECISION] aprobado. El precio del proveedor es interno (cost), no público.
 
 MODO 7 — CHAT CONVERSACIONAL:
@@ -2354,7 +2433,7 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool
                 log.info(f"Tool: {tool_name}({json.dumps(tool_input)[:120]})")
 
                 # Inyectar stream_id automáticamente en tools que lo necesitan
-                if tool_name in ("crear_rfqs_desde_texto", "notificar_sistema", "publicar_producto_link") and not tool_input.get("stream_id"):
+                if tool_name in ("crear_rfqs_desde_texto", "notificar_sistema", "publicar_producto_link", "publicar_productos_desde_links") and not tool_input.get("stream_id"):
                     tool_input["stream_id"] = stream_id
 
                 # Aviso de inicio con estimado (la burbuja "procesando" lo muestra en vivo)
