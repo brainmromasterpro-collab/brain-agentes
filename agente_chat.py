@@ -1168,12 +1168,21 @@ def _extraer_producto_link(url: str) -> dict:
             payload = json.dumps({"nombre": nombre, "descripcion": desc, "caracteristicas": carac}, ensure_ascii=False)
             resp = claude.messages.create(
                 model="claude-haiku-4-5-20251001",
-                max_tokens=1200,
+                max_tokens=1600,
                 timeout=25,
-                system=("Traduce al INGLÉS los textos del JSON de producto. Conserva intactos part numbers, "
-                        "códigos, números y unidades (420 bar, 18.58 kg, R900938249, ISO 7368, NBR, SIEH-M12B-NS-K-L-CR). "
-                        "Responde SOLO JSON válido con las MISMAS claves: nombre (string), descripcion (string) y "
-                        "caracteristicas (array)."),
+                system=(
+                    "Recibes un JSON de producto (nombre, descripcion, caracteristicas). Haz DOS cosas:\n"
+                    "1) Traduce TODO al INGLÉS. Conserva intactos part numbers, códigos, números y unidades "
+                    "(420 bar, 18.58 kg, R900938249, ISO 7368, NBR, M12×1, IP67, PNP).\n"
+                    "2) Si la 'descripcion' trae specs técnicas embebidas como pares 'Etiqueta: valor' "
+                    "(p.ej. 'Dimension: 32 x 20 x 8 mm, Range: 5 mm, Switching output: PNP NO, "
+                    "Housing material: Stainless steel, Connection: Cable with connector, M12×1-Male, 4-pin'), "
+                    "SEPÁRALAS: mételas en 'caracteristicas' como arreglo de strings 'Label: value' (una por spec, "
+                    "respetando valores que llevan comas), y deja en 'descripcion' SOLO la descripción general del "
+                    "producto (la parte introductoria), SIN la lista de specs y SIN líneas de precio/'list price'.\n"
+                    "Combina con las caracteristicas que ya existan, sin duplicar.\n"
+                    "Responde SOLO JSON válido con las claves: nombre (string), descripcion (string), "
+                    "caracteristicas (array de strings)."),
                 messages=[{"role": "user", "content": payload}],
             )
             txt = resp.content[0].text if resp.content else ""
@@ -1182,7 +1191,8 @@ def _extraer_producto_link(url: str) -> dict:
                 data = json.loads(m.group(0))
                 if data.get("nombre"):         prod["nombre"] = data["nombre"]
                 if data.get("descripcion"):    prod["descripcion"] = data["descripcion"]
-                if data.get("caracteristicas"): prod["caracteristicas"] = data["caracteristicas"]
+                if isinstance(data.get("caracteristicas"), list) and data["caracteristicas"]:
+                    prod["caracteristicas"] = [str(c) for c in data["caracteristicas"]][:14]
         except Exception as e:
             log.warning(f"Traducción de producto falló, se usa original: {e}")
         return prod
