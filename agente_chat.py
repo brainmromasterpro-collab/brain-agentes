@@ -2286,8 +2286,12 @@ extraer, dilo y sigue con los demás (no inventes datos).
 IMAGEN ADJUNTA (screenshot): si el mensaje trae una imagen, LEE las URLs de producto COMPLETAS visibles \
 en ella (que empiecen con http, en enlaces, texto o tarjetas de preview). En estos screenshots de chat la \
 MISMA URL suele aparecer dos veces (como enlace y dentro de la tarjeta de preview) y también hay dominios \
-sueltos (p.ej. "www.futek.com"): IGNORA los dominios sueltos y NO proceses una URL repetida más de una vez \
-(dedupe por URL completa). Con la lista ya única, trátalas EXACTAMENTE como links pegados: extrae cada una \
+sueltos (p.ej. "www.futek.com"): IGNORA los dominios sueltos y NO proceses una URL repetida más de una vez. \
+DEDUPE SOLO cuando la URL completa es IDÉNTICA carácter por carácter. DOS URLs con paths distintos son DOS \
+productos DIFERENTES aunque compartan dominio/marca — NUNCA las juntes. Ejemplo: \
+".../pressure-sensor-oem-pmp300" y ".../stick-shift-load-cell-mau300/fsh04423" son DOS productos distintos. \
+Ante la duda, publica de MÁS (dos productos separados), nunca de menos. Con la lista ya única, trátalas \
+EXACTAMENTE como links pegados: extrae cada una \
 con extraer_producto_de_link y sigue el flujo de arriba (tarjeta(s) + [DECISION] → \
 publicar_productos_desde_links). Si en la imagen no hay ninguna URL completa legible, dilo claramente y pide \
 el link en texto — NO inventes ni completes URLs a medias.
