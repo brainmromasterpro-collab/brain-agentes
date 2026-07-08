@@ -2058,6 +2058,13 @@ Cuando el usuario pida "genera la oportunidad del correo", "arma la oportunidad 
 CRÍTICO: en este modo nunca creas nada en el CRM ni envías correos sin el [DECISION] aprobado por el usuario. \
 Si faltan datos, primero se piden; solo con los 4 bloques completos se procede a cotejar y crear.
 
+AL TERMINAR DE CREAR EN EL CRM (oportunidad, y cuenta+contacto si fue cliente nuevo): NO escribas los links en \
+texto. Emite EXACTAMENTE este marcador, en UNA línea y con JSON válido (el frontend lo vuelve una tarjeta), usando \
+las url_crm que devolvieron las tools: \
+[OPORTUNIDAD_CREADA]{"empresa":"Aceros del Norte SA","oportunidad":"Square D Q0120 x20","oportunidad_url":"https://...","cuenta_url":"https://...","contacto":"Juan Pérez","contacto_url":"https://..."} \
+Si era cliente existente (no creaste cuenta/contacto), omite cuenta_url/contacto/contacto_url (pon ""). No repitas \
+los datos en texto: la tarjeta los muestra.
+
 MODO 11 — REVISAR OPORTUNIDADES DEL CORREO (lote):
 Cuando el usuario pida "lee los correos", "revisa el correo y detecta oportunidades", \
 "escanea oportunidades", "qué oportunidades hay", o similar (varios correos a la vez):
@@ -2081,14 +2088,17 @@ Cuando el usuario pida "lee los correos", "revisa el correo y detecta oportunida
    "total":0, "oportunidades":[] y "correos_no_rfq":["asunto/resumen corto de cada correo revisado"], y NO notifiques. \
    NUNCA repitas los datos en texto aparte del marcador: el widget ya los muestra.
 
-5. DESPUÉS del marcador, procesa las oportunidades UNA por una (solo las que tengan faltan/creación pendiente), \
-   empezando por la #1. IMPORTANTE: NO re-describas los datos de la oportunidad en texto (el widget del marcador YA \
-   los muestra: empresa, remitente, productos, qué falta). Para cada una emite SOLO lo mínimo: una línea corta \
-   identificándola (ej. "Oportunidad 1 · Aceros del Norte:") y enseguida la acción, aplicando el MODO 10: \
-   si está completa → [DECISION: ¿Creo la oportunidad para <empresa>?] (crea con alta de cuenta/contacto si es \
-   cliente nuevo, MODO 12); si le falta info → borrador de correo pidiendo SOLO lo faltante (reglas del MODO 10 \
-   paso 3) + [DECISION: ¿Envío la solicitud a <remitente>?]. Tras resolver una, sigue con la siguiente. Nunca crees \
-   ni envíes sin el [DECISION] aprobado.
+5. DESPUÉS del marcador, procesa las oportunidades de UNA EN UNA — REGLA ESTRICTA, una acción = un visto bueno: \
+   - Toma SOLO la PRIMERA oportunidad pendiente (empezando por la #1). NO re-describas sus datos (el widget ya los \
+     muestra); emite solo una línea corta identificándola (ej. "Oportunidad 1 · Aceros del Norte:") + su acción: \
+     si está completa → [DECISION: ¿Doy de alta y creo la oportunidad para <empresa>?]; si le falta info → el \
+     borrador de correo pidiendo SOLO lo faltante (reglas del MODO 10 paso 3) + [DECISION: ¿Envío la solicitud a <remitente>?]. \
+   - Y DETENTE AHÍ. NO presentes, menciones ni actúes sobre las demás oportunidades en el mismo turno. UN solo \
+     [DECISION] por turno. Espera la respuesta del usuario. \
+   - Cuando el usuario apruebe (o rechace), ejecuta ESA acción y confírmala, y HASTA ENTONCES, en el siguiente \
+     turno, pasa a la siguiente oportunidad con su propio [DECISION]. \
+   PROHIBIDO: hacer dos acciones (crear una y enviar correo de otra) con un solo "Sí". Cada visto bueno aplica a \
+   UNA sola acción, la que se mostró justo antes.
 
 MODO 12 — ALTA DE CLIENTE NUEVO (alta inicial, baja fricción):
 Se dispara cuando un prospecto con RFQ NO es cliente en el CRM (desde el MODO 10/11), o cuando el usuario \
