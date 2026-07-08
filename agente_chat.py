@@ -2283,6 +2283,11 @@ NO llames a publicar_producto_link varias veces: el tool plural hace que todos c
 Igual que con uno: no agregues texto después de publicar; respuesta final vacía. Si algún link falla al \
 extraer, dilo y sigue con los demás (no inventes datos).
 
+IMAGEN ADJUNTA (screenshot): si el mensaje trae una imagen, LEE las URLs de producto visibles en ella \
+(barra de direcciones, texto, enlaces) y trátalas EXACTAMENTE como links pegados: extrae cada una con \
+extraer_producto_de_link y sigue el flujo de arriba (tarjeta(s) + [DECISION] → publicar_productos_desde_links). \
+Si en la imagen no hay ninguna URL legible, dilo claramente y pide el link en texto — NO inventes URLs.
+
 CRÍTICO: nunca publiques sin el [DECISION] aprobado. El precio del proveedor es interno (cost), no público.
 
 MODO 7 — CHAT CONVERSACIONAL:
@@ -2476,6 +2481,25 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool
     return "No pude completar la respuesta.", tools_used, rfqs_created, token_counts, _perf
 
 
+def _build_image_block(url: str):
+    """Descarga una imagen y la devuelve como bloque de visión (base64) para la API de Claude.
+    Se usa base64 (no la URL) para no depender de que Anthropic pueda alcanzar la URL de Supabase."""
+    try:
+        r = httpx.get(url, timeout=25, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200 or "image" not in r.headers.get("content-type", "").lower():
+            log.warning(f"Imagen para visión no accesible: {r.status_code}")
+            return None
+        ct = r.headers.get("content-type", "").lower()
+        media = ("image/png" if "png" in ct else "image/webp" if "webp" in ct
+                 else "image/gif" if "gif" in ct else "image/jpeg")
+        import base64 as _b64
+        return {"type": "image", "source": {"type": "base64", "media_type": media,
+                                            "data": _b64.standard_b64encode(r.content).decode()}}
+    except Exception as e:
+        log.warning(f"No se pudo construir bloque de imagen: {e}")
+        return None
+
+
 # ─────────────────────────────────────────────────────────────
 # PROCESADOR DE MENSAJES
 # ─────────────────────────────────────────────────────────────
@@ -2531,6 +2555,22 @@ def procesar_mensaje(msg: dict) -> None:
         historial.pop(0)
     if not historial or historial[-1].get("content") != contenido:
         historial.append({"role": "user", "content": contenido})
+
+    # Visión: si el mensaje trae una imagen (screenshot), se adjunta al último turno del usuario
+    # como bloque de imagen para que el modelo lea los links/datos visibles y corra el flujo de
+    # publicar. El resto del pipeline (texto) queda igual.
+    try:
+        _md = msg.get("metadata") or {}
+        _img_url = _md.get("image_url") if isinstance(_md, dict) else None
+    except Exception:
+        _img_url = None
+    if _img_url and historial and historial[-1]["role"] == "user":
+        _blk = _build_image_block(_img_url)
+        if _blk:
+            historial[-1]["content"] = [
+                {"type": "text", "text": contenido or "Imagen adjunta."}, _blk,
+            ]
+            log.info("Mensaje con imagen → visión activada")
 
     # Log del stream: registrar la solicitud entrante (alimenta el log del UI)
     _log_stream(stream_id, f'Solicitud recibida: "{contenido[:80]}"', "info")
