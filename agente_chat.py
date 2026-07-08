@@ -2523,7 +2523,7 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool
                         rfqs_created = True
                     # Publicar desde link: el widget negro (BulkWidget) ya muestra el resultado →
                     # suprimir la respuesta de texto redundante ("Publicando…").
-                    if tool_name == "publicar_producto_link" and isinstance(result, dict) and result.get("ok"):
+                    if tool_name in ("publicar_producto_link", "publicar_productos_desde_links") and isinstance(result, dict) and result.get("ok"):
                         rfqs_created = True
                 except Exception as e:
                     result = {"error": str(e)}
