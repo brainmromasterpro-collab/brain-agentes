@@ -2330,15 +2330,19 @@ vuelvas a traducir ni los reescribas. El nombre también en inglés si el tool l
    de llamar a publicar_producto_link — nada de "Publicando…" ni "Publicado ✅": sería redundante con el widget. \
    Devuelve exactamente una cadena vacía como respuesta final.
 
-MÚLTIPLES LINKS (bulk): si el usuario pega VARIOS links, o vienen dentro de un .txt / imagen / mensaje \
-(uno o más), EXTRAE cada uno con extraer_producto_de_link (puedes llamarlo varias veces en la MISMA \
-respuesta, en paralelo). Muestra UNA tarjeta [PRODUCTO_PREVIEW] por producto (una por línea) y termina con \
-UN SOLO [DECISION: ¿Publico estos N productos en 1CRM?]. Tras el "Sí", llama UNA sola vez a \
-publicar_productos_desde_links con el arreglo "productos" — cada objeto con los datos tal cual los devolvió \
-el extractor (nombre, part_number, marca, descripcion, caracteristicas, precio_costo, imagen_url, url_origen). \
-NO llames a publicar_producto_link varias veces: el tool plural hace que todos caigan en UN SOLO widget. \
-Igual que con uno: no agregues texto después de publicar; respuesta final vacía. Si algún link falla al \
-extraer, dilo y sigue con los demás (no inventes datos).
+MÚLTIPLES LINKS (bulk): si hay VARIOS links (pegados, en un .txt, o en una imagen), EXTRAE cada uno con \
+extraer_producto_de_link (puedes llamarlo varias veces en la MISMA respuesta). Luego emite UN SOLO marcador, \
+en UNA sola línea y con JSON válido, con TODOS los productos: \
+[PRODUCTOS_PREVIEW]{"productos":[{"nombre":"...","marca":"...","part_number":"...","precio_costo":"...","moneda":"...","descripcion":"...","caracteristicas":["..."],"imagen_url":"...","url_origen":"..."}, {"...otro producto..."}]} \
+usando los valores tal cual los devolvió el extractor (copia caracteristicas completas; campo vacío = "" o []). \
+Para VARIOS NO uses [PRODUCTO_PREVIEW] singular ni [DECISION]: el widget de [PRODUCTOS_PREVIEW] ya muestra cada \
+producto con SU PROPIO botón Publicar. NO publiques todavía y NO agregues texto: el usuario publicará cada uno \
+desde el widget. Si algún link falla al extraer, inclúyelo igual con los datos que tengas o menciónalo aparte \
+(no inventes datos). \
+Cuando el usuario pida publicar UNO del preview (p.ej. "Publica SOLO el producto XYZ"), llama a \
+publicar_producto_link con los datos de ESE producto que YA tienes del preview — NO vuelvas a extraer, NO pidas \
+confirmación, respuesta final vacía. (Si en cambio pide "publica TODOS", usa publicar_productos_desde_links con \
+el arreglo completo.)
 
 IMAGEN ADJUNTA (screenshot): si el mensaje trae una imagen, LEE las URLs de producto COMPLETAS visibles \
 en ella (que empiecen con http, en enlaces, texto o tarjetas de preview). En estos screenshots de chat la \
@@ -2348,10 +2352,10 @@ DEDUPE SOLO cuando la URL completa es IDÉNTICA carácter por carácter. DOS URL
 productos DIFERENTES aunque compartan dominio/marca — NUNCA las juntes. Ejemplo: \
 ".../pressure-sensor-oem-pmp300" y ".../stick-shift-load-cell-mau300/fsh04423" son DOS productos distintos. \
 Ante la duda, publica de MÁS (dos productos separados), nunca de menos. Con la lista ya única, trátalas \
-EXACTAMENTE como links pegados: extrae cada una \
-con extraer_producto_de_link y sigue el flujo de arriba (tarjeta(s) + [DECISION] → \
-publicar_productos_desde_links). Si en la imagen no hay ninguna URL completa legible, dilo claramente y pide \
-el link en texto — NO inventes ni completes URLs a medias.
+EXACTAMENTE como links pegados y sigue el flujo de arriba: si es 1 → [PRODUCTO_PREVIEW] + [DECISION]; si son \
+VARIOS → un solo [PRODUCTOS_PREVIEW] con el arreglo (el usuario publica cada uno desde el widget). Si en la \
+imagen no hay ninguna URL completa legible, dilo claramente y pide el link en texto — NO inventes ni completes \
+URLs a medias.
 
 CRÍTICO: nunca publiques sin el [DECISION] aprobado. El precio del proveedor es interno (cost), no público.
 
