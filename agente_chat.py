@@ -1265,11 +1265,36 @@ def _rehost_imagen(imagen_url: str, part_number: str = "") -> str:
         if not _ok(r):
             return imagen_url
         ct = r.headers.get("content-type", "image/jpeg").lower()
-        ext = "png" if "png" in ct else ("webp" if "webp" in ct else "jpg")
+        content = r.content
+        if "png" in ct:
+            ext = "png"
+        elif "jpeg" in ct or "jpg" in ct:
+            ext = "jpg"
+        else:
+            # 1CRM no acepta WebP/AVIF/etc (y el publicador los sube con extensión errónea →
+            # rechazo). Normalizar a PNG con Pillow para que la subida a 1CRM funcione.
+            try:
+                from PIL import Image
+                import io as _io
+                im = Image.open(_io.BytesIO(content))
+                if im.mode in ("RGBA", "LA", "P"):
+                    im = im.convert("RGBA")
+                    bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
+                    im = Image.alpha_composite(bg, im).convert("RGB")
+                else:
+                    im = im.convert("RGB")
+                buf = _io.BytesIO()
+                im.save(buf, format="PNG")
+                content = buf.getvalue()
+                ct, ext = "image/png", "png"
+                log.info(f"Imagen {r.headers.get('content-type','?')} convertida a PNG")
+            except Exception as _e_conv:
+                log.warning(f"No se pudo convertir imagen a PNG ({ct}): {_e_conv}")
+                ext = "jpg"
         safe = (part_number or "producto").replace("/", "-").replace(" ", "_")
         path = f"link/{safe}_{str(uuid.uuid4())[:6]}.{ext}"
         supabase.storage.from_("product-images").upload(
-            path=path, file=r.content, file_options={"content-type": ct, "upsert": "true"},
+            path=path, file=content, file_options={"content-type": ct, "upsert": "true"},
         )
         url = supabase.storage.from_("product-images").get_public_url(path)
         log.info(f"Imagen re-hospedada en Supabase: {url[:70]}")
@@ -1294,6 +1319,17 @@ def tool_publicar_producto_link(
     campo INTERNO 'cost' (no se expone al público); el precio de venta (list_price) queda en 0
     para definirlo después. Reutiliza el pipeline del publicador y su widget producto_publicado."""
     try:
+        # Nombre para 1CRM en formato consistente: "número de parte / nombre / marca"
+        # (se omiten partes vacías o repetidas — p.ej. si el nombre extraído == part number).
+        _seen: set = set()
+        _partes: list = []
+        for _p in (part_number, nombre, marca):
+            _p = (_p or "").strip()
+            if _p and _p.lower() not in _seen:
+                _seen.add(_p.lower())
+                _partes.append(_p)
+        nombre_crm = " / ".join(_partes) if _partes else (nombre or part_number or "Producto")
+
         # Descripción completa para 1CRM = descripción + ficha técnica (características)
         desc_full = descripcion or nombre
         if caracteristicas:
@@ -1329,7 +1365,7 @@ def tool_publicar_producto_link(
                 "origen": "link",
                 "url":    url_origen,
                 "ficha": {
-                    "nombre":      nombre,
+                    "nombre":      nombre_crm,
                     "descripcion": desc_full,
                     "cost":        float(precio_costo or 0),
                     "list_price":  0,
