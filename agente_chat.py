@@ -1197,6 +1197,63 @@ def _extraer_producto_link(url: str) -> dict:
             log.warning(f"Traducción de producto falló, se usa original: {e}")
         return prod
 
+    def _parse_llm(html: str):
+        """Fallback cuando el sitio NO expone datos estructurados (JSON-LD/og), como Futek: extrae
+        los campos del producto con Haiku a partir del título, h1, meta description, texto visible y
+        candidatos de imagen. Devuelve el mismo shape que _parse, o None."""
+        try:
+            from urllib.parse import urljoin
+            _clean = _re.sub(r'(?is)<(script|style|noscript|svg)[^>]*>.*?</\1>', ' ', html)
+            _t = _re.search(r'<title[^>]*>(.*?)</title>', html, _re.S | _re.I)
+            title = _re.sub(r'<[^>]+>', ' ', _t.group(1)).strip() if _t else ""
+            _h = _re.search(r'<h1[^>]*>(.*?)</h1>', html, _re.S | _re.I)
+            h1 = _re.sub(r'<[^>]+>', ' ', _h.group(1)).strip() if _h else ""
+            _md = _re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)', html, _re.I)
+            mdesc = _md.group(1) if _md else ""
+            cands = []
+            _og = _re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', html, _re.I)
+            if _og:
+                cands.append(urljoin(url, _og.group(1)))
+            for m in _re.finditer(r'<(?:img|source)[^>]+(?:src|data-src|data-original|data-lazy|srcset)=["\']([^"\']+)', html, _re.I):
+                u = m.group(1).split()[0]
+                if not u or _re.search(r'(icon|logo|sprite|placeholder|avatar|flag|\.svg|1x1|blank)', u, _re.I):
+                    continue
+                cands.append(urljoin(url, u))
+            _seen: set = set()
+            cands = [c for c in cands if not (c in _seen or _seen.add(c))][:20]
+            visible = _re.sub(r'\s+', ' ', _re.sub(r'<[^>]+>', ' ', _clean)).strip()[:12000]
+            payload = json.dumps({"url": url, "title": title, "h1": h1, "meta_description": mdesc,
+                                  "image_candidates": cands, "page_text": visible}, ensure_ascii=False)
+            resp = claude.messages.create(
+                model="claude-haiku-4-5-20251001", max_tokens=1500, timeout=30,
+                system=(
+                    "Extrae los datos de UN producto industrial de la página. Responde SOLO JSON con las claves: "
+                    "nombre, part_number, marca, precio_costo (''si no hay precio visible), moneda, descripcion "
+                    "(general), caracteristicas (array 'Etiqueta: valor'), imagen_url. REGLAS: part_number del "
+                    "título o de la URL; marca = fabricante (p.ej. Futek); NO inventes precio si la página no lo "
+                    "muestra (deja ''); imagen_url = la FOTO principal del producto elegida de image_candidates "
+                    "(NUNCA iconos ni logos); si ninguna candidata es la foto del producto, deja imagen_url ''. "
+                    "Conserva part numbers, códigos, números y unidades intactos."),
+                messages=[{"role": "user", "content": payload}],
+            )
+            m = _re.search(r'\{[\s\S]*\}', resp.content[0].text if resp.content else "")
+            if not m:
+                return None
+            d = json.loads(m.group(0))
+            if not d.get("nombre"):
+                return None
+            log.info(f"_parse_llm extrajo: {d.get('nombre','')[:50]} | img={'sí' if d.get('imagen_url') else 'no'}")
+            return {
+                "ok": True, "url": url, "nombre": d.get("nombre", ""), "marca": d.get("marca", ""),
+                "part_number": d.get("part_number", ""), "precio_costo": d.get("precio_costo", "") or "",
+                "moneda": d.get("moneda", "") or "", "descripcion": (d.get("descripcion", "") or "")[:600],
+                "caracteristicas": [str(c) for c in (d.get("caracteristicas") or [])][:14],
+                "imagen_url": d.get("imagen_url", "") or "",
+            }
+        except Exception as e:
+            log.warning(f"_parse_llm falló: {e}")
+            return None
+
     scraper_tmpl = os.environ.get("SCRAPER_API_URL", "").strip()
 
     if scraper_tmpl:
@@ -1205,7 +1262,7 @@ def _extraer_producto_link(url: str) -> dict:
         if fast_tmpl != scraper_tmpl:
             r = _fetch(fast_tmpl.replace("{url}", quote_plus(url)), 30)
             if r is not None and r.status_code == 200:
-                parsed = _parse(r.text)
+                parsed = _parse(r.text) or _parse_llm(r.text)  # fallback LLM (Futek y sitios sin schema)
                 if parsed:
                     return _traducir(parsed)
         # Intento 2 — CON RENDER (lento pero pasa sitios JS/anti-bot como Festo)
@@ -1214,7 +1271,7 @@ def _extraer_producto_link(url: str) -> dict:
             return {"error": "El scraper no respondió a tiempo. Reintenta o pega los datos manualmente."}
         if r.status_code != 200:
             return {"error": f"HTTP {r.status_code} — el sitio bloquea el acceso. Pega los datos manualmente."}
-        parsed = _parse(r.text)
+        parsed = _parse(r.text) or _parse_llm(r.text)  # fallback LLM para sitios sin schema (Futek)
         return _traducir(parsed) if parsed else {"error": "No encontré datos de producto en el link (¿es una página de producto?)."}
 
     # Sin scraper: fetch directo
@@ -1224,7 +1281,7 @@ def _extraer_producto_link(url: str) -> dict:
     if r.status_code != 200:
         return {"error": f"HTTP {r.status_code} — el sitio bloquea el acceso automático "
                          f"(sin SCRAPER_API_URL configurado). Pega los datos manualmente."}
-    parsed = _parse(r.text)
+    parsed = _parse(r.text) or _parse_llm(r.text)  # fallback LLM para sitios sin schema (Futek)
     return _traducir(parsed) if parsed else {"error": "No encontré datos de producto en el link (¿es una página de producto?)."}
 
 
