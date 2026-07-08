@@ -2365,15 +2365,17 @@ def procesar_mensaje(msg: dict) -> None:
     try:
         hist_resp = (
             supabase.table("mensajes")
-            .select("role, content, procesado")
+            .select("role, content, procesado, metadata")
             .eq("stream_id", stream_id)
             .order("created_at", desc=True)
-            .limit(10)
+            .limit(12)
             .execute()
         )
         for r in reversed(hist_resp.data or []):
             if r["role"] not in ("user", "assistant"):
                 continue
+            if isinstance(r.get("metadata"), dict) and r["metadata"].get("estimado"):
+                continue  # los mensajes de "procesando/estimado" no van al contexto
             raw_content = r.get("content") or ""
             if not raw_content or not isinstance(raw_content, str):
                 continue
@@ -2398,6 +2400,28 @@ def procesar_mensaje(msg: dict) -> None:
 
     # Log del stream: registrar la solicitud entrante (alimenta el log del UI)
     _log_stream(stream_id, f'Solicitud recibida: "{contenido[:80]}"', "info")
+
+    # Estimado de tiempo INMEDIATO como mensaje del asistente (se muestra por realtime de
+    # `mensajes`, que ya funciona — NO depende del deploy del frontend). Se marca con
+    # metadata.estimado para no meterlo al contexto del LLM.
+    try:
+        import re as _re_est
+        _low_est = (contenido or "").lower().strip()
+        _est = None
+        if _re_est.search(r'https?://', contenido or ""):
+            _est = "🔎 Reviso el link del producto… (~15-40s). Te aviso al terminar."
+        elif _re_est.search(r'(correo|oportunidad|email|\brfq\b|cotiza|escanea)', _low_est):
+            _est = "🔎 Reviso tu correo en busca de oportunidades… (~1 min). Te aviso al terminar."
+        elif _re_est.match(r'^(s[ií]|no|ok|dale|adelante|publica|env[ií]a)\b', _low_est):
+            _est = "Procesando tu aprobación… (~30s). Te aviso al terminar."
+        else:
+            _est = "Procesando tu solicitud… un momento."
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant", "content": _est,
+            "procesado": True, "metadata": {"estimado": True},
+        }).execute()
+    except Exception as _e_est:
+        log.warning(f"No se pudo insertar estimado: {_e_est}")
 
     # Llamar a Claude
     token_counts = {"tokens_input": 0, "tokens_output": 0}
