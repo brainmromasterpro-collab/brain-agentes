@@ -564,7 +564,7 @@ def tool_buscar_clientes_crm(query: str = "", limite: int = 10) -> dict:
                 "web":       r.get("website", ""),
                 "ciudad":    r.get("billing_address_city", ""),
                 "pais":      r.get("billing_address_country", ""),
-                "url_crm":   f"{ONECRM_BASE}/index.php?module=Accounts&record={r.get('id')}",
+                "url_crm":   f"{ONECRM_BASE}/index.php?module=Accounts&action=DetailView&record={r.get('id')}",
             }
             for r in records
         ],
@@ -594,7 +594,7 @@ def tool_ver_cliente_crm(cliente_id: str) -> dict:
             "pais":    record.get("billing_address_country", ""),
         },
         "descripcion": record.get("description", ""),
-        "url_crm":  f"{ONECRM_BASE}/index.php?module=Accounts&record={cliente_id}",
+        "url_crm":  f"{ONECRM_BASE}/index.php?module=Accounts&action=DetailView&record={cliente_id}",
     }
 
 
@@ -655,7 +655,7 @@ def tool_listar_oportunidades_crm(estado: str = "", cuenta_id: str = "", limite:
                 "cierre":    r.get("date_closed", ""),
                 "cuenta":    r.get("account_name", ""),
                 "probabilidad": r.get("probability", ""),
-                "url_crm":   f"{ONECRM_BASE}/index.php?module=Opportunities&record={r.get('id')}",
+                "url_crm":   f"{ONECRM_BASE}/index.php?module=Opportunities&action=DetailView&record={r.get('id')}",
             }
             for r in records
         ],
@@ -715,7 +715,7 @@ def tool_crear_oportunidad_crm(
         "ok":      bool(opp_id),
         "id":      opp_id,
         "nombre":  nombre,
-        "url_crm": f"{ONECRM_BASE}/index.php?module=Opportunities&record={opp_id}" if opp_id else "",
+        "url_crm": f"{ONECRM_BASE}/index.php?module=Opportunities&action=DetailView&record={opp_id}" if opp_id else "",
     }
 
 
@@ -781,7 +781,7 @@ def tool_crear_cuenta_crm(
         "ok":      bool(acct_id),
         "id":      acct_id,
         "nombre":  nombre,
-        "url_crm": f"{ONECRM_BASE}/index.php?module=Accounts&record={acct_id}" if acct_id else "",
+        "url_crm": f"{ONECRM_BASE}/index.php?module=Accounts&action=DetailView&record={acct_id}" if acct_id else "",
         "error":   resp.get("error", ""),
     }
 
@@ -816,7 +816,7 @@ def tool_crear_contacto_crm(
         "id":         contacto_id,
         "nombre":     f"{nombre} {apellido}".strip(),
         "cuenta_id":  cuenta_id,
-        "url_crm":    f"{ONECRM_BASE}/index.php?module=Contacts&record={contacto_id}" if contacto_id else "",
+        "url_crm":    f"{ONECRM_BASE}/index.php?module=Contacts&action=DetailView&record={contacto_id}" if contacto_id else "",
         "error":      resp.get("error", ""),
     }
 
