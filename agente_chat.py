@@ -2384,6 +2384,49 @@ Todo correo saliente (borrador o envío) debe ir en el MISMO idioma del correo o
 
 
 # ─────────────────────────────────────────────────────────────
+# PROMPT FOCALIZADO POR TIPO DE STREAM
+# Cada stream tiene un `tipo`; según el tipo se carga SOLO los modos de ese propósito (+ el intro
+# y el MODO 7, que son las reglas base). Prompt más chico = más predecible y algo más rápido.
+# Tipo desconocido/None → prompt COMPLETO (comportamiento actual intacto → cero riesgo).
+# ─────────────────────────────────────────────────────────────
+def _partir_prompt(full: str):
+    heads = list(re.finditer(r'(?m)^MODO (\d+) [—-]', full))
+    if not heads:
+        return full, {}
+    intro = full[:heads[0].start()]
+    modos: dict = {}
+    for i, h in enumerate(heads):
+        num = int(h.group(1))
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(full)
+        modos[num] = full[h.start():end]
+    return intro, modos
+
+
+_PROMPT_INTRO, _PROMPT_MODOS = _partir_prompt(SYSTEM_PROMPT)
+
+# Qué modos carga cada tipo (además del intro y MODO 7 = reglas base, que van siempre).
+TIPO_MODOS = {
+    "catalogo":     [1, 2, 3, 4, 5, 6, 8, 13],   # publicar desde link + búsqueda RFQ + imagen
+    "mensajeria":   [9, 10, 11, 12],              # correo/WhatsApp: RFQ, oportunidades, alta cliente
+    "cotizaciones": [],                            # (módulo de cotización se agrega después)
+    "ordenes":      [],
+}
+
+
+def _build_system_prompt(tipo: str) -> str:
+    """Prompt focalizado según el tipo del stream. Tipo no reconocido → prompt completo."""
+    if not tipo or tipo not in TIPO_MODOS or not _PROMPT_MODOS:
+        return SYSTEM_PROMPT
+    partes = [_PROMPT_INTRO]
+    for n in TIPO_MODOS[tipo]:
+        if n in _PROMPT_MODOS:
+            partes.append(_PROMPT_MODOS[n])
+    if 7 in _PROMPT_MODOS:
+        partes.append(_PROMPT_MODOS[7])  # MODO 7 = reglas generales, siempre al final
+    return "".join(partes)
+
+
+# ─────────────────────────────────────────────────────────────
 # LOG DEL STREAM (alimenta los logs del UI: global y por-stream)
 # ─────────────────────────────────────────────────────────────
 def _log_stream(stream_id: str, msg: str, tipo: str = "ok") -> None:
@@ -2445,7 +2488,7 @@ _LOG_INICIO_TOOL = {
 # ─────────────────────────────────────────────────────────────
 # LOOP DE CLAUDE CON TOOL_USE
 # ─────────────────────────────────────────────────────────────
-def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool, dict]:
+def run_chat(messages: list[dict], stream_id: str, system_prompt: str = SYSTEM_PROMPT) -> tuple[str, list[str], bool, dict]:
     tools_used: list[str] = []
     rfqs_created = False
     current_messages = list(messages)
@@ -2466,7 +2509,7 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool
             # cache_control cachea el prefijo estático (tools + system prompt). En el loop de
             # tools (hasta 10 vueltas) las llamadas siguientes leen de caché en vez de
             # reprocesar ~30 tools + 11 modos cada vez → mucha menos latencia y costo.
-            system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
+            system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
             tools=TOOLS,
             messages=current_messages,
         )
@@ -2577,7 +2620,19 @@ def procesar_mensaje(msg: dict) -> None:
     stream_id = msg.get("stream_id", "")
     contenido = msg.get("content", "")
 
-    log.info(f"Chat msg {msg_id[:8]} | stream={stream_id!r} | '{contenido[:60]}...'")
+    # Tipo del stream → prompt focalizado (base + solo los modos de ese propósito). Si no hay tipo
+    # reconocido, _build_system_prompt devuelve el prompt completo (comportamiento actual).
+    _tipo_stream = None
+    try:
+        if stream_id:
+            _sres = supabase.table("streams").select("tipo").eq("id", stream_id).single().execute()
+            _tipo_stream = (_sres.data or {}).get("tipo")
+    except Exception as e:
+        log.warning(f"No se pudo leer tipo del stream: {e}")
+    _system_prompt = _build_system_prompt(_tipo_stream)
+
+    log.info(f"Chat msg {msg_id[:8]} | stream={stream_id!r} tipo={_tipo_stream!r} "
+             f"prompt={len(_system_prompt)}ch | '{contenido[:60]}...'")
 
     # Marcar como procesado
     supabase.table("mensajes").update({"procesado": True}).eq("id", msg_id).execute()
@@ -2655,7 +2710,7 @@ def procesar_mensaje(msg: dict) -> None:
     try:
         roles = [m['role'] for m in historial]
         print(f"[BRAIN] historial roles={roles} n={len(historial)}", flush=True)
-        respuesta, tools_used, rfqs_created, token_counts, perf = run_chat(historial, stream_id=str(stream_id))
+        respuesta, tools_used, rfqs_created, token_counts, perf = run_chat(historial, stream_id=str(stream_id), system_prompt=_system_prompt)
     except Exception as e:
         import traceback as _tb
         print(f"[BRAIN ERROR] {e}", flush=True)
