@@ -2255,6 +2255,9 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool
 
     import time as _time
     _t_start = _time.time()
+    # Desglose de tiempos que se persiste en el metadata de la respuesta (para diagnosticar
+    # la lentitud sin depender de los logs de Railway): segundos en el modelo, por tool, total.
+    _perf: dict = {"llm_s": 0.0, "tools": {}, "rondas": 0}
     for _ronda in range(10):
         _t_llm = _time.time()
         response = claude.messages.create(
@@ -2269,6 +2272,8 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool
             messages=current_messages,
         )
         _dt_llm = _time.time() - _t_llm
+        _perf["llm_s"] = round(_perf["llm_s"] + _dt_llm, 1)
+        _perf["rondas"] = _ronda + 1
 
         if hasattr(response, "usage") and response.usage:
             total_input_tokens  += getattr(response.usage, "input_tokens",  0)
@@ -2283,10 +2288,11 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool
             text = next(
                 (b.text for b in response.content if hasattr(b, "text")), ""
             )
-            log.info(f"[PERF] TOTAL run_chat={_time.time()-_t_start:.1f}s rondas={_ronda+1} "
+            _perf["total_s"] = round(_time.time() - _t_start, 1)
+            log.info(f"[PERF] TOTAL run_chat={_perf['total_s']:.1f}s rondas={_ronda+1} "
                      f"tools={tools_used}")
             token_counts = {"tokens_input": total_input_tokens, "tokens_output": total_output_tokens}
-            return text, tools_used, rfqs_created, token_counts
+            return text, tools_used, rfqs_created, token_counts, _perf
 
         if response.stop_reason == "tool_use":
             current_messages.append({"role": "assistant", "content": response.content})
@@ -2322,7 +2328,9 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool
                         rfqs_created = True
                 except Exception as e:
                     result = {"error": str(e)}
-                log.info(f"[PERF] tool={tool_name} dt={_time.time()-_t_tool:.1f}s")
+                _dt_tool = round(_time.time() - _t_tool, 1)
+                _perf["tools"][tool_name] = round(_perf["tools"].get(tool_name, 0) + _dt_tool, 1)
+                log.info(f"[PERF] tool={tool_name} dt={_dt_tool:.1f}s")
 
                 # Registrar la acción en el log del stream (UI global + por-stream)
                 _msg_log, _tipo_log = _mensaje_log_tool(tool_name, tool_input, result)
@@ -2338,8 +2346,9 @@ def run_chat(messages: list[dict], stream_id: str) -> tuple[str, list[str], bool
         else:
             break
 
+    _perf["total_s"] = round(_time.time() - _t_start, 1)
     token_counts = {"tokens_input": total_input_tokens, "tokens_output": total_output_tokens}
-    return "No pude completar la respuesta.", tools_used, rfqs_created, token_counts
+    return "No pude completar la respuesta.", tools_used, rfqs_created, token_counts, _perf
 
 
 # ─────────────────────────────────────────────────────────────
@@ -2407,10 +2416,12 @@ def procesar_mensaje(msg: dict) -> None:
 
     # Llamar a Claude
     token_counts = {"tokens_input": 0, "tokens_output": 0}
+    perf: dict = {}
+    _t_proc = time.time()
     try:
         roles = [m['role'] for m in historial]
         print(f"[BRAIN] historial roles={roles} n={len(historial)}", flush=True)
-        respuesta, tools_used, rfqs_created, token_counts = run_chat(historial, stream_id=str(stream_id))
+        respuesta, tools_used, rfqs_created, token_counts, perf = run_chat(historial, stream_id=str(stream_id))
     except Exception as e:
         import traceback as _tb
         print(f"[BRAIN ERROR] {e}", flush=True)
@@ -2420,6 +2431,14 @@ def procesar_mensaje(msg: dict) -> None:
         respuesta    = f"Error procesando tu mensaje. Intenta de nuevo. ({str(e)[:400]})"
         tools_used   = []
         rfqs_created = False
+    # Tiempo de cola: desde que el usuario mandó el mensaje hasta que empezó a procesarse.
+    try:
+        _created = msg.get("created_at")
+        if _created:
+            _t0 = datetime.fromisoformat(_created.replace("Z", "+00:00"))
+            perf["cola_s"] = round((datetime.now(timezone.utc) - _t0).total_seconds() - (time.time() - _t_proc), 1)
+    except Exception:
+        pass
 
     # Registrar job de chat con tokens para que agente_monitor los sume
     try:
@@ -2456,7 +2475,7 @@ def procesar_mensaje(msg: dict) -> None:
         "role":      "assistant",
         "content":   respuesta,
         "procesado": True,
-        "metadata":  {"tools_used": tools_used},
+        "metadata":  {"tools_used": tools_used, "perf": perf},
     }).execute()
     if hasattr(insert_resp, 'error') and insert_resp.error:
         log.error(f"Error insertando respuesta: {insert_resp.error}")
