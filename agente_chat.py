@@ -2405,11 +2405,18 @@ def _partir_prompt(full: str):
 _PROMPT_INTRO, _PROMPT_MODOS = _partir_prompt(SYSTEM_PROMPT)
 
 # Qué modos carga cada tipo (además del intro y MODO 7 = reglas base, que van siempre).
+# "generico" / "compras" / "general" / desconocido / None → prompt COMPLETO (todos los modos).
 TIPO_MODOS = {
-    "catalogo":     [1, 2, 3, 4, 5, 6, 8, 13],   # publicar desde link + búsqueda RFQ + imagen
-    "mensajeria":   [9, 10, 11, 12],              # correo/WhatsApp: RFQ, oportunidades, alta cliente
-    "cotizaciones": [],                            # (módulo de cotización se agrega después)
+    "correo":       [9, 10, 11, 12],              # correo: RFQ, oportunidades, alta cliente
+    "whatsapp":     [9, 10, 11, 12],              # WhatsApp: mismos modos que correo, otro canal
+    "busquedas":    [1, 2, 3, 4, 5, 6, 8],        # búsqueda RFQ + selección proveedor + imagen
+    "publicacion":  [13],                          # publicar producto(s) desde link
+    "cotizacion":   [],                            # (módulo de cotización se agrega después)
     "ordenes":      [],
+    # aliases de compatibilidad
+    "mensajeria":   [9, 10, 11, 12],
+    "catalogo":     [1, 2, 3, 4, 5, 6, 8, 13],
+    "cotizaciones": [],
 }
 
 
