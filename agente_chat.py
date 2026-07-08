@@ -2082,10 +2082,13 @@ Cuando el usuario pida "lee los correos", "revisa el correo y detecta oportunida
    NUNCA repitas los datos en texto aparte del marcador: el widget ya los muestra.
 
 5. DESPUÉS del marcador, procesa las oportunidades UNA por una (solo las que tengan faltan/creación pendiente), \
-   empezando por la #1, aplicando el flujo del MODO 10: si está completa → [DECISION: ¿Creo la oportunidad para <empresa>?] \
-   (crea con alta de cuenta/contacto si es cliente nuevo, MODO 12); si le falta info → borrador de correo pidiendo SOLO \
-   lo faltante (reglas del MODO 10 paso 3) + [DECISION: ¿Envío la solicitud a <remitente>?]. Tras resolver una, sigue con \
-   la siguiente. Nunca crees ni envíes sin el [DECISION] aprobado.
+   empezando por la #1. IMPORTANTE: NO re-describas los datos de la oportunidad en texto (el widget del marcador YA \
+   los muestra: empresa, remitente, productos, qué falta). Para cada una emite SOLO lo mínimo: una línea corta \
+   identificándola (ej. "Oportunidad 1 · Aceros del Norte:") y enseguida la acción, aplicando el MODO 10: \
+   si está completa → [DECISION: ¿Creo la oportunidad para <empresa>?] (crea con alta de cuenta/contacto si es \
+   cliente nuevo, MODO 12); si le falta info → borrador de correo pidiendo SOLO lo faltante (reglas del MODO 10 \
+   paso 3) + [DECISION: ¿Envío la solicitud a <remitente>?]. Tras resolver una, sigue con la siguiente. Nunca crees \
+   ni envíes sin el [DECISION] aprobado.
 
 MODO 12 — ALTA DE CLIENTE NUEVO (alta inicial, baja fricción):
 Se dispara cuando un prospecto con RFQ NO es cliente en el CRM (desde el MODO 10/11), o cuando el usuario \
