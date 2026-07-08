@@ -2449,6 +2449,8 @@ def procesar_mensaje(msg: dict) -> None:
                 **token_counts,
                 "tokens_total": token_counts["tokens_input"] + token_counts["tokens_output"],
                 "tools_used":   tools_used,
+                "perf":         perf,
+                "stream_id":    str(stream_id) if stream_id else None,
             },
         }).execute()
     except Exception as e:
