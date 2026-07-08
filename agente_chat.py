@@ -2283,10 +2283,14 @@ NO llames a publicar_producto_link varias veces: el tool plural hace que todos c
 Igual que con uno: no agregues texto después de publicar; respuesta final vacía. Si algún link falla al \
 extraer, dilo y sigue con los demás (no inventes datos).
 
-IMAGEN ADJUNTA (screenshot): si el mensaje trae una imagen, LEE las URLs de producto visibles en ella \
-(barra de direcciones, texto, enlaces) y trátalas EXACTAMENTE como links pegados: extrae cada una con \
-extraer_producto_de_link y sigue el flujo de arriba (tarjeta(s) + [DECISION] → publicar_productos_desde_links). \
-Si en la imagen no hay ninguna URL legible, dilo claramente y pide el link en texto — NO inventes URLs.
+IMAGEN ADJUNTA (screenshot): si el mensaje trae una imagen, LEE las URLs de producto COMPLETAS visibles \
+en ella (que empiecen con http, en enlaces, texto o tarjetas de preview). En estos screenshots de chat la \
+MISMA URL suele aparecer dos veces (como enlace y dentro de la tarjeta de preview) y también hay dominios \
+sueltos (p.ej. "www.futek.com"): IGNORA los dominios sueltos y NO proceses una URL repetida más de una vez \
+(dedupe por URL completa). Con la lista ya única, trátalas EXACTAMENTE como links pegados: extrae cada una \
+con extraer_producto_de_link y sigue el flujo de arriba (tarjeta(s) + [DECISION] → \
+publicar_productos_desde_links). Si en la imagen no hay ninguna URL completa legible, dilo claramente y pide \
+el link en texto — NO inventes ni completes URLs a medias.
 
 CRÍTICO: nunca publiques sin el [DECISION] aprobado. El precio del proveedor es interno (cost), no público.
 
