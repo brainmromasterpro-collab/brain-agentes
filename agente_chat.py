@@ -41,7 +41,7 @@ import json
 import time
 import uuid
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 import httpx
@@ -1361,6 +1361,22 @@ def _rehost_imagen(imagen_url: str, part_number: str = "") -> str:
         return imagen_url
 
 
+def _ya_publicado_reciente(part_number: str, clean_stream, minutos: int = 30) -> bool:
+    """True si el mismo part_number ya se publicó (o está publicándose) en este stream hace poco.
+    Guardia anti-doble-publicación: evita republicar por un mensaje suelto ('muy bien', 'ok', etc.)."""
+    if not part_number or not clean_stream:
+        return False
+    try:
+        corte = (datetime.now(timezone.utc) - timedelta(minutes=minutos)).isoformat()
+        r = (supabase.table("rfqs").select("id")
+             .eq("stream_id", clean_stream).eq("modelo", part_number)
+             .in_("estado", ["publicando", "publicado"])
+             .gte("created_at", corte).limit(1).execute())
+        return bool(r.data)
+    except Exception:
+        return False
+
+
 def _publicar_producto_uno(
     bulk_id: str, clean_stream, nombre: str, part_number: str, marca: str = "",
     descripcion: str = "", caracteristicas: list | None = None, precio_costo: float = 0,
@@ -1442,6 +1458,9 @@ def tool_publicar_producto_link(
     para definirlo después. Reutiliza el pipeline del publicador y su widget producto_publicado."""
     try:
         clean_stream = stream_id if (stream_id and stream_id not in ("None", "")) else None
+        if _ya_publicado_reciente(part_number, clean_stream):
+            return {"error": f"El producto {part_number or nombre} YA fue publicado en este stream hace poco. "
+                             f"No lo republico. Si de verdad quieres otra copia, dímelo explícitamente."}
         bulk_id = str(uuid.uuid4())  # bulk de 1 producto → dispara el BulkWidget (widget "Ver en CRM")
         res = _publicar_producto_uno(bulk_id, clean_stream, nombre, part_number, marca,
                                      descripcion, caracteristicas, precio_costo, imagen_url, url_origen)
@@ -1467,6 +1486,9 @@ def tool_publicar_productos_desde_links(productos: list | None = None, stream_id
         errores: list = []
         for p in productos:
             if not isinstance(p, dict):
+                continue
+            if _ya_publicado_reciente(p.get("part_number", ""), clean_stream):
+                errores.append(f"{p.get('part_number') or p.get('nombre') or '?'}: ya publicado recientemente, omitido")
                 continue
             try:
                 res = _publicar_producto_uno(
@@ -2367,6 +2389,13 @@ VARIOS → un solo [PRODUCTOS_PREVIEW] con el arreglo (el usuario publica cada u
 imagen no hay ninguna URL completa legible, dilo claramente y pide el link en texto — NO inventes ni completes \
 URLs a medias.
 
+CRÍTICO — NO REPUBLIQUES NI ACTÚES POR MENSAJES SUELTOS: solo publicas como respuesta INMEDIATA a la \
+aprobación ("Sí", "publica", "adelante") de un preview que ACABAS de mostrar y que AÚN NO se ha publicado. \
+Un producto ya aprobado/publicado NO se vuelve a publicar. Si el usuario dice algo conversacional o un \
+afirmativo suelto ("muy bien", "ok", "gracias", "perfecto", "excelente", "va") y NO hay un preview NUEVO \
+esperando su aprobación, es SOLO conversación: responde breve y NO llames a ninguna tool de publicar. Nunca \
+uses los datos de un [PRODUCTO_PREVIEW] anterior del historial para publicar de nuevo.
+
 CRÍTICO: nunca publiques sin el [DECISION] aprobado. El precio del proveedor es interno (cost), no público.
 
 MODO 7 — CHAT CONVERSACIONAL:
@@ -2386,6 +2415,11 @@ completo creas. Si la tool devuelve "INFO_INCOMPLETA", NO reintentes crear: pide
 - Para listas de productos, SIEMPRE usa crear_rfqs_desde_texto aunque sean 1 o 2 items
 - Los mensajes [SISTEMA:...] son triggers automáticos del sistema, no del usuario. Procésalos silenciosamente y responde al usuario con el resultado.
 - CONTACTOS CRM: Cuando el usuario pregunte por el contacto de un cliente, primero usa buscar_clientes_crm para obtener el cuenta_id, luego usa ver_contactos_cuenta_crm. La respuesta incluye "info_cuenta" con el email y teléfono registrados en la cuenta — SIEMPRE muestra esos datos aunque no haya Contact records separados. "info_cuenta" con email o teléfono ES información de contacto válida.
+- AFIRMATIVOS SUELTOS = SOLO CONVERSACIÓN: mensajes como "muy bien", "ok", "gracias", "perfecto", "va", \
+"excelente", "genial" NO son instrucciones para ejecutar acciones (publicar, crear/actualizar en CRM, enviar \
+correo). NUNCA llames una tool de acción por ellos. Solo ejecutas una acción con una instrucción EXPLÍCITA, o \
+como aprobación DIRECTA de un [DECISION]/preview que acabas de mostrar y que sigue pendiente. Ante la duda, \
+responde conversando y NO actúes.
 - DECISIONES CON BOTONES: Cuando necesites aprobación del usuario para una acción importante (enviar un email, crear algo en CRM, etc.), termina tu mensaje con el tag [DECISION: pregunta corta aquí]. Ejemplo: "Le contestaré a Alejandro que tenemos el producto disponible. [DECISION: ¿Confirmas que lo enviamos?]". El sistema mostrará botones Sí/No automáticamente.
 - IDIOMA DE CORREOS: la regla "responde en español" aplica al chat con el usuario, NO a los correos a clientes. \
 Todo correo saliente (borrador o envío) debe ir en el MISMO idioma del correo original del cliente.
