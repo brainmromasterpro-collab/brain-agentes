@@ -1368,11 +1368,11 @@ def _publicar_producto_uno(
 ) -> dict:
     """Crea el rfq + job del publicador para UN producto extraído de link, bajo el bulk_id dado.
     Lo comparten el flujo de 1 link y el de N links (bulk). Devuelve {rfq_id, job_id, nombre_crm}."""
-    # Nombre para 1CRM en formato consistente: "número de parte / nombre / marca"
+    # Nombre para 1CRM en el ORDEN: modelo (part number) / marca / descripción (nombre).
     # (se omiten partes vacías o repetidas — p.ej. si el nombre extraído == part number).
     _seen: set = set()
     _partes: list = []
-    for _p in (part_number, nombre, marca):
+    for _p in (part_number, marca, nombre):
         _p = (_p or "").strip()
         if _p and _p.lower() not in _seen:
             _seen.add(_p.lower())
