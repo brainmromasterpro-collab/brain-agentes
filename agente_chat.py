@@ -2521,7 +2521,7 @@ def run_chat(messages: list[dict], stream_id: str, system_prompt: str = SYSTEM_P
         _t_llm = _time.time()
         response = claude.messages.create(
             model=CHAT_MODEL,
-            max_tokens=4096,
+            max_tokens=8192,
             # (timeout y max_retries se definen a nivel de cliente — ver anthropic.Anthropic arriba)
             # cache_control cachea el prefijo estático (tools + system prompt). En el loop de
             # tools (hasta 10 vueltas) las llamadas siguientes leen de caché en vez de
@@ -2543,13 +2543,17 @@ def run_chat(messages: list[dict], stream_id: str, system_prompt: str = SYSTEM_P
                      f"cache_read={getattr(_u,'cache_read_input_tokens',0)} "
                      f"cache_write={getattr(_u,'cache_creation_input_tokens',0)}")
 
-        if response.stop_reason == "end_turn":
+        # end_turn = terminó normal. max_tokens = se truncó (respuesta grande): devolvemos lo
+        # generado igual (mejor un widget/aviso parcial que "No pude completar la respuesta").
+        if response.stop_reason in ("end_turn", "max_tokens"):
             text = next(
                 (b.text for b in response.content if hasattr(b, "text")), ""
             )
             _perf["total_s"] = round(_time.time() - _t_start, 1)
+            if response.stop_reason == "max_tokens":
+                log.warning(f"[PERF] respuesta truncada por max_tokens (out={total_output_tokens})")
             log.info(f"[PERF] TOTAL run_chat={_perf['total_s']:.1f}s rondas={_ronda+1} "
-                     f"tools={tools_used}")
+                     f"tools={tools_used} stop={response.stop_reason}")
             token_counts = {"tokens_input": total_input_tokens, "tokens_output": total_output_tokens}
             return text, tools_used, rfqs_created, token_counts, _perf
 
