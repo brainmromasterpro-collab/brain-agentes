@@ -276,17 +276,24 @@ def generar_ficha_producto(marca: str, modelo: str, opciones: list[dict]) -> dic
 
     prompt = f"""You are an industrial MRO product catalog specialist.
 
-Generate the product listing for the 1CRM catalog with this data:
+The prospect provided the following, which MAY CONTAIN TYPOS or data-entry errors:
+  Brand as typed:            {marca}
+  Model / Part Number typed: {modelo}
 
-Brand: {marca}
-Model/Part Number: {modelo}
-
-Search results found:
+Search results found for that part number (source of truth):
 {json.dumps(opciones, ensure_ascii=False, indent=2)}
+
+TASK: Using the SEARCH RESULTS as the source of truth, determine the CORRECT brand, model/part
+number, and product name. The prospect's typed values are only a hint and often have typos — for
+example "LIPPER" is really "Clipper", "FESTON" is "Festo". If the results clearly show a different,
+correct brand or a cleaner part number, USE THE CORRECTED VALUES. If the results are ambiguous or
+empty, keep the prospect's typed values — do NOT invent.
 
 Return ONLY this JSON (no extra text):
 {{
-  "nombre": "Title format: {{modelo}} - {{marca}} - {{short technical description, max 60 chars}}. All in English.",
+  "marca": "Corrected brand from the results (or the prospect's if unclear)",
+  "modelo": "Corrected model / part number from the results (or the prospect's if unclear)",
+  "nombre": "Title format: {{corrected_modelo}} - {{corrected_marca}} - {{short technical description, max 60 chars}}. All in English.",
   "descripcion": "Technical description in English, 2-4 sentences. Include application, key specs, and compatibility if known.",
   "precio_referencia": {mejor_precio or 0},
   "moneda": "{mejor_moneda}",
@@ -686,8 +693,20 @@ def procesar_job_publicador(job: dict) -> None:
             op_elegida = opts_para_ficha[0]
             log.info(f"Publicando con opción seleccionada: {op_elegida.get('proveedor','?')} @ {op_elegida.get('precio_orig','?')} {op_elegida.get('moneda','')}")
 
-            # ── Claude genera ficha ──────────────────────────────────────
+            # ── Claude genera ficha (corrige marca/modelo con base en los resultados) ──
             ficha = generar_ficha_producto(marca, modelo, opts_para_ficha)
+            # Si Claude corrigió la marca/modelo (typo del prospecto, p.ej. Lipper→Clipper),
+            # adoptar los valores corregidos y actualizarlos en el rfq (widget + registro).
+            marca_corr  = (ficha.get("marca")  or marca).strip()
+            modelo_corr = (ficha.get("modelo") or modelo).strip()
+            if (marca_corr and marca_corr.lower() != (marca or "").lower()) or \
+               (modelo_corr and modelo_corr.lower() != (modelo or "").lower()):
+                log.info(f"Corrección por resultados: '{marca} {modelo}' → '{marca_corr} {modelo_corr}'")
+                try:
+                    supabase.table("rfqs").update({"marca": marca_corr, "modelo": modelo_corr}).eq("id", rfq_uuid).execute()
+                except Exception as _e:
+                    log.warning(f"No se pudo actualizar marca/modelo corregidos: {_e}")
+                marca, modelo = marca_corr, modelo_corr
 
         # ── Crear producto en 1CRM ───────────────────────────────────────
         # crear_producto_en_crm raises RuntimeError with full response if 1CRM fails
