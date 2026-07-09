@@ -58,6 +58,20 @@ def _notificar(stream_id: str, email: dict) -> None:
         }).execute()
     except Exception as e:
         log.warning(f"notificación correo falló: {e}")
+    # Tarjeta clickable EN el stream (mensaje del asistente con marcador). El frontend la renderiza
+    # con un botón para procesar el correo. metadata.correo_entrante → el historial del chat la ignora.
+    try:
+        payload = json.dumps({
+            "de": email.get("de", ""), "asunto": email.get("asunto", ""),
+            "snippet": email.get("snippet", ""), "gmail_id": email.get("id", ""),
+        }, ensure_ascii=False)
+        supabase.table("mensajes").insert({
+            "stream_id": str(stream_id), "role": "assistant",
+            "content": f"[CORREO_ENTRANTE]{payload}",
+            "procesado": True, "metadata": {"correo_entrante": True},
+        }).execute()
+    except Exception as e:
+        log.warning(f"tarjeta de correo en stream falló: {e}")
 
 
 def main() -> None:

@@ -2663,8 +2663,9 @@ def procesar_mensaje(msg: dict) -> None:
         for r in reversed(hist_resp.data or []):
             if r["role"] not in ("user", "assistant"):
                 continue
-            if isinstance(r.get("metadata"), dict) and r["metadata"].get("estimado"):
-                continue  # los mensajes de "procesando/estimado" no van al contexto
+            _md = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+            if _md.get("estimado") or _md.get("correo_entrante"):
+                continue  # estimados y tarjetas de correo entrante no van al contexto
             raw_content = r.get("content") or ""
             if not raw_content or not isinstance(raw_content, str):
                 continue
