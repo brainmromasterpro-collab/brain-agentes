@@ -2227,6 +2227,16 @@ Cuando el usuario pida "genera la oportunidad del correo", "arma la oportunidad 
        Créalo con [DECISION], y en cuanto la cuenta exista crea la oportunidad ligada con crear_oportunidad_crm \
        (cuenta_id de la cuenta recién creada, descripcion "RFQ: <part-numbers> | Qty: <cantidades>").
 
+FORMATO DE SALIDA (OBLIGATORIO): NO escribas el diagnóstico ni el borrador como prosa/texto. En su lugar \
+emite EXACTAMENTE este marcador en UNA línea y con JSON válido (el frontend lo vuelve una tarjeta), y \
+DESPUÉS el [DECISION] que corresponda: \
+[OPORTUNIDAD]{"es_oportunidad":true,"resumen":"una línea","remitente":"Nombre","correo":"correo@x.com","empresa":"","campos":[{"nombre":"Contacto","ok":true,"valor":"Jesús G"},{"nombre":"Empresa","ok":false,"valor":"no la menciona"},{"nombre":"RFQ + Qty","ok":false,"valor":"'quiero una parte' es ambiguo"},{"nombre":"Correo","ok":true,"valor":"correo@x.com"},{"nombre":"Dirección de envío","ok":false,"valor":"no la incluye"}],"completa":false,"faltan":["empresa","part-number + cantidad","dirección de envío"],"es_cliente":false,"accion":"Pedir datos faltantes","borrador":{"para":"correo@x.com","asunto":"Re: ...","cuerpo":"texto redactado según las reglas de arriba"}} \
+- Los 5 campos van SIEMPRE en este orden y con estos nombres: Contacto, Empresa, RFQ + Qty, Correo, Dirección de envío. Cada uno con ok (true/false) y un "valor" corto (el dato o por qué falta). \
+- Incompleta → accion "Pedir datos faltantes", incluye el borrador, y termina con [DECISION: ¿Envío esta solicitud de información a <remitente>?]. \
+- Completa y ES cliente → borrador null, accion "Crear oportunidad", [DECISION: ¿Creo la oportunidad para <cuenta>?]. \
+- Completa y NO es cliente → borrador null, accion "Alta de cliente + oportunidad", [DECISION: ¿Doy de alta a <empresa> y creo la oportunidad?]. \
+NO repitas el diagnóstico ni el borrador en texto aparte: la tarjeta ya los muestra.
+
 CRÍTICO: en este modo nunca creas nada en el CRM ni envías correos sin el [DECISION] aprobado por el usuario. \
 Si faltan datos, primero se piden; solo con los 4 bloques completos se procede a cotejar y crear.
 
