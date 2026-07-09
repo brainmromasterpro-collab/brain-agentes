@@ -29,6 +29,7 @@ if __name__ == "__main__":
     import agente_publicador
     import agente_chat
     import agente_monitor
+    import agente_lector
 
     disponibles = {
         "buscador":   agente_buscador.main,
@@ -36,6 +37,7 @@ if __name__ == "__main__":
         "publicador": agente_publicador.main,
         "chat":       agente_chat.main,
         "monitor":    agente_monitor.main,
+        "lector":     agente_lector.main,
     }
 
     agents_env = os.environ.get("AGENTS", "").strip().lower()
@@ -46,6 +48,11 @@ if __name__ == "__main__":
         if not seleccionados:
             log.warning(f"AGENTS='{agents_env}' no coincide con ninguno; corriendo TODOS por defecto")
             seleccionados = list(disponibles.keys())
+
+    # El lector de Gmail necesita las creds de Gmail (servicio chat) → corre junto al chat aunque
+    # AGENTS=chat no lo liste explícitamente.
+    if "chat" in seleccionados and "lector" not in seleccionados:
+        seleccionados.append("lector")
 
     log.info(f"Iniciando Brain MRO Master Pro — agentes: {seleccionados}")
 
