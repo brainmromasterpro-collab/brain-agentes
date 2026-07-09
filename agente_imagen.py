@@ -593,30 +593,35 @@ def procesar_job_imagen(job: dict) -> None:
             "error":       str(e),
         }).eq("id", job_id).execute()
 
-        # Fallback: error obteniendo imagen → avisar en el chat y publicar sin imagen
+        # Fallback: no se pudo obtener imagen.
         try:
             rfq_fb = supabase.table("rfqs").select("stream_id,marca,modelo").eq("id", rfq_uuid).single().execute().data
             stream_id_fb = (rfq_fb or {}).get("stream_id")
             marca_fb  = (rfq_fb or {}).get("marca", marca)
             modelo_fb = (rfq_fb or {}).get("modelo", modelo)
             if stream_id_fb:
+                # HITL: hay un usuario en el stream → NO auto-publicar. Marcar imagen fallida y avisar;
+                # el usuario decide en el widget (Reintentar / Publicar sin imagen / omitir).
+                supabase.table("rfqs").update({"estado": "imagen_fallida"}).eq("id", rfq_uuid).execute()
                 supabase.table("mensajes").insert({
                     "stream_id": stream_id_fb,
                     "role":      "user",
                     "content":   (
                         f"[SISTEMA:imagen_no_encontrada] rfq_id={rfq_uuid} "
                         f"marca={marca_fb} modelo={modelo_fb} "
-                        f"motivo=No se pudo obtener imagen — se publica sin imagen"
+                        f"motivo=No se pudo obtener imagen — ESPERANDO decisión del usuario (no publicar)"
                     ),
                     "procesado": False,
                     "metadata":  {"trigger": "imagen_no_encontrada", "rfq_id": rfq_uuid},
                 }).execute()
-            # Publicar de todos modos (crea publicador + pone 'publicando' + notifica)
-            _auto_publicar_sin_imagen(
-                rfq_uuid, marca_fb, modelo_fb,
-                motivo=f"Error en agente de imágenes: {str(e)[:200]}",
-            )
-            log.info(f"RFQ {rfq_uuid} → fallback sin imagen: publicando igual")
+                log.info(f"HITL: imagen no encontrada rfq {rfq_uuid} — esperando decisión del usuario (NO auto-publica)")
+            else:
+                # Modo automático (sin stream): sí publica sin imagen.
+                _auto_publicar_sin_imagen(
+                    rfq_uuid, marca_fb, modelo_fb,
+                    motivo=f"Error en agente de imágenes: {str(e)[:200]}",
+                )
+                log.info(f"RFQ {rfq_uuid} → auto sin imagen (modo automático, sin stream)")
         except Exception as e2:
             log.error(f"Error en fallback sin imagen: {e2}")
 
