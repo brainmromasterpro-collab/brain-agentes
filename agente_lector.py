@@ -24,14 +24,31 @@ POLL = int(os.environ.get("LECTOR_POLL", "60"))          # segundos entre revisi
 QUERY = os.environ.get("LECTOR_QUERY", "is:unread in:inbox newer_than:2d")
 
 
-def _streams_correo() -> list[str]:
-    """IDs de los streams de tipo correo/mensajeria (a los que se empuja el aviso)."""
+def _streams_correo() -> list[dict]:
+    """Streams de tipo correo/mensajeria (a los que se empuja el aviso). Incluye auto_detectar."""
     try:
-        rows = supabase.table("streams").select("id,tipo").execute().data or []
-        return [r["id"] for r in rows if (r.get("tipo") or "") in ("correo", "mensajeria")]
+        rows = supabase.table("streams").select("*").execute().data or []
+        return [r for r in rows if (r.get("tipo") or "") in ("correo", "mensajeria")]
     except Exception as e:
         log.warning(f"No se pudieron leer streams de correo: {e}")
         return []
+
+
+def _disparar_deteccion(stream_id: str, email: dict) -> None:
+    """Modo automático: inserta un mensaje de usuario que hace que el chat lea el correo y detecte
+    si es oportunidad (mismo flujo que el botón manual)."""
+    de = (email.get("de") or "")[:80]
+    asunto = (email.get("asunto") or "")[:100]
+    try:
+        supabase.table("mensajes").insert({
+            "stream_id": str(stream_id), "role": "user",
+            "content": (f'Detecta si el correo de "{de}" con asunto "{asunto}" es una oportunidad '
+                        f'(léelo completo con leer_emails_gmail). Si lo es y faltan datos, dime qué falta.'),
+            "procesado": False,
+        }).execute()
+        log.info(f"Auto-detección disparada para: {asunto[:50]}")
+    except Exception as e:
+        log.warning(f"auto-detección falló: {e}")
 
 
 def _notificar(stream_id: str, email: dict) -> None:
@@ -91,8 +108,10 @@ def main() -> None:
                 seen.add(e["id"])
                 if first:
                     continue  # baseline: no notificar la bandeja ya existente
-                for sid in streams:
-                    _notificar(sid, e)
+                for s in streams:
+                    _notificar(s["id"], e)                      # siempre: tarjeta + log + notificación
+                    if s.get("auto_detectar"):                  # toggle ON → además dispara la detección
+                        _disparar_deteccion(s["id"], e)
                 if streams:
                     log.info(f"Correo nuevo → {len(streams)} stream(s): {(e.get('asunto') or '')[:50]}")
             if first:
