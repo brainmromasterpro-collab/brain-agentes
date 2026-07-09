@@ -729,6 +729,38 @@ def _filtrar_resultados_web(resultados: list[dict], modelo: str) -> list[dict]:
 # ─────────────────────────────────────────
 # CLAUDE — ANALIZA Y RANKEA TOP 5
 # ─────────────────────────────────────────
+def corregir_marca_modelo(marca: str, modelo: str, opciones: list[dict]) -> tuple[str, str]:
+    """Corrige typos de la marca/modelo del prospecto usando los resultados de búsqueda como fuente
+    de verdad (p.ej. Lipper→Clipper, Feston→Festo). Si no hay evidencia clara, deja los originales."""
+    import re as _re
+    try:
+        muestras = [{
+            "proveedor": o.get("proveedor", ""),
+            "nombre": o.get("nombre_producto") or o.get("nombre") or o.get("titulo") or "",
+            "notas": (o.get("notas") or "")[:120],
+        } for o in (opciones or [])[:5]]
+        prompt = (
+            "La marca y el modelo/part number los escribió un prospecto y PUEDEN tener errores de dedo.\n"
+            f"Marca escrita: {marca}\nModelo / part number escrito: {modelo}\n\n"
+            f"Resultados de la búsqueda de ese part number:\n{json.dumps(muestras, ensure_ascii=False)}\n\n"
+            "Con los resultados como fuente de verdad, devuelve la marca y el modelo/part number CORRECTOS "
+            "(ej: 'Lipper'→'Clipper', 'Feston'→'Festo'). Si los resultados NO dan evidencia clara, deja los "
+            "valores escritos tal cual — NO inventes. Responde SOLO JSON: {\"marca\":\"...\",\"modelo\":\"...\"}"
+        )
+        resp = claude.messages.create(
+            model="claude-haiku-4-5-20251001", max_tokens=150, timeout=20,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        txt = resp.content[0].text if resp.content else ""
+        m = _re.search(r'\{[\s\S]*\}', txt)
+        if m:
+            d = json.loads(m.group(0))
+            return (str(d.get("marca") or marca).strip(), str(d.get("modelo") or modelo).strip())
+    except Exception as e:
+        log.warning(f"corregir_marca_modelo falló: {e}")
+    return marca, modelo
+
+
 def rankear_con_claude(
     marca: str,
     modelo: str,
@@ -1096,6 +1128,19 @@ def procesar_job(job: dict) -> None:
             }).execute()
             log.info(f"Job {job_id} cerrado como sin_resultado (ranking vacío) — notificador encolado")
             return
+
+        # ── Corregir typos de marca/modelo con base en los resultados (Lipper→Clipper) ──
+        # Se hace apenas termina la búsqueda para que el widget muestre los datos correctos
+        # ANTES de publicar. Actualiza el rfq (marca/modelo).
+        marca_c, modelo_c = corregir_marca_modelo(marca, modelo, top5)
+        if (marca_c and marca_c.lower() != (marca or "").lower()) or \
+           (modelo_c and modelo_c.lower() != (modelo or "").lower()):
+            log.info(f"Corrección por resultados: '{marca} {modelo}' → '{marca_c} {modelo_c}'")
+            try:
+                supabase.table("rfqs").update({"marca": marca_c, "modelo": modelo_c}).eq("id", rfq_uuid).execute()
+            except Exception as _e:
+                log.warning(f"No se pudo actualizar marca/modelo corregidos: {_e}")
+            marca, modelo = marca_c, modelo_c
 
         # ── Garantizar que 1CRM catálogo siempre aparezca en el Top 5 ──
         # Si Claude no incluyó ningún resultado del catálogo, los inyectamos
