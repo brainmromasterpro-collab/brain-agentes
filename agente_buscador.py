@@ -47,6 +47,16 @@ supabase: Client = create_client(
 )
 claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
+# Acumulador de tokens por job (visibilidad de gasto). El buscador procesa 1 job a la vez → seguro.
+_tok = {"in": 0, "out": 0}
+def _add_usage(resp) -> None:
+    try:
+        u = resp.usage
+        _tok["in"]  += getattr(u, "input_tokens", 0) or 0
+        _tok["out"] += getattr(u, "output_tokens", 0) or 0
+    except Exception:
+        pass
+
 ONECRM_BASE = os.environ["ONECRM_URL"].rstrip("/")
 POLL_INTERVAL = 10  # segundos entre polls
 
@@ -751,6 +761,7 @@ def corregir_marca_modelo(marca: str, modelo: str, opciones: list[dict]) -> tupl
             model="claude-haiku-4-5-20251001", max_tokens=150, timeout=20,
             messages=[{"role": "user", "content": prompt}],
         )
+        _add_usage(resp)
         txt = resp.content[0].text if resp.content else ""
         m = _re.search(r'\{[\s\S]*\}', txt)
         if m:
@@ -896,6 +907,7 @@ El "idx" DEBE ser uno de los índices listados arriba. No incluyas ningún texto
         **extra,
     )
 
+    _add_usage(response)
     text = response.content[0].text.strip()
     # Limpiar posibles backticks
     text = text.replace("```json", "").replace("```", "").strip()
@@ -988,9 +1000,14 @@ def agregar_log_job(job_id: str, paso: str, msg: str) -> None:
 # ─────────────────────────────────────────
 # PROCESADOR PRINCIPAL DEL JOB
 # ─────────────────────────────────────────
+def _job_tokens() -> dict:
+    return {"tokens_input": _tok["in"], "tokens_output": _tok["out"], "tokens_total": _tok["in"] + _tok["out"]}
+
+
 def procesar_job(job: dict) -> None:
     job_id = job["id"]
     rfq_uuid = job["rfq_id"]
+    _tok["in"] = 0; _tok["out"] = 0  # reset del acumulador de tokens de este job
 
     log.info(f"Procesando job {job_id} para rfq {rfq_uuid}")
 
@@ -1119,7 +1136,7 @@ def procesar_job(job: dict) -> None:
             supabase.table("jobs").update({
                 "estado": "completado",
                 "finished_at": datetime.utcnow().isoformat(),
-                "output": {"opciones_encontradas": 0, "razon": "ranking_vacio"},
+                "output": {"opciones_encontradas": 0, "razon": "ranking_vacio", **_job_tokens()},
             }).eq("id", job_id).execute()
             supabase.table("jobs").insert({
                 "rfq_id": rfq_uuid,
@@ -1216,7 +1233,7 @@ def procesar_job(job: dict) -> None:
         supabase.table("jobs").update({
             "estado": "completado",
             "finished_at": datetime.utcnow().isoformat(),
-            "output": {"opciones_encontradas": len(top5)},
+            "output": {"opciones_encontradas": len(top5), **_job_tokens()},
         }).eq("id", job_id).execute()
 
         log.info(f"Job {job_id} completado — Top {len(top5)} generado")

@@ -50,6 +50,18 @@ supabase: Client = create_client(
 )
 claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
+# Acumulador de tokens por job (visibilidad del gasto de visión). 1 job a la vez → seguro.
+_tok = {"in": 0, "out": 0}
+def _add_usage(resp) -> None:
+    try:
+        u = resp.usage
+        _tok["in"]  += getattr(u, "input_tokens", 0) or 0
+        _tok["out"] += getattr(u, "output_tokens", 0) or 0
+    except Exception:
+        pass
+def _job_tokens() -> dict:
+    return {"tokens_input": _tok["in"], "tokens_output": _tok["out"], "tokens_total": _tok["in"] + _tok["out"]}
+
 POLL_INTERVAL = 10
 BUCKET = "product-images"
 
@@ -307,6 +319,7 @@ def evaluar_con_claude_vision(marca: str, modelo: str, candidatas: list[dict]) -
             messages=[{"role": "user", "content": content}],
             **extra,
         )
+        _add_usage(response)
         text = response.content[0].text.strip()
         text = text.replace("```json", "").replace("```", "").strip()
         result = json.loads(text)
@@ -472,6 +485,7 @@ def _auto_publicar_sin_imagen(rfq_uuid: str, marca: str, modelo: str, motivo: st
 def procesar_job_imagen(job: dict) -> None:
     job_id  = job["id"]
     rfq_uuid = job["rfq_id"]
+    _tok["in"] = 0; _tok["out"] = 0  # reset del acumulador de tokens de este job
     log.info(f"=== Job imagen {job_id} | rfq {rfq_uuid} ===")
 
     # Marcar corriendo
@@ -581,6 +595,7 @@ def procesar_job_imagen(job: dict) -> None:
                 "foto_url":      foto_url,
                 "imagen_fuente": ganadora["url"],
                 "removebg":      img_sin_fondo is not None,
+                **_job_tokens(),
             },
         }).eq("id", job_id).execute()
 
@@ -592,6 +607,7 @@ def procesar_job_imagen(job: dict) -> None:
             "estado":      "fallido",
             "finished_at": datetime.utcnow().isoformat(),
             "error":       str(e),
+            "output":      _job_tokens(),
         }).eq("id", job_id).execute()
 
         # Fallback: no se pudo obtener imagen.
