@@ -42,8 +42,12 @@ def _disparar_deteccion(stream_id: str, email: dict) -> None:
     try:
         supabase.table("mensajes").insert({
             "stream_id": str(stream_id), "role": "user",
-            "content": (f'Detecta si el correo de "{de}" con asunto "{asunto}" es una oportunidad '
-                        f'(léelo completo con leer_emails_gmail). Si lo es y faltan datos, dime qué falta.'),
+            "content": (
+                f'Revisa el correo de "{de}" (asunto "{asunto}") leyéndolo completo con leer_emails_gmail. '
+                f'Si es una OPORTUNIDAD NUEVA, detéctala y sigue el flujo (cotejar CRM, completar con la firma, '
+                f'pedir lo que falte o crearla). Si es una RESPUESTA de un prospecto a una solicitud NUESTRA, '
+                f'revisa el HILO completo: si ya llegó el dato que faltaba, COMPLETA y crea la oportunidad '
+                f'(ligada a su cuenta, sin duplicar); si sigue faltando algo, dime qué.'),
             "procesado": False,
         }).execute()
         log.info(f"Auto-detección disparada para: {asunto[:50]}")

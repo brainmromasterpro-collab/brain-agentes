@@ -427,6 +427,17 @@ def tool_notificar_sistema(titulo: str, mensaje: str = "", tipo: str = "oportuni
         return {"ok": False, "error": str(e)}
 
 
+def _notif(stream_id: str, titulo: str, mensaje: str = "", tipo: str = "oportunidad") -> None:
+    """Notificación DETERMINISTA (la emite la tool al tener éxito, no el modelo → nunca se salta)."""
+    try:
+        payload: dict = {"tipo": tipo, "titulo": titulo, "mensaje": mensaje or "", "leida": False}
+        if stream_id and stream_id not in ("None", ""):
+            payload["stream_id"] = stream_id
+        supabase.table("notificaciones").insert(payload).execute()
+    except Exception as e:
+        log.warning(f"notif determinista falló: {e}")
+
+
 def _onecrm_post(endpoint: str, payload: dict) -> dict:
     user = os.environ.get("ONECRM_USERNAME", "")
     pwd  = os.environ.get("ONECRM_PASSWORD",  "")
@@ -669,6 +680,7 @@ def tool_crear_oportunidad_crm(
     fecha_cierre: str = "",
     etapa: str = "Prospecting",
     descripcion: str = "",
+    stream_id: str = "",
 ) -> dict:
     """Crea una nueva oportunidad en 1CRM.
     etapa: Prospecting | Qualification | Proposal/Price Quote | Negotiation | Closed Won | Closed Lost
@@ -711,6 +723,8 @@ def tool_crear_oportunidad_crm(
     }
     resp = _onecrm_post("data/Opportunity", payload)
     opp_id = resp.get("id", "")
+    if opp_id:
+        _notif(stream_id, f"✅ Oportunidad creada — {nombre}", descripcion[:120])
     return {
         "ok":      bool(opp_id),
         "id":      opp_id,
@@ -773,6 +787,7 @@ def tool_crear_cuenta_crm(
     regimen_fiscal: str = "",
     condiciones_pago: str = "",
     industria: str = "",
+    stream_id: str = "",
 ) -> dict:
     """Crea una nueva cuenta/empresa en 1CRM.
     tipo: Customer | Supplier | Partner | Competitor | Press | Analyst | Other
@@ -817,6 +832,8 @@ def tool_crear_cuenta_crm(
     if industria:        payload["industry"] = industria
     resp = _onecrm_post("data/Account", payload)
     acct_id = resp.get("id", "")
+    if acct_id:
+        _notif(stream_id, f"✅ Alta de cuenta — {nombre}")
     return {
         "ok":      bool(acct_id),
         "id":      acct_id,
@@ -835,6 +852,7 @@ def tool_crear_contacto_crm(
     telefono: str = "",
     cargo: str = "",
     descripcion: str = "",
+    stream_id: str = "",
 ) -> dict:
     """Crea un contacto (persona) en 1CRM, opcionalmente ligado a una cuenta/empresa.
     whatsapp se guarda en phone_mobile (1CRM no tiene campo de WhatsApp dedicado).
@@ -867,6 +885,8 @@ def tool_crear_contacto_crm(
     if descripcion:  payload["description"] = descripcion
     resp = _onecrm_post("data/Contact", payload)
     contacto_id = resp.get("id", "")
+    if contacto_id:
+        _notif(stream_id, f"✅ Contacto creado — {f'{nombre} {apellido}'.strip()}")
     return {
         "ok":         bool(contacto_id),
         "id":         contacto_id,
@@ -2708,7 +2728,7 @@ def run_chat(messages: list[dict], stream_id: str, system_prompt: str = SYSTEM_P
                 log.info(f"Tool: {tool_name}({json.dumps(tool_input)[:120]})")
 
                 # Inyectar stream_id automáticamente en tools que lo necesitan
-                if tool_name in ("crear_rfqs_desde_texto", "notificar_sistema", "publicar_producto_link", "publicar_productos_desde_links") and not tool_input.get("stream_id"):
+                if tool_name in ("crear_rfqs_desde_texto", "notificar_sistema", "publicar_producto_link", "publicar_productos_desde_links", "crear_cuenta_crm", "crear_contacto_crm", "crear_oportunidad_crm") and not tool_input.get("stream_id"):
                     tool_input["stream_id"] = stream_id
 
                 # Aviso de inicio con estimado (la burbuja "procesando" lo muestra en vivo)
