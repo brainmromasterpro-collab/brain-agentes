@@ -559,7 +559,9 @@ def procesar_job_imagen(job: dict) -> None:
                     f"marca={marca} modelo={modelo} "
                     f"foto_url={foto_url}"
                 ),
-                "procesado": False,
+                # procesado=True: el chat NO gasta Sonnet; el widget muestra "Foto lista" + botón
+                # Publicar (esa es la aprobación). (ahorro de costo)
+                "procesado": True,
                 "metadata":  {"trigger": "imagen_lista", "rfq_id": rfq_uuid, "foto_url": foto_url},
             }).execute()
             log.info(f"HITL: imagen lista — esperando aprobación del usuario en stream {str(stream_id)[:8]}")
@@ -628,7 +630,9 @@ def procesar_job_imagen(job: dict) -> None:
                         f"marca={marca_fb} modelo={modelo_fb} "
                         f"motivo=No se pudo obtener imagen — ESPERANDO decisión del usuario (no publicar)"
                     ),
-                    "procesado": False,
+                    # procesado=True: el chat NO gasta Sonnet; el widget muestra "Imagen fallida" +
+                    # botones Reintentar / Publicar sin imagen. (ahorro de costo)
+                    "procesado": True,
                     "metadata":  {"trigger": "imagen_no_encontrada", "rfq_id": rfq_uuid},
                 }).execute()
                 log.info(f"HITL: imagen no encontrada rfq {rfq_uuid} — esperando decisión del usuario (NO auto-publica)")

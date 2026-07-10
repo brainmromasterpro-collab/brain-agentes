@@ -1224,7 +1224,9 @@ def procesar_job(job: dict) -> None:
                     f"[SISTEMA:busqueda_completa] rfq_id={rfq_uuid} "
                     f"marca={marca_disp} modelo={modelo_disp}"
                 ),
-                "procesado": False,
+                # procesado=True: el chat NO gasta Sonnet respondiendo esto; el widget ya muestra
+                # las opciones. Solo queda como registro. (ahorro de costo)
+                "procesado": True,
                 "metadata":  {"trigger": "busqueda_completa", "rfq_id": rfq_uuid},
             }).execute()
             log.info(f"Trigger de busqueda_completa enviado al stream {str(stream_id)[:8]}")
