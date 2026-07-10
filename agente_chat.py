@@ -76,6 +76,7 @@ GOOGLE_CLIENT_ID     = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
 GMAIL_USER           = "brain.mromasterpro@gmail.com"
+VENTAS_USER          = os.environ.get("GMAIL_DELEGATED_USER", "ventas@mromasterpro.com")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -96,7 +97,8 @@ def _onecrm_get(endpoint: str, params: dict = {}) -> dict:
         return {"error": str(e), "records": [], "total_count": 0}
 
 
-_gmail_token_cache: dict = {"token": None, "exp": 0.0}
+_gmail_token_cache: dict  = {"token": None, "exp": 0.0}
+_ventas_token_cache: dict = {"token": None, "exp": 0.0}
 
 
 def _gmail_access_token() -> str:
@@ -118,6 +120,28 @@ def _gmail_access_token() -> str:
     _gmail_token_cache["token"] = data["access_token"]
     _gmail_token_cache["exp"]   = time.time() + data.get("expires_in", 3600) - 300
     return data["access_token"]
+
+
+def _gmail_access_token_ventas() -> str:
+    """Token de acceso para ventas@mromasterpro.com vía Service Account + DWD.
+    Requiere GOOGLE_SERVICE_ACCOUNT_JSON en env."""
+    import time
+    if _ventas_token_cache["token"] and time.time() < _ventas_token_cache["exp"]:
+        return _ventas_token_cache["token"]
+    sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+    if not sa_json:
+        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON no configurado")
+    from google.oauth2 import service_account
+    import google.auth.transport.requests
+    info = json.loads(sa_json)
+    creds = service_account.Credentials.from_service_account_info(
+        info,
+        scopes=["https://www.googleapis.com/auth/gmail.modify"],
+    ).with_subject(VENTAS_USER)
+    creds.refresh(google.auth.transport.requests.Request())
+    _ventas_token_cache["token"] = creds.token
+    _ventas_token_cache["exp"]   = time.time() + 3300  # ~55 min
+    return creds.token
 
 
 def _gmail_decode_body(payload: dict) -> str:
@@ -161,43 +185,65 @@ def _gmail_ultimo_mensaje_nuestro(thread_id: str, token: str) -> bool:
         return False
 
 
-def tool_leer_emails_gmail(max_emails: int = 10, query: str = "newer_than:1d") -> dict:
-    """Lee emails de brain.mromasterpro@gmail.com.
+def _leer_emails_con_token(token: str, max_emails: int, query: str) -> list[dict]:
+    """Lee emails de Gmail usando un access token ya obtenido."""
+    headers = {"Authorization": f"Bearer {token}"}
+    base = "https://gmail.googleapis.com/gmail/v1"
+    params = {"userId": "me", "maxResults": min(max_emails, 20), "q": query}
+    lista = httpx.get(f"{base}/users/me/messages", headers=headers, params=params, timeout=15).json()
+    emails = []
+    for m in lista.get("messages", []):
+        detail = httpx.get(f"{base}/users/me/messages/{m['id']}",
+            headers=headers, params={"userId": "me", "format": "full"}, timeout=15).json()
+        hdrs = {h["name"]: h["value"] for h in detail.get("payload", {}).get("headers", [])}
+        body = _gmail_decode_body(detail.get("payload", {}))
+        emails.append({
+            "id":        m["id"],
+            "thread_id": detail.get("threadId", ""),
+            "de":        hdrs.get("From", ""),
+            "para":      hdrs.get("To", ""),
+            "asunto":    hdrs.get("Subject", ""),
+            "fecha":     hdrs.get("Date", ""),
+            "snippet":   detail.get("snippet", ""),
+            "cuerpo":    body[:1500] if body else detail.get("snippet", ""),
+            "leido":     "UNREAD" not in detail.get("labelIds", []),
+        })
+    return emails
+
+
+def tool_leer_emails_gmail(max_emails: int = 10, query: str = "newer_than:1d",
+                           cuenta: str = "ventas") -> dict:
+    """Lee emails de Gmail.
+    cuenta: 'ventas' (ventas@mromasterpro.com, default), 'personal' (brain.mromasterpro@gmail.com),
+            'ambas' (combina los dos buzones).
     query soporta filtros de Gmail: newer_than:1d, from:alguien@mail.com, subject:tema, is:unread, etc.
     """
-    refresh = os.environ.get("GOOGLE_REFRESH_TOKEN", GOOGLE_REFRESH_TOKEN)
-    if not refresh:
-        return {"error": "GOOGLE_REFRESH_TOKEN no configurado en Railway"}
-    try:
-        token = _gmail_access_token()
-        headers = {"Authorization": f"Bearer {token}"}
-        base = "https://gmail.googleapis.com/gmail/v1"
+    emails: list[dict] = []
+    errors: list[str] = []
 
-        # Listar IDs
-        params = {"userId": "me", "maxResults": min(max_emails, 20), "q": query}
-        lista = httpx.get(f"{base}/users/me/messages", headers=headers, params=params, timeout=15).json()
-        msgs = lista.get("messages", [])
+    if cuenta in ("ventas", "ambas"):
+        try:
+            token = _gmail_access_token_ventas()
+            emails += _leer_emails_con_token(token, max_emails, query)
+        except Exception as e:
+            errors.append(f"ventas@: {e}")
 
-        emails = []
-        for m in msgs:
-            detail = httpx.get(f"{base}/users/me/messages/{m['id']}",
-                headers=headers, params={"userId": "me", "format": "full"}, timeout=15).json()
-            hdrs = {h["name"]: h["value"] for h in detail.get("payload", {}).get("headers", [])}
-            body = _gmail_decode_body(detail.get("payload", {}))
-            emails.append({
-                "id":        m["id"],
-                "thread_id": detail.get("threadId", ""),
-                "de":        hdrs.get("From", ""),
-                "para":      hdrs.get("To", ""),
-                "asunto":    hdrs.get("Subject", ""),
-                "fecha":     hdrs.get("Date", ""),
-                "snippet":   detail.get("snippet", ""),
-                "cuerpo":    body[:1500] if body else detail.get("snippet", ""),
-                "leido":     "UNREAD" not in detail.get("labelIds", []),
-            })
-        return {"total": len(emails), "query": query, "emails": emails}
-    except Exception as e:
-        return {"error": str(e)}
+    if cuenta in ("personal", "ambas"):
+        refresh = os.environ.get("GOOGLE_REFRESH_TOKEN", GOOGLE_REFRESH_TOKEN)
+        if refresh:
+            try:
+                token = _gmail_access_token()
+                emails += _leer_emails_con_token(token, max_emails, query)
+            except Exception as e:
+                errors.append(f"personal: {e}")
+
+    if not emails and errors:
+        return {"error": "; ".join(errors)}
+
+    # Deduplicar por id (puede haber overlap si el mismo correo está en ambas cuentas)
+    seen: set[str] = set()
+    unique = [e for e in emails if not (e["id"] in seen or seen.add(e["id"]))]  # type: ignore[func-returns-value]
+    return {"total": len(unique), "query": query, "cuenta": cuenta, "emails": unique}
 
 
 def tool_buscar_email_gmail(query: str, max_emails: int = 5) -> dict:
@@ -205,52 +251,56 @@ def tool_buscar_email_gmail(query: str, max_emails: int = 5) -> dict:
     return tool_leer_emails_gmail(max_emails=max_emails, query=query)
 
 
-def tool_enviar_email_gmail(para: str, asunto: str, cuerpo: str, thread_id: str = "", message_id: str = "") -> dict:
-    """Envía o responde un email desde brain.mromasterpro@gmail.com.
+def tool_enviar_email_gmail(para: str, asunto: str, cuerpo: str, thread_id: str = "",
+                            message_id: str = "", cuenta: str = "ventas") -> dict:
+    """Envía o responde un email desde la cuenta de la empresa.
+    cuenta: 'ventas' (ventas@mromasterpro.com, default) o 'personal' (brain.mromasterpro@gmail.com).
     Si se pasa thread_id y message_id, responde en el hilo existente (Reply).
-    Si no, envía un email nuevo.
     """
     import base64
     from email.mime.text import MIMEText
 
-    refresh = os.environ.get("GOOGLE_REFRESH_TOKEN", GOOGLE_REFRESH_TOKEN)
-    if not refresh:
-        return {"error": "GOOGLE_REFRESH_TOKEN no configurado en Railway"}
     try:
-        token = _gmail_access_token()
+        if cuenta == "ventas":
+            token   = _gmail_access_token_ventas()
+            from_addr = VENTAS_USER
+        else:
+            refresh = os.environ.get("GOOGLE_REFRESH_TOKEN", GOOGLE_REFRESH_TOKEN)
+            if not refresh:
+                return {"error": "GOOGLE_REFRESH_TOKEN no configurado"}
+            token   = _gmail_access_token()
+            from_addr = GMAIL_USER
+
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
         msg = MIMEText(cuerpo, "plain", "utf-8")
         msg["To"]      = para
-        msg["From"]    = GMAIL_USER
+        msg["From"]    = from_addr
         msg["Subject"] = asunto
         if message_id:
             msg["In-Reply-To"] = message_id
             msg["References"]  = message_id
 
         raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
-        body: dict = {"raw": raw}
+        body_payload: dict = {"raw": raw}
         if thread_id:
-            body["threadId"] = thread_id
+            body_payload["threadId"] = thread_id
 
         resp = httpx.post(
             "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
-            headers=headers,  # incluye Content-Type: application/json (sin esto Gmail da 400 INVALID_ARGUMENT)
-            content=json.dumps(body).encode(),
+            headers=headers,
+            content=json.dumps(body_payload).encode(),
             timeout=15,
         )
         if not resp.is_success:
-            return {
-                "error":        f"Gmail API {resp.status_code}",
-                "detalle":      resp.text[:500],
-                "token_prefix": token[:20],
-            }
+            return {"error": f"Gmail API {resp.status_code}", "detalle": resp.text[:500]}
         data = resp.json()
         return {
             "ok":         True,
             "message_id": data.get("id"),
             "thread_id":  data.get("threadId"),
             "enviado_a":  para,
+            "desde":      from_addr,
             "asunto":     asunto,
         }
     except Exception as e:
@@ -262,19 +312,30 @@ def tool_diagnostico_gmail() -> dict:
     client_id  = os.environ.get("GOOGLE_CLIENT_ID", "")
     client_sec = os.environ.get("GOOGLE_CLIENT_SECRET", "")
     refresh    = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
+    sa_json    = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
     status = {
-        "GOOGLE_CLIENT_ID":     "✅ configurado" if client_id  else "❌ falta",
-        "GOOGLE_CLIENT_SECRET": "✅ configurado" if client_sec else "❌ falta",
-        "GOOGLE_REFRESH_TOKEN": "✅ configurado" if refresh    else "❌ falta",
+        "GOOGLE_CLIENT_ID":            "✅ configurado" if client_id  else "❌ falta",
+        "GOOGLE_CLIENT_SECRET":        "✅ configurado" if client_sec else "❌ falta",
+        "GOOGLE_REFRESH_TOKEN":        "✅ configurado" if refresh    else "❌ falta",
+        "GOOGLE_SERVICE_ACCOUNT_JSON": "✅ configurado" if sa_json   else "❌ falta",
+        "GMAIL_DELEGATED_USER":        VENTAS_USER,
     }
     if client_id and client_sec and refresh:
         try:
             _gmail_access_token()
-            status["conexion"] = "✅ token de acceso obtenido correctamente"
+            status["conexion_personal"] = f"✅ token OK para {GMAIL_USER}"
         except Exception as e:
-            status["conexion"] = f"❌ error al obtener token: {e}"
+            status["conexion_personal"] = f"❌ error: {e}"
     else:
-        status["conexion"] = "❌ variables incompletas"
+        status["conexion_personal"] = "❌ variables incompletas"
+    if sa_json:
+        try:
+            _gmail_access_token_ventas()
+            status["conexion_ventas"] = f"✅ token OK para {VENTAS_USER}"
+        except Exception as e:
+            status["conexion_ventas"] = f"❌ error: {e}"
+    else:
+        status["conexion_ventas"] = "❌ GOOGLE_SERVICE_ACCOUNT_JSON no configurado"
     return status
 
 
