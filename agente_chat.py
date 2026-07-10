@@ -133,7 +133,12 @@ def _gmail_access_token_ventas() -> str:
         raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON no configurado")
     from google.oauth2 import service_account
     import google.auth.transport.requests
-    info = json.loads(sa_json)
+    import base64 as _b64
+    # Acepta tanto JSON directo como JSON codificado en base64 (recomendado para Railway)
+    try:
+        info = json.loads(sa_json)
+    except json.JSONDecodeError:
+        info = json.loads(_b64.b64decode(sa_json).decode())
     creds = service_account.Credentials.from_service_account_info(
         info,
         scopes=["https://www.googleapis.com/auth/gmail.modify"],
