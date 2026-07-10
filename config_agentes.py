@@ -48,7 +48,9 @@ _MODEL_MAP: dict[str, str] = {
 }
 
 _DEFAULTS: dict[str, object] = {
-    "model_id":      "claude-sonnet-4-6",
+    # Haiku por defecto para los workers (rankear/elegir imagen/generar ficha): ~10x más barato
+    # que Sonnet y suficiente para estas tareas estructuradas. Reversible: volver a sonnet-4-6.
+    "model_id":      "claude-haiku-4-5-20251001",
     "max_tokens":    4096,
     "temperature":   0.3,
     "system_prompt": "",

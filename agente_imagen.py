@@ -57,8 +57,9 @@ BUCKET = "product-images"
 # ─────────────────────────────────────────
 # PASO 1 — BUSCAR IMÁGENES EN GOOGLE
 # ─────────────────────────────────────────
-# Cuántas URLs candidatas reunir antes de pasar a descarga/evaluación
-TARGET_URLS = 8
+# Cuántas URLs candidatas reunir antes de pasar a descarga/evaluación.
+# Menos candidatas = MUCHO menos costo de visión (cada imagen a Claude cuesta tokens). 3 basta.
+TARGET_URLS = 3
 
 
 def _build_queries(marca: str, modelo: str) -> list[str]:
