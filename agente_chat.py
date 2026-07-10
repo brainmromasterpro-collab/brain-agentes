@@ -2327,9 +2327,25 @@ Cuando el usuario pida "genera la oportunidad del correo", "arma la oportunidad 
    - Nota: las tools crear_cuenta_crm/crear_contacto_crm ya tienen protección — si el cliente/contacto ya existe \
      devuelven "ya_existe": true con su id; eso NO es error, usa ese id para ligar la oportunidad.
 
-   4a. YA ES CLIENTE (la cuenta existe en CRM): termina con [DECISION: ¿Creo la oportunidad para <cuenta>?]. \
-       Tras el "Sí": crea la oportunidad con crear_oportunidad_crm — pon en descripcion el detalle "RFQ: <part-numbers> | Qty: <cantidades>" \
-       y usa el cuenta_id del CRM. Confirma con el link de la oportunidad creada.
+   4a. YA ES CLIENTE Y EL CONTACTO YA EXISTE (cuenta + contacto en CRM, y no falta ningún dato obligatorio): \
+       termina con [DECISION: ¿Creo la oportunidad para <cuenta>?]. Tras el "Sí": crea la oportunidad con \
+       crear_oportunidad_crm — descripcion "RFQ: <part-numbers> | Qty: <cantidades>", cuenta_id del CRM. \
+       Confirma con el link de la oportunidad creada.
+
+   4a-bis. LA EMPRESA/CUENTA EXISTE PERO EL CONTACTO ES NUEVO (o falta algún dato de la oportunidad): la cuenta \
+       ya está en el CRM (coincide por dominio del correo, nombre de empresa o firma), pero esta PERSONA no está \
+       como contacto de esa cuenta (verifícalo con ver_contactos_cuenta_crm usando el cuenta_id). Entonces: \
+       - Redacta un correo BREVE y cordial al remitente (trato de usted, mismo idioma del correo, positivo, NO \
+         condicionante) confirmando su alta como CONTACTO ADICIONAL de su empresa y/o pidiendo SOLO el dato que \
+         falte. Ej: "Estimado/a <nombre>: gracias por contactarnos. Ya tenemos registrada a <empresa>; con gusto \
+         lo damos de alta como contacto adicional. ¿Nos confirma <dato faltante, p.ej. dirección de envío>? \
+         Seguimos avanzando con su requerimiento mientras tanto." \
+       - Termina con [DECISION: ¿Envío la confirmación a <remitente>?]. (Si el usuario del chat ya te dio lo que \
+         faltaba, en su lugar pide: [DECISION: ¿Doy de alta a <nombre> como contacto de <empresa> y creo la \
+         oportunidad?].) \
+       - Tras el "Sí": crea el contacto con crear_contacto_crm ligado al cuenta_id EXISTENTE (NUNCA crees otra \
+         cuenta), y luego la oportunidad ligada a esa misma cuenta. Avisa con notificar_sistema del alta del \
+         contacto y de la oportunidad creada.
 
    4b. NO ES CLIENTE (no hay cuenta en CRM): hay que DAR DE ALTA al cliente primero. Sigue el MODO 12 (alta \
        inicial, baja fricción): basta con empresa, contacto, correo y dirección de envío — SIN datos fiscales. \
