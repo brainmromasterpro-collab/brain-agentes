@@ -719,6 +719,37 @@ def tool_crear_oportunidad_crm(
     }
 
 
+def _norm_nombre(s: str) -> str:
+    return "".join(c for c in (s or "").lower() if c.isalnum())
+
+
+def _buscar_cuenta_existente(nombre: str, email: str = "") -> dict | None:
+    """Busca una cuenta ya existente en 1CRM por CORREO (identificador confiable) o por NOMBRE de
+    empresa. Devuelve {id, nombre, url_crm, por} o None. Evita crear clientes duplicados."""
+    if not ONECRM_BASE:
+        return None
+    def _url(rid): return f"{ONECRM_BASE}/index.php?module=Accounts&action=DetailView&record={rid}"
+    try:
+        # 1) por email exacto (email1 o email2)
+        if email:
+            data = _onecrm_get("data/Account", {"filter_text": email, "max_num": 20})
+            for r in (data.get("records", []) or []):
+                if email.lower() in ((r.get("email1", "") or "").lower(), (r.get("email2", "") or "").lower()):
+                    return {"id": r.get("id"), "nombre": r.get("name", ""), "url_crm": _url(r.get("id")), "por": "correo"}
+        # 2) por nombre de empresa (normalizado; uno contenido en el otro, evita variaciones SA/SA de CV)
+        if nombre:
+            n = _norm_nombre(nombre)
+            if len(n) >= 6:
+                data = _onecrm_get("data/Account", {"filter_text": nombre, "max_num": 20})
+                for r in (data.get("records", []) or []):
+                    cn = _norm_nombre(r.get("name", ""))
+                    if cn and (cn == n or (len(min(cn, n, key=len)) >= 8 and (n in cn or cn in n))):
+                        return {"id": r.get("id"), "nombre": r.get("name", ""), "url_crm": _url(r.get("id")), "por": "nombre"}
+    except Exception as e:
+        log.warning(f"_buscar_cuenta_existente falló: {e}")
+    return None
+
+
 def tool_crear_cuenta_crm(
     nombre: str,
     tipo: str = "Customer",
@@ -752,6 +783,15 @@ def tool_crear_cuenta_crm(
     """
     if not ONECRM_BASE:
         return {"error": "1CRM no configurado"}
+    # DEDUPE: si la cuenta ya existe (por correo o nombre), NO crear duplicado — devolver la existente.
+    _ex = _buscar_cuenta_existente(nombre, email)
+    if _ex:
+        return {
+            "ok": True, "ya_existe": True, "id": _ex["id"], "nombre": _ex["nombre"],
+            "url_crm": _ex["url_crm"],
+            "mensaje": f"La cuenta '{_ex['nombre']}' YA EXISTE en 1CRM (coincidencia por {_ex['por']}). "
+                       f"No la dupliqué. Usa este cuenta_id para el contacto/oportunidad.",
+        }
     payload: dict = {"name": nombre, "account_type": tipo}
     if email:         payload["email1"] = email
     if telefono:      payload["phone_office"] = telefono
@@ -802,6 +842,22 @@ def tool_crear_contacto_crm(
     """
     if not ONECRM_BASE:
         return {"error": "1CRM no configurado"}
+    # DEDUPE: si ya existe un contacto con ese correo, no duplicar — devolver el existente.
+    if email:
+        try:
+            data = _onecrm_get("data/Contact", {"filter_text": email, "max_num": 20})
+            for r in (data.get("records", []) or []):
+                if email.lower() in ((r.get("email1", "") or "").lower(), (r.get("email2", "") or "").lower()):
+                    rid = r.get("id")
+                    return {
+                        "ok": True, "ya_existe": True, "id": rid,
+                        "nombre": f"{r.get('first_name','')} {r.get('last_name','')}".strip(),
+                        "cuenta_id": r.get("primary_account_id", "") or cuenta_id,
+                        "url_crm": f"{ONECRM_BASE}/index.php?module=Contacts&action=DetailView&record={rid}",
+                        "mensaje": "El contacto con ese correo YA EXISTE — no lo dupliqué.",
+                    }
+        except Exception as e:
+            log.warning(f"dedupe contacto falló: {e}")
     payload: dict = {"first_name": nombre, "last_name": apellido or nombre}
     if cuenta_id:    payload["primary_account_id"] = cuenta_id
     if email:        payload["email1"] = email
@@ -2254,7 +2310,13 @@ Cuando el usuario pida "genera la oportunidad del correo", "arma la oportunidad 
        te los proporciona. Cualquiera de las dos completa la oportunidad.
 
 4. SI ESTÁN LOS 4 BLOQUES COMPLETOS (por el RFQ, o completados por el prospecto o por el usuario del chat) → \
-   coteja con el CRM (escanear_emails_ventas o buscar_clientes_crm por el correo/dominio del remitente):
+   COTEJA SIEMPRE con el CRM antes de decidir, para NO duplicar clientes: usa buscar_clientes_crm buscando \
+   por el CORREO del contacto Y por el NOMBRE DE LA EMPRESA (no solo el dominio). \
+   - Si encuentras la cuenta (por correo o por nombre) → YA ES CLIENTE: usa ESE cuenta_id (no crees otra). \
+   - Si hay una coincidencia PARCIAL o dudosa (nombre parecido pero no idéntico) → NO asumas: confírmalo con el \
+     usuario ("¿<empresa> es la misma que <cuenta encontrada> en el CRM?") antes de crear. \
+   - Nota: las tools crear_cuenta_crm/crear_contacto_crm ya tienen protección — si el cliente/contacto ya existe \
+     devuelven "ya_existe": true con su id; eso NO es error, usa ese id para ligar la oportunidad.
 
    4a. YA ES CLIENTE (la cuenta existe en CRM): termina con [DECISION: ¿Creo la oportunidad para <cuenta>?]. \
        Tras el "Sí": crea la oportunidad con crear_oportunidad_crm — pon en descripcion el detalle "RFQ: <part-numbers> | Qty: <cantidades>" \
