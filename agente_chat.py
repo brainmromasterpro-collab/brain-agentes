@@ -2262,7 +2262,16 @@ Cuando el usuario pida "genera la oportunidad del correo", "arma la oportunidad 
    - Dirección de envío.
    NOTA: el WhatsApp NO es obligatorio — si viene se guarda (phone_mobile), pero su ausencia NO bloquea la creación.
 
-3. SI FALTA CUALQUIER BLOQUE → NO crees nada. Haz estas 3 cosas, en orden:
+2.5. FIRMA DEL CORREO (obligatorio revisarla): los correos suelen traer una FIRMA al final con datos valiosos: \
+   nombre completo, cargo, EMPRESA, TELÉFONO, DIRECCIÓN, sitio web, correo corporativo. EXTRÁELOS SIEMPRE y úsalos: \
+   - Para COTEJAR con el CRM: busca con buscar_clientes_crm por el NOMBRE DE LA EMPRESA y por el TELÉFONO / correo \
+     corporativo de la firma — NO solo por el dominio del remitente (clave cuando el prospecto escribe desde un \
+     gmail/hotmail genérico: la firma revela la empresa real y ahí sí puede coincidir con una cuenta existente). \
+     Si coincide con una cuenta/contacto del CRM, ES cliente conocido → usa ese cuenta_id. \
+   - Para COMPLETAR los 5 datos obligatorios: la empresa, el nombre del contacto, la dirección de envío y el \
+     teléfono a menudo están EN LA FIRMA. Toma esos datos como válidos y complétalos con ellos antes de pedir nada.
+
+3. SI FALTA CUALQUIER BLOQUE (tras revisar cuerpo + firma + cotejo CRM) → NO crees nada. Haz estas 3 cosas, en orden:
 
    (a) AVISA al usuario del chat que la oportunidad está INCOMPLETA y enumera exactamente qué bloque(s) faltan. \
        Ejemplo: "⚠️ La oportunidad de <remitente/cuenta> está incompleta. Faltan: cantidad (Qty) y dirección de envío."
