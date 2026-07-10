@@ -750,12 +750,15 @@ def corregir_marca_modelo(marca: str, modelo: str, opciones: list[dict]) -> tupl
             "notas": (o.get("notas") or "")[:120],
         } for o in (opciones or [])[:5]]
         prompt = (
-            "La marca y el modelo/part number los escribió un prospecto y PUEDEN tener errores de dedo.\n"
-            f"Marca escrita: {marca}\nModelo / part number escrito: {modelo}\n\n"
+            "La MARCA que escribió un prospecto puede tener un error de dedo.\n"
+            f"Marca escrita: {marca}\nNúmero de parte / modelo: {modelo}\n\n"
             f"Resultados de la búsqueda de ese part number:\n{json.dumps(muestras, ensure_ascii=False)}\n\n"
-            "Con los resultados como fuente de verdad, devuelve la marca y el modelo/part number CORRECTOS "
-            "(ej: 'Lipper'→'Clipper', 'Feston'→'Festo'). Si los resultados NO dan evidencia clara, deja los "
-            "valores escritos tal cual — NO inventes. Responde SOLO JSON: {\"marca\":\"...\",\"modelo\":\"...\"}"
+            "Corrige la MARCA SOLO si es un TYPO EVIDENTE (la misma palabra mal escrita, diferencia de 1-2 "
+            "letras) Y los resultados/proveedores lo respaldan — ej: 'Lipper'→'Clipper', 'Feston'→'Festo'. "
+            "PROHIBIDO: NO infieras ni inventes una marca DISTINTA a partir del número de parte ni de tu "
+            "conocimiento general (ej: NO cambies 'Lipper' por 'Linemaster'). NUNCA cambies el número de parte. "
+            "Si no es un typo claro y respaldado por los resultados, deja la marca TAL CUAL. "
+            "Responde SOLO JSON: {\"marca\":\"...\",\"modelo\":\"" + str(modelo) + "\"}"
         )
         resp = claude.messages.create(
             model="claude-haiku-4-5-20251001", max_tokens=150, timeout=20,
@@ -766,7 +769,8 @@ def corregir_marca_modelo(marca: str, modelo: str, opciones: list[dict]) -> tupl
         m = _re.search(r'\{[\s\S]*\}', txt)
         if m:
             d = json.loads(m.group(0))
-            return (str(d.get("marca") or marca).strip(), str(d.get("modelo") or modelo).strip())
+            # El número de parte NO se cambia nunca (solo la marca puede corregirse por typo).
+            return (str(d.get("marca") or marca).strip(), modelo)
     except Exception as e:
         log.warning(f"corregir_marca_modelo falló: {e}")
     return marca, modelo
@@ -860,6 +864,15 @@ C. PRECIOS — usa ÚNICAMENTE el valor del campo "precio_orig".
 
 D. Si hay pocos resultados de calidad, devuelve menos de 5. Prefiere 2 resultados reales
    a 5 resultados donde los últimos 3 sean inventados o de baja calidad.
+
+E. CORRESPONDENCIA (CRÍTICO) — cada resultado que incluyas DEBE ser del MISMO producto buscado:
+   el número de parte / modelo del resultado tiene que COINCIDIR con "{modelo}". Se tolera SOLO un
+   error de dedo evidente en la MARCA (ej. "Lipper"→"Clipper"), NUNCA en el número de parte.
+   - Si un resultado es de un producto DIFERENTE (el número de parte no coincide con "{modelo}"),
+     EXCLÚYELO.
+   - Si NINGÚN resultado corresponde al número de parte "{modelo}", devuelve un array VACÍO [].
+     ES MEJOR "no encontrado" QUE UN PRODUCTO EQUIVOCADO. NO adivines, NO fuerces coincidencias,
+     NO completes con lo más parecido.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Tu tarea:
