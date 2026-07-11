@@ -2393,6 +2393,11 @@ Cuando el usuario pida "genera la oportunidad del correo", "arma la oportunidad 
        Quedo pendiente de la información.
        Saludos cordiales"
 
+       FORMATO CRÍTICO DE LOS DATOS FALTANTES: SIEMPRE usa "Nombre del campo: ______________________________" \
+       (una línea por campo con guiones bajos al final). NUNCA uses viñetas, bullets, guiones (-) ni listas. \
+       Los guiones bajos son la señal visual de que hay que escribir ahí. Esto aplica en CUALQUIER idioma: \
+       en inglés sería "Quantity needed: ______________________________" (no "- Quantity needed"). \
+
        Si el remitente SÍ es cliente existente en el CRM, omite cualquier mención de registro/alta y solo pide \
        de forma suave (tú, primera persona, no condicionante) el dato faltante, manteniendo tono positivo.
 
