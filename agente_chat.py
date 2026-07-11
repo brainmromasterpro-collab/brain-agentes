@@ -2786,6 +2786,16 @@ def run_chat(messages: list[dict], stream_id: str, system_prompt: str = SYSTEM_P
         if response.stop_reason == "tool_use":
             current_messages.append({"role": "assistant", "content": response.content})
 
+            # Si el agente escribió [DECISION] en esta misma respuesta, NO ejecutar
+            # tools de escritura en el mismo turno — el [DECISION] debe esperar aprobación.
+            _WRITE_TOOLS = {"crear_oportunidad_crm", "crear_cuenta_crm", "crear_contacto_crm",
+                            "enviar_email_gmail", "crear_rfqs_desde_texto",
+                            "publicar_producto_link", "publicar_productos_desde_links"}
+            _response_text = " ".join(
+                b.text for b in response.content if getattr(b, "type", "") == "text"
+            )
+            _has_pending_decision = "[DECISION" in _response_text
+
             tool_results = []
             for block in response.content:
                 if block.type != "tool_use":
@@ -2795,6 +2805,16 @@ def run_chat(messages: list[dict], stream_id: str, system_prompt: str = SYSTEM_P
                 tool_input = block.input
                 tools_used.append(tool_name)
                 log.info(f"Tool: {tool_name}({json.dumps(tool_input)[:120]})")
+
+                # Gate: bloquear tools de escritura si hay un [DECISION] pendiente en esta respuesta
+                if _has_pending_decision and tool_name in _WRITE_TOOLS:
+                    log.warning(f"[GATE] Tool '{tool_name}' bloqueada — hay [DECISION] pendiente en este turno")
+                    tool_results.append({
+                        "type":        "tool_result",
+                        "tool_use_id": block.id,
+                        "content":     json.dumps({"error": "Acción bloqueada: hay una solicitud de aprobación [DECISION] pendiente en este turno. Espera la respuesta del usuario antes de ejecutar esta acción."}, ensure_ascii=False),
+                    })
+                    continue
 
                 # Inyectar stream_id automáticamente en tools que lo necesitan
                 if tool_name in ("crear_rfqs_desde_texto", "notificar_sistema", "publicar_producto_link", "publicar_productos_desde_links", "crear_cuenta_crm", "crear_contacto_crm", "crear_oportunidad_crm") and not tool_input.get("stream_id"):
