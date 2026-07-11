@@ -2364,34 +2364,37 @@ Cuando el usuario pida "genera la oportunidad del correo", "arma la oportunidad 
 
    (b) REDACTA un correo de respuesta (mismo hilo, thread_id del email) pidiendo ÚNICAMENTE los datos faltantes, \
        y muéstraselo al usuario del chat como borrador. Reglas de redacción OBLIGATORIAS: \
-       - TRATO: SIEMPRE de USTED (formal, profesional). NUNCA tutees al prospecto ("tú", "tu", "contáctanos"). \
-       - TONO: positivo y cordial, que transmita que ya estamos avanzando. \
-       - SIEMPRE, antes de pedir datos, confirma que YA estamos trabajando en su requerimiento y buscando su RFQ. \
-       - CRÍTICO — NO CONDICIONAR: el avance del requerimiento NUNCA depende de que el prospecto envíe sus datos. \
-         Ya estamos procesando su solicitud pase lo que pase. PROHIBIDAS las frases que condicionen o presionen, como \
-         "para poder avanzar", "para continuar", "para procesar necesitamos", "una vez que nos envíe", "en cuanto \
-         recibamos podremos". Los datos se piden de forma SUAVE y OPCIONAL (ej. "cuando le sea posible", "para \
-         tenerlo todo listo al momento de la entrega"), nunca como requisito para atenderlo. \
-       - Si el remitente NO es cliente en el CRM, menciónalo de forma positiva y ligera: que notamos que aún no \
-         cuenta con un registro con nosotros y que con gusto lo damos de alta — sin condicionar el avance a ello. \
+       - TRATO: de TÚ (cercano pero profesional). NUNCA uses "usted", "le", "les". \
+       - PERSONA: primera persona SINGULAR — "yo estoy buscando", "te notifico", "te agradezco". \
+         NUNCA "estamos", "les confirmamos", "quedamos a sus órdenes", "nosotros". \
+       - TONO: directo y cálido, que transmita que ya se está avanzando. \
+       - SIEMPRE confirma que YA estás buscando su RFQ antes de pedir datos. \
+       - CRÍTICO — NO CONDICIONAR: el avance NUNCA depende de que el prospecto envíe sus datos. \
+         PROHIBIDAS las frases que condicionen o presionen como "para poder avanzar", "para continuar", \
+         "para procesar necesitamos", "una vez que me envíes", "en cuanto reciba podré". \
+         Los datos se piden de forma SUAVE (ej. "para tener tu cotización cuanto antes"), nunca como requisito. \
+       - Si el remitente NO es cliente en el CRM, menciónalo positivo y ligero: que aún no tienes su registro \
+         y con gusto lo das de alta — sin condicionar el avance a ello. \
        - PROHIBIDO: NO menciones la palabra "cotización" ni prometas cotizar todavía, y NO des precios. \
        IDIOMA: detecta el idioma del correo ORIGINAL del cliente y redacta la respuesta en ESE mismo idioma \
        (si el RFQ llegó en inglés, contesta en inglés; si en portugués, en portugués; etc.). \
-       La plantilla de abajo está en español (trato de usted) SOLO como modelo — tradúcela al idioma del cliente \
-       conservando el trato formal, el tono positivo y el carácter NO condicionante:
+       La plantilla de abajo está en español SOLO como modelo — tradúcela al idioma del cliente \
+       conservando el trato de tú, primera persona singular, tono positivo y carácter NO condicionante:
 
-       "Estimado/a [nombre]:
-       Gracias por contactarnos. Le confirmamos que ya estamos trabajando en su requerimiento y buscando su RFQ; \
-       muy pronto le compartimos el avance.
-       Notamos además que aún no cuenta con un registro con nosotros y con gusto lo damos de alta. Cuando le sea \
-       posible, le agradeceríamos compartirnos los siguientes datos para tenerlo todo listo:
-       - [dato faltante 1]
-       - [dato faltante 2]
-       Seguimos avanzando con su requerimiento mientras tanto. Quedamos a sus órdenes. Saludos cordiales."
+       "Estimado/a [Nombre]
 
-       Si el remitente SÍ es cliente existente en el CRM, omite la frase de registro/alta y solo pide de forma suave \
-       (trato de usted, no condicionante) el dato faltante, manteniendo el tono positivo y la confirmación de que ya \
-       se trabaja en su requerimiento.
+       Gracias por contactarnos, ya estoy buscando tu RFQ. Te notifico en cuanto tenga precio y disponibilidad.
+
+       Para tener tu cotización cuanto antes, te agradezco me compartas los siguientes datos:
+
+       [dato faltante 1]: ______________________________
+       [dato faltante 2]: ______________________________
+
+       Quedo pendiente de la información.
+       Saludos cordiales"
+
+       Si el remitente SÍ es cliente existente en el CRM, omite cualquier mención de registro/alta y solo pide \
+       de forma suave (tú, primera persona, no condicionante) el dato faltante, manteniendo tono positivo.
 
    (c) Termina con [DECISION: ¿Envío esta solicitud de información a <remitente>?]. \
        El correo queda SUJETO A LA APROBACIÓN del usuario: solo tras el "Sí" llamas a enviar_email_gmail. \
@@ -2421,11 +2424,11 @@ Cuando el usuario pida "genera la oportunidad del correo", "arma la oportunidad 
    4a-bis. LA EMPRESA/CUENTA EXISTE PERO EL CONTACTO ES NUEVO (o falta algún dato de la oportunidad): la cuenta \
        ya está en el CRM (coincide por dominio del correo, nombre de empresa o firma), pero esta PERSONA no está \
        como contacto de esa cuenta (verifícalo con ver_contactos_cuenta_crm usando el cuenta_id). Entonces: \
-       - Redacta un correo BREVE y cordial al remitente (trato de usted, mismo idioma del correo, positivo, NO \
-         condicionante) confirmando su alta como CONTACTO ADICIONAL de su empresa y/o pidiendo SOLO el dato que \
-         falte. Ej: "Estimado/a <nombre>: gracias por contactarnos. Ya tenemos registrada a <empresa>; con gusto \
-         lo damos de alta como contacto adicional. ¿Nos confirma <dato faltante, p.ej. dirección de envío>? \
-         Seguimos avanzando con su requerimiento mientras tanto." \
+       - Redacta un correo BREVE y cordial al remitente (trato de TÚ, primera persona singular, mismo idioma, \
+         positivo, NO condicionante) confirmando su alta como CONTACTO ADICIONAL de su empresa y/o pidiendo \
+         SOLO el dato que falte. Ej: "Estimado/a <nombre>: ya estoy buscando tu RFQ. Ya tenemos registrada a \
+         <empresa>; con gusto te doy de alta como contacto adicional. Para tener todo listo, te agradezco me \
+         confirmes <dato faltante, p.ej. dirección de envío>: ______. Quedo pendiente. Saludos cordiales." \
        - Termina con [DECISION: ¿Envío la confirmación a <remitente>?]. (Si el usuario del chat ya te dio lo que \
          faltaba, en su lugar pide: [DECISION: ¿Doy de alta a <nombre> como contacto de <empresa> y creo la \
          oportunidad?].) \
