@@ -1503,20 +1503,39 @@ def _rehost_imagen(imagen_url: str, part_number: str = "") -> str:
         return imagen_url
 
 
-def _ya_publicado_reciente(part_number: str, clean_stream, minutos: int = 30) -> bool:
-    """True si el mismo part_number ya se publicó (o está publicándose) en este stream hace poco.
-    Guardia anti-doble-publicación: evita republicar por un mensaje suelto ('muy bien', 'ok', etc.)."""
+_EN_CURSO_MIN = 5  # una publicación real tarda <1-2 min; más allá = job atorado, no "publicado"
+
+
+def _estado_publicacion_reciente(part_number: str, clean_stream, minutos: int = 30) -> str:
+    """Guardia anti-doble-publicación, PERO sin mentir. Devuelve:
+      'publicado' → ya se publicó DE VERDAD en este stream hace poco (bloquea).
+      'en_curso'  → se está publicando AHORITA (job vivo, < _EN_CURSO_MIN) (bloquea).
+      ''          → libre. Incluye el caso de un rfq ATORADO en 'publicando' (el worker nunca
+                    tomó el job): eso NO se reporta como publicado y SÍ se deja reintentar.
+    """
     if not part_number or not clean_stream:
-        return False
+        return ""
     try:
         corte = (datetime.now(timezone.utc) - timedelta(minutes=minutos)).isoformat()
-        r = (supabase.table("rfqs").select("id")
+        r = (supabase.table("rfqs").select("id,estado,created_at")
              .eq("stream_id", clean_stream).eq("modelo", part_number)
              .in_("estado", ["publicando", "publicado"])
-             .gte("created_at", corte).limit(1).execute())
-        return bool(r.data)
+             .gte("created_at", corte).order("created_at", desc=True).limit(1).execute())
+        if not r.data:
+            return ""
+        row = r.data[0]
+        if (row.get("estado") or "") == "publicado":
+            return "publicado"
+        # 'publicando': solo cuenta si es reciente; si lleva rato, el job se atoró → permitir reintento.
+        try:
+            creado = datetime.fromisoformat(str(row.get("created_at")).replace("Z", "+00:00"))
+            if (datetime.now(timezone.utc) - creado) < timedelta(minutes=_EN_CURSO_MIN):
+                return "en_curso"
+        except Exception:
+            pass
+        return ""
     except Exception:
-        return False
+        return ""
 
 
 def _publicar_producto_uno(
@@ -1600,9 +1619,13 @@ def tool_publicar_producto_link(
     para definirlo después. Reutiliza el pipeline del publicador y su widget producto_publicado."""
     try:
         clean_stream = stream_id if (stream_id and stream_id not in ("None", "")) else None
-        if _ya_publicado_reciente(part_number, clean_stream):
-            return {"error": f"El producto {part_number or nombre} YA fue publicado en este stream hace poco. "
+        _est = _estado_publicacion_reciente(part_number, clean_stream)
+        if _est == "publicado":
+            return {"error": f"El producto {part_number or nombre} YA está publicado en este stream (verificado en la base). "
                              f"No lo republico. Si de verdad quieres otra copia, dímelo explícitamente."}
+        if _est == "en_curso":
+            return {"error": f"El producto {part_number or nombre} se está publicando en este momento. "
+                             f"Espera a que termine — todavía NO está en el CRM."}
         bulk_id = str(uuid.uuid4())  # bulk de 1 producto → dispara el BulkWidget (widget "Ver en CRM")
         res = _publicar_producto_uno(bulk_id, clean_stream, nombre, part_number, marca,
                                      descripcion, caracteristicas, precio_costo, imagen_url, url_origen)
@@ -1629,8 +1652,10 @@ def tool_publicar_productos_desde_links(productos: list | None = None, stream_id
         for p in productos:
             if not isinstance(p, dict):
                 continue
-            if _ya_publicado_reciente(p.get("part_number", ""), clean_stream):
-                errores.append(f"{p.get('part_number') or p.get('nombre') or '?'}: ya publicado recientemente, omitido")
+            _est = _estado_publicacion_reciente(p.get("part_number", ""), clean_stream)
+            if _est:
+                _que = "ya está publicado" if _est == "publicado" else "se está publicando en este momento"
+                errores.append(f"{p.get('part_number') or p.get('nombre') or '?'}: {_que}, omitido")
                 continue
             try:
                 res = _publicar_producto_uno(
