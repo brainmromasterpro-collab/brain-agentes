@@ -23,6 +23,25 @@ import logging
 log = logging.getLogger("main")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
+def _latido(activos: list):
+    """LATIDO del servicio de workers → resource_status(workers/heartbeat) cada 60s.
+
+    Por qué existe: Railway DUERME el servicio cuando no se usa (p.ej. varios días sin actividad).
+    Dormido, los jobs se quedan en la cola sin procesarse y la falla es SILENCIOSA. El monitor no
+    sirve para avisarlo porque vive en este mismo servicio y se duerme también. Con este latido, el
+    chat y el frontend (que sí están despiertos cuando el usuario trabaja) detectan que los workers
+    no están y avisan ANTES de encolar trabajo.
+    """
+    import time
+    import agente_monitor
+    while True:
+        try:
+            agente_monitor.upsert("workers", "heartbeat", valor_texto=",".join(activos), estado="ok")
+        except Exception as e:
+            log.warning(f"latido: {e}")
+        time.sleep(60)
+
+
 if __name__ == "__main__":
     import agente_buscador
     import agente_imagen
@@ -55,6 +74,11 @@ if __name__ == "__main__":
         seleccionados.append("lector")
 
     log.info(f"Iniciando Brain MRO Master Pro — agentes: {seleccionados}")
+
+    # Solo el servicio que corre workers reales late (el servicio de chat no debe reportar workers vivos).
+    if any(a in seleccionados for a in ("buscador", "imagen", "publicador")):
+        threading.Thread(target=_latido, args=(seleccionados,), name="latido", daemon=True).start()
+        log.info("Latido de workers activo → resource_status(workers/heartbeat) cada 60s")
 
     hilos = []
     for nombre in seleccionados:

@@ -1503,6 +1503,46 @@ def _rehost_imagen(imagen_url: str, part_number: str = "") -> str:
         return imagen_url
 
 
+_HEARTBEAT_MAX_MIN = 3  # el servicio de workers late cada 60s; 3 min sin latido = dormido/caído
+
+
+def _workers_despiertos() -> tuple[bool, str]:
+    """(despiertos, cuánto llevan dormidos). Lee el latido que escribe el servicio de workers.
+
+    Railway duerme el servicio cuando no se usa (días sin actividad). Dormido, los jobs se encolan
+    pero NADIE los procesa: falla silenciosa. Esto permite avisarle al usuario ANTES de trabajar.
+    Ante cualquier duda devuelve True (no estorbar el flujo por un problema de lectura).
+    """
+    try:
+        r = (supabase.table("resource_status").select("actualizado_en")
+             .eq("servicio", "workers").eq("metrica", "heartbeat").limit(1).execute())
+        if not r.data:
+            return True, ""  # nunca ha latido (función nueva / tabla vacía) → NO alarmar en falso
+        ts = datetime.fromisoformat(str(r.data[0]["actualizado_en"]).replace("Z", "+00:00"))
+        delta = datetime.now(timezone.utc) - ts
+        if delta < timedelta(minutes=_HEARTBEAT_MAX_MIN):
+            return True, ""
+        mins = int(delta.total_seconds() // 60)
+        if mins < 120:
+            return False, f"{mins} min"
+        horas = mins // 60
+        return False, (f"{horas} h" if horas < 48 else f"{horas // 24} días")
+    except Exception:
+        return True, ""
+
+
+def _aviso_workers_dormidos(detalle: str, clean_stream=None) -> str:
+    """Aviso determinista (no depende de que el modelo se acuerde) de que la cola no se va a mover."""
+    txt = (f"Los workers llevan {detalle} sin dar señales — Railway los duerme cuando el servicio no se usa. "
+           f"El trabajo QUEDA ENCOLADO pero NO se va a procesar hasta que reactives el servicio en Railway.")
+    try:
+        tool_notificar_sistema("⚠️ Workers dormidos — la cola no se va a procesar", txt,
+                               tipo="sistema", stream_id=str(clean_stream or ""))
+    except Exception:
+        pass
+    return txt
+
+
 _EN_CURSO_MIN = 5  # una publicación real tarda <1-2 min; más allá = job atorado, no "publicado"
 
 
@@ -1631,7 +1671,12 @@ def tool_publicar_producto_link(
                                      descripcion, caracteristicas, precio_costo, imagen_url, url_origen)
         _crear_notificacion_bulk(clean_stream, bulk_id, [nombre], res["rfq_id"])
         log.info(f"Job publicador (link) creado: {res['job_id']} para '{nombre}'")
-        return {"ok": True, "rfq_id": res["rfq_id"], "job_publicador": res["job_id"], "nombre": nombre}
+        out = {"ok": True, "rfq_id": res["rfq_id"], "job_publicador": res["job_id"], "nombre": nombre}
+        _vivos, _det = _workers_despiertos()
+        if not _vivos:
+            out["AVISO_CRITICO"] = (f"{_aviso_workers_dormidos(_det, clean_stream)} "
+                                    f"DÍSELO AL USUARIO de forma clara y visible: el producto NO está publicado todavía.")
+        return out
     except Exception as e:
         return {"error": str(e)}
 
@@ -1672,6 +1717,10 @@ def tool_publicar_productos_desde_links(productos: list | None = None, stream_id
         if ok == 0:
             return {"error": "no se pudo publicar ninguno", "detalles": errores}
         _crear_notificacion_bulk(clean_stream, bulk_id, nombres, first_rfq)
+        _vivos, _det = _workers_despiertos()
+        if not _vivos:
+            errores.append(f"AVISO_CRITICO: {_aviso_workers_dormidos(_det, clean_stream)} "
+                           f"Ninguno de los {ok} productos está publicado todavía — DÍSELO AL USUARIO.")
         log.info(f"Bulk link: {ok}/{len(productos)} publicados, bulk_id={bulk_id}, errores={len(errores)}")
         return {"ok": True, "publicados": ok, "total": len(productos), "bulk_id": bulk_id, "errores": errores}
     except Exception as e:
@@ -1791,6 +1840,10 @@ def tool_crear_rfqs_desde_texto(
     }
     if errores:
         result["errores"] = errores
+    _vivos, _det = _workers_despiertos()
+    if not _vivos and creados:
+        result["AVISO_CRITICO"] = (f"{_aviso_workers_dormidos(_det, clean_stream_id)} "
+                                   f"Las búsquedas NO van a arrancar — DÍSELO AL USUARIO antes de que espere en vano.")
     return result
 
 
