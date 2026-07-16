@@ -23,6 +23,52 @@ import logging
 log = logging.getLogger("main")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
+def _servidor_salud(activos: list):
+    """Servidor HTTP mínimo del servicio de workers. Sirve para DESPERTARLO.
+
+    Railway duerme el servicio cuando no se usa y solo lo revive el tráfico HTTP entrante. Un worker
+    que no escucha ningún puerto NO puede despertarse solo — por eso la cola se quedaba muerta días.
+    Con este endpoint, la app le hace ping al iniciar sesión y el sistema revive solo: el cliente
+    JAMÁS tiene que entrar a Railway.
+
+    GET /  o  /health → 200 {"ok":true,"agentes":[...]}
+    """
+    import json
+    from datetime import datetime, timezone
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps({
+                "ok": True,
+                "servicio": "workers",
+                "agentes": activos,
+                "ts": datetime.now(timezone.utc).isoformat(),
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")  # la app lo llama desde el browser
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass  # no ensuciar los logs con cada ping
+
+    port = int(os.environ.get("PORT", "8080"))
+    try:
+        log.info(f"Servidor de salud escuchando en :{port} (ping para despertar el servicio)")
+        HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    except Exception as e:
+        log.error(f"servidor de salud: {e}")
+
+
 def _latido(activos: list):
     """LATIDO del servicio de workers → resource_status(workers/heartbeat) cada 60s.
 
@@ -79,6 +125,8 @@ if __name__ == "__main__":
     if any(a in seleccionados for a in ("buscador", "imagen", "publicador")):
         threading.Thread(target=_latido, args=(seleccionados,), name="latido", daemon=True).start()
         log.info("Latido de workers activo → resource_status(workers/heartbeat) cada 60s")
+        # Oídos HTTP: sin esto Railway no puede despertar el servicio con un ping.
+        threading.Thread(target=_servidor_salud, args=(seleccionados,), name="salud", daemon=True).start()
 
     hilos = []
     for nombre in seleccionados:
