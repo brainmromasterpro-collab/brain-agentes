@@ -137,6 +137,23 @@ def _vigencia(quote_id: str) -> dict:
 # ─────────────────────────────────────────────────────────────
 # 3. COTEJO
 # ─────────────────────────────────────────────────────────────
+def _match_lineas(pc: str, indice: dict) -> tuple[list, bool]:
+    """Busca las líneas que corresponden a un part number (compacto). Devuelve (candidatos, parcial).
+    Primero match EXACTO; si falla, match PARCIAL por prefijo (>=5 chars) para tolerar part numbers
+    truncados/variantes por la extracción (p.ej. '48625' vs '48625RO222'). El parcial se marca para
+    que el humano lo confirme — nunca se da por bueno en silencio."""
+    if pc in indice:
+        return indice[pc], False
+    if len(pc) >= 5:
+        hits: list = []
+        for k, v in indice.items():
+            if len(k) >= 5 and (k.startswith(pc) or pc.startswith(k)):
+                hits.extend(v)
+        if hits:
+            return hits, True
+    return [], False
+
+
 def _precio_coincide(po_precio: float | None, cot_precio: float | None) -> bool:
     if po_precio is None or cot_precio is None:
         return True  # sin precio en el PO → no se marca discrepancia de precio
@@ -177,7 +194,7 @@ def cotejar(po: dict) -> dict:
         pc = _compact(pn)
         po_precio = _num(it.get("precio_unitario"))
         po_qty = _num(it.get("cantidad"))
-        candidatos = indice.get(pc, [])
+        candidatos, parcial = _match_lineas(pc, indice)
 
         if not candidatos:
             items_out.append({
@@ -199,14 +216,21 @@ def cotejar(po: dict) -> dict:
         estado = "ok" if precio_ok else "precio_distinto"
         items_out.append({
             "part_number": pn,
+            "part_number_cotizacion": mejor_ln["part_number"],  # el número tal cual está en la cotización
             "cantidad_po": po_qty,                        # la cantidad del PO manda
             "cantidad_cotizacion": mejor_ln["quantity"],
             "precio_po": po_precio,
             "precio_cotizacion": mejor_ln["unit_price"],
             "estado": estado,
+            "match_parcial": parcial,
             "cotizacion": {"id": mejor_q["id"], "nombre": mejor_q["nombre"]},
             "en_varias": len({q["id"] for q, _ in candidatos}) > 1,
         })
+        if parcial:
+            discrepancias.append(
+                f"«{pn}»: coincidencia PARCIAL de número de parte con «{mejor_ln['part_number']}» "
+                f"(cot. {mejor_q['nombre'][:30]}) — verifica que sea el mismo producto."
+            )
         if estado == "precio_distinto":
             discrepancias.append(
                 f"«{pn}»: PO ${po_precio} vs cotización ${mejor_ln['unit_price']} "
@@ -233,6 +257,7 @@ def cotejar(po: dict) -> dict:
     encontrados = sum(1 for i in items_out if i["estado"] != "no_encontrado")
     todo_ok = (encontrados == len(items_out) and len(items_out) > 0
                and all(i["estado"] == "ok" for i in items_out)
+               and not any(i.get("match_parcial") for i in items_out)
                and any(c["vigente"] for c in candidatas))
 
     return {

@@ -2965,6 +2965,47 @@ def _build_image_block(url: str):
 # ─────────────────────────────────────────────────────────────
 # PROCESADOR DE MENSAJES
 # ─────────────────────────────────────────────────────────────
+def _procesar_orden_compra(stream_id: str, file_url: str, nombre: str = "orden", mime: str = "") -> None:
+    """PIPELINE DE ORDEN DE COMPRA (Fase 1, stream 'ordenes'): lee el PO, lo coteja contra las
+    cotizaciones del cliente y emite el widget [COTEJO_PO]. NO escribe al CRM. Determinista
+    (sin round-trip al modelo): más barato y robusto. Import perezoso para no romper el chat si
+    aún falta alguna dependencia de parsing en el entorno."""
+    try:
+        import orden_compra
+        import sales_order
+    except Exception as e:
+        log.error(f"orden_compra/sales_order no disponible: {e}")
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": f"No pude procesar la orden de compra (módulo no disponible: {e}).",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+
+    _log_stream(stream_id, f"Leyendo orden de compra: {nombre}", "info")
+    po = orden_compra.leer_po(url=file_url, nombre=nombre, mime=mime)
+    if po.get("error"):
+        _log_stream(stream_id, f"No se pudo leer el PO: {po['error']}", "error")
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": f"No pude leer la orden de compra «{nombre}»: {po['error']}. "
+                       f"Verifica que el archivo sea legible (PDF/Excel/Word).",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+
+    _log_stream(stream_id, f"Cotejando {len(po.get('items', []))} producto(s) contra cotizaciones…", "info")
+    cotejo = sales_order.cotejar(po)
+    payload = {"po": po, "cotejo": cotejo}
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[COTEJO_PO]" + json.dumps(payload, ensure_ascii=False),
+        "procesado": True, "metadata": {"cotejo_po": True},
+    }).execute()
+    _log_stream(stream_id, cotejo.get("resumen", "Cotejo listo"), "ok")
+    log.info(f"Cotejo PO emitido | {cotejo.get('resumen','')}")
+
+
 def procesar_mensaje(msg: dict) -> None:
     msg_id    = msg["id"]
     stream_id = msg.get("stream_id", "")
@@ -2986,6 +3027,18 @@ def procesar_mensaje(msg: dict) -> None:
 
     # Marcar como procesado
     supabase.table("mensajes").update({"procesado": True}).eq("id", msg_id).execute()
+
+    # PIPELINE DE ORDEN DE COMPRA: si es un stream 'ordenes' y llega un archivo (PO), léelo y
+    # coteja contra las cotizaciones del cliente — sin pasar por el modelo. Emite el widget y termina.
+    try:
+        _md0 = msg.get("metadata") or {}
+        _po_url = (_md0.get("file_url") or _md0.get("po_url")) if isinstance(_md0, dict) else None
+    except Exception:
+        _po_url = None
+    if _tipo_stream in ("ordenes", "sales_order") and _po_url:
+        _procesar_orden_compra(stream_id, _po_url,
+                               (_md0.get("file_name") or "orden"), _md0.get("file_mime", ""))
+        return
 
     # Los triggers [SISTEMA:...] los maneja el widget del frontend — no necesitan respuesta de Claude
     if contenido.startswith("[SISTEMA:"):
