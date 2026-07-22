@@ -1433,6 +1433,27 @@ def tool_extraer_producto_de_link(url: str) -> dict:
     return _extraer_producto_link(url)
 
 
+def _ajustar_imagen_500(content: bytes) -> bytes:
+    """Ajusta cualquier imagen a un lienzo cuadrado de 500x500 px sobre fondo blanco (sin deformar
+    el aspect ratio) — tamaño estándar para las fotos de producto que se suben a 1CRM. Devuelve
+    siempre PNG."""
+    from PIL import Image
+    import io as _io
+    im = Image.open(_io.BytesIO(content))
+    if im.mode in ("RGBA", "LA", "P"):
+        im = im.convert("RGBA")
+        bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
+        im = Image.alpha_composite(bg, im).convert("RGB")
+    else:
+        im = im.convert("RGB")
+    im.thumbnail((500, 500), Image.LANCZOS)
+    lienzo = Image.new("RGB", (500, 500), (255, 255, 255))
+    lienzo.paste(im, ((500 - im.width) // 2, (500 - im.height) // 2))
+    buf = _io.BytesIO()
+    lienzo.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def tool_extraer_ficha_pdf(url: str) -> dict:
     """Extrae el/los producto(s) de una ficha técnica (PDF/Excel/Word) por URL: nombre, marca,
     part number, descripción y características técnicas de cada variante/SKU encontrado. Si el PDF
@@ -1446,28 +1467,19 @@ def tool_extraer_ficha_pdf(url: str) -> dict:
 
     datos = ficha_tecnica.leer_ficha(url=url)
     b64  = datos.pop("imagen_b64", "")
-    ext  = datos.pop("imagen_ext", "")
+    datos.pop("imagen_ext", "")
     if b64:
         try:
             import base64 as _b64mod
-            content = _b64mod.b64decode(b64)
-            ct = "image/png" if ext == "png" else "image/jpeg"
-            if ext not in ("png", "jpeg", "jpg"):
-                # Formatos raros embebidos (jp2/tiff/etc.) → normalizar a PNG con Pillow.
-                from PIL import Image
-                import io as _io
-                im = Image.open(_io.BytesIO(content)).convert("RGB")
-                buf = _io.BytesIO()
-                im.save(buf, format="PNG")
-                content, ct, ext = buf.getvalue(), "image/png", "png"
-            path = f"ficha/{uuid.uuid4().hex[:10]}.{'jpg' if ext == 'jpeg' else ext}"
+            content = _ajustar_imagen_500(_b64mod.b64decode(b64))
+            path = f"ficha/{uuid.uuid4().hex[:10]}.png"
             supabase.storage.from_("product-images").upload(
-                path=path, file=content, file_options={"content-type": ct, "upsert": "true"},
+                path=path, file=content, file_options={"content-type": "image/png", "upsert": "true"},
             )
             img_url = supabase.storage.from_("product-images").get_public_url(path)
             for p in datos.get("productos", []):
                 p["imagen_url"] = img_url
-            log.info(f"Imagen extraída del PDF y re-hospedada: {img_url[:70]}")
+            log.info(f"Imagen extraída del PDF, ajustada a 500x500 y re-hospedada: {img_url[:70]}")
         except Exception as e:
             log.warning(f"No se pudo subir la imagen extraída del PDF: {e}")
     return datos
@@ -1503,33 +1515,16 @@ def _rehost_imagen(imagen_url: str, part_number: str = "") -> str:
             r = _dl(True)  # bloqueado → proxy residencial
         if not _ok(r):
             return imagen_url
-        ct = r.headers.get("content-type", "image/jpeg").lower()
-        content = r.content
-        if "png" in ct:
-            ext = "png"
-        elif "jpeg" in ct or "jpg" in ct:
-            ext = "jpg"
-        else:
-            # 1CRM no acepta WebP/AVIF/etc (y el publicador los sube con extensión errónea →
-            # rechazo). Normalizar a PNG con Pillow para que la subida a 1CRM funcione.
-            try:
-                from PIL import Image
-                import io as _io
-                im = Image.open(_io.BytesIO(content))
-                if im.mode in ("RGBA", "LA", "P"):
-                    im = im.convert("RGBA")
-                    bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
-                    im = Image.alpha_composite(bg, im).convert("RGB")
-                else:
-                    im = im.convert("RGB")
-                buf = _io.BytesIO()
-                im.save(buf, format="PNG")
-                content = buf.getvalue()
-                ct, ext = "image/png", "png"
-                log.info(f"Imagen {r.headers.get('content-type','?')} convertida a PNG")
-            except Exception as _e_conv:
-                log.warning(f"No se pudo convertir imagen a PNG ({ct}): {_e_conv}")
-                ext = "jpg"
+        content_type = r.headers.get("content-type", "image/jpeg").lower()
+        try:
+            # Ajusta a 500x500 (tamaño estándar de foto de producto) y normaliza a PNG de paso
+            # (1CRM no acepta WebP/AVIF/etc y el publicador los subiría con extensión errónea).
+            content = _ajustar_imagen_500(r.content)
+            ct, ext = "image/png", "png"
+        except Exception as _e_conv:
+            log.warning(f"No se pudo ajustar la imagen a 500x500 ({content_type}): {_e_conv}")
+            content, ct = r.content, content_type
+            ext = "png" if "png" in content_type else "jpg"
         safe = (part_number or "producto").replace("/", "-").replace(" ", "_")
         path = f"link/{safe}_{str(uuid.uuid4())[:6]}.{ext}"
         supabase.storage.from_("product-images").upload(
