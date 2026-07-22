@@ -17,6 +17,7 @@ Hechos de la API 1CRM en que se apoya (verificados en vivo):
 import os
 import re
 import logging
+import unicodedata
 from datetime import date, datetime
 
 import httpx
@@ -42,9 +43,14 @@ def _crm_get(path: str, params: dict | None = None) -> dict:
         return {}
 
 
+def _sin_acentos(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKD", s or "") if not unicodedata.combining(c))
+
+
 def _norm(s: str) -> str:
-    """Normaliza para comparar nombres/partes: mayúsculas, espacios colapsados."""
-    return re.sub(r"\s+", " ", (s or "").strip()).upper()
+    """Normaliza para comparar nombres/partes: sin acentos, mayúsculas, espacios colapsados
+    (así 'México' == 'Mexico')."""
+    return re.sub(r"\s+", " ", _sin_acentos(s).strip()).upper()
 
 
 def _compact(s: str) -> str:
@@ -88,6 +94,18 @@ def buscar_cuenta(nombre: str) -> dict | None:
     }
 
 
+def cuenta_por_id(cuenta_id: str) -> dict | None:
+    """Trae una cuenta por id (para derivar el cliente desde la cotización referenciada)."""
+    if not cuenta_id:
+        return None
+    d = _crm_get(f"data/Account/{cuenta_id}")
+    rec = d.get("record", d)
+    if not rec.get("id"):
+        return None
+    return {"id": rec["id"], "nombre": rec.get("name", ""),
+            "url": f"{CRM_BASE}/index.php?module=Accounts&record={rec['id']}"}
+
+
 # ─────────────────────────────────────────────────────────────
 # 2. COTIZACIONES DEL CLIENTE (índice de líneas)
 # ─────────────────────────────────────────────────────────────
@@ -113,6 +131,31 @@ def cotizaciones_cliente(cuenta_id: str, limite: int = 40) -> list[dict]:
             })
         out.append({"id": q.get("id"), "nombre": q.get("name", ""), "lines": lines})
     return out
+
+
+def cotizacion_por_ref(ref: str) -> dict | None:
+    """Busca una cotización por su número/folio (p.ej. 'Q2026-0608-2042') citado en el PO.
+    Devuelve {id, nombre, lines[...], referenciada:True} o None. filter_text SÍ encuentra el folio."""
+    ref = (ref or "").strip()
+    if not ref or not CRM_BASE:
+        return None
+    data = _crm_get("data/Quote", {"filter_text": ref, "limit": 3})
+    recs = data.get("records", [])
+    if not recs:
+        return None
+    qid = recs[0].get("id")
+    full = _crm_get(f"data/Quote/{qid}")
+    rec = full.get("record", full)
+    lines = []
+    for li in (rec.get("line_items") or []):
+        pn = li.get("mfr_part_no") or ""
+        lines.append({
+            "part_number": pn, "part_compact": _compact(pn),
+            "unit_price": _num(li.get("unit_price")), "quantity": _num(li.get("quantity")),
+            "descripcion": li.get("name", ""),
+        })
+    return {"id": qid, "nombre": rec.get("name", ""), "lines": lines, "referenciada": True,
+            "cuenta_id": rec.get("billing_account_id") or ""}
 
 
 def _vigencia(quote_id: str) -> dict:
@@ -168,7 +211,13 @@ def cotejar(po: dict) -> dict:
     if po.get("error"):
         return {"error": f"el PO no se pudo leer: {po['error']}"}
 
+    # Cotización REFERENCIADA en el propio PO (cita/adjunta nuestro presupuesto Q2026-…): mejor pista
+    # de origen. La buscamos primero porque además define la cuenta cuando el nombre no matchea.
+    ref_q = cotizacion_por_ref(po.get("cotizacion_ref", ""))
+
     cuenta = buscar_cuenta(po.get("cliente", ""))
+    if not cuenta and ref_q and ref_q.get("cuenta_id"):
+        cuenta = cuenta_por_id(ref_q["cuenta_id"])  # la cotización citada define el cliente
     if not cuenta:
         return {
             "ok": False,
@@ -178,6 +227,15 @@ def cotejar(po: dict) -> dict:
         }
 
     quotes = cotizaciones_cliente(cuenta["id"])
+
+    # Priorizamos la referenciada, pero seguimos el proceso completo (verificamos productos/precios/
+    # vigencia igual). Si no está en la lista reciente del cliente, la agregamos.
+    ref_id = None
+    if ref_q:
+        ref_id = ref_q["id"]
+        if ref_id not in {q["id"] for q in quotes}:
+            quotes.insert(0, ref_q)
+
     # índice part_compact → lista de (quote, line)
     indice: dict[str, list[tuple[dict, dict]]] = {}
     for q in quotes:
@@ -237,22 +295,25 @@ def cotejar(po: dict) -> dict:
                 f"(cot. {mejor_q['nombre'][:30]})."
             )
 
-    # cotizaciones candidatas: las que cubren ≥1 item, ordenadas por cobertura desc
+    # cotizaciones candidatas: las que cubren ≥1 item (+ la referenciada aunque cubra 0),
+    # ordenadas: referenciada primero, luego por cobertura y vigencia.
     candidatas = []
     for q in quotes:
         cov = cobertura.get(q["id"], 0)
-        if cov <= 0:
+        es_ref = (q["id"] == ref_id)
+        if cov <= 0 and not es_ref:
             continue
         vig = _vigencia(q["id"])
         candidatas.append({
             "id": q["id"], "nombre": q["nombre"],
             "items_cubiertos": cov, "total_items_po": len(po.get("items", [])),
+            "referenciada": es_ref,
             **vig,
             "url": f"{CRM_BASE}/index.php?module=Quotes&record={q['id']}",
         })
         if not vig["vigente"]:
             discrepancias.append(f"La cotización «{q['nombre'][:30]}» está {vig['motivo']}.")
-    candidatas.sort(key=lambda c: (c["items_cubiertos"], c["vigente"]), reverse=True)
+    candidatas.sort(key=lambda c: (c["referenciada"], c["items_cubiertos"], c["vigente"]), reverse=True)
 
     encontrados = sum(1 for i in items_out if i["estado"] != "no_encontrado")
     todo_ok = (encontrados == len(items_out) and len(items_out) > 0

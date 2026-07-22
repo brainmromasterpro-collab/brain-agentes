@@ -137,6 +137,8 @@ _NORM_SYS = (
     "{\n"
     '  "cliente": "razón social del cliente que emite la orden (comprador), o \\"\\" si no está claro",\n'
     '  "po_number": "número de la orden de compra del cliente, tal cual aparece, o \\"\\"",\n'
+    '  "cotizacion_ref": "número de cotización/presupuesto NUESTRO citado o adjunto en el documento '
+    '(formato tipo Q2026-0608-2042), o \\"\\" si no aparece",\n'
     '  "moneda": "MXN | USD | \\"\\" si no se indica",\n'
     '  "items": [\n'
     '    {"part_number": "número de parte/modelo tal cual", "descripcion": "texto del renglón", '
@@ -147,6 +149,8 @@ _NORM_SYS = (
     "REGLAS:\n"
     "- NO inventes. Si un precio o cantidad no aparece, usa null (precio) o deja el item con lo que haya.\n"
     "- El part_number es el identificador del producto (SKU/modelo/mfr part no), NO la descripción.\n"
+    "- Si el documento incluye o cita una COTIZACIÓN/PRESUPUESTO nuestro (de MRO Master Pro), pon su "
+    "número en cotizacion_ref — sirve de referencia para saber de qué cotización salió la orden.\n"
     "- Si el texto NO parece una orden de compra, devuelve items:[] y explica en notas.\n"
     "- Números sin separadores de miles ni símbolo de moneda (1234.56, no $1,234.56)."
 )
@@ -163,6 +167,7 @@ def _parse_respuesta(raw: str) -> dict:
     datos.setdefault("items", [])
     datos.setdefault("cliente", "")
     datos.setdefault("po_number", "")
+    datos.setdefault("cotizacion_ref", "")
     datos.setdefault("moneda", "")
     return datos
 
