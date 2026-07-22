@@ -180,21 +180,33 @@ def _vigencia(quote_id: str) -> dict:
 # ─────────────────────────────────────────────────────────────
 # 3. COTEJO
 # ─────────────────────────────────────────────────────────────
-def _match_lineas(pc: str, indice: dict) -> tuple[list, bool]:
-    """Busca las líneas que corresponden a un part number (compacto). Devuelve (candidatos, parcial).
-    Primero match EXACTO; si falla, match PARCIAL por prefijo (>=5 chars) para tolerar part numbers
-    truncados/variantes por la extracción (p.ej. '48625' vs '48625RO222'). El parcial se marca para
-    que el humano lo confirme — nunca se da por bueno en silencio."""
+def _match_item(pc: str, descripcion: str, indice: dict) -> tuple[list, str]:
+    """Cascada de match para UN renglón del PO. Devuelve (líneas, tipo):
+      'exacto'      → número de parte idéntico al de una cotización.
+      'parcial'     → por prefijo (>=5 chars): tolera truncados/variantes ('48625' vs '48625RO222').
+      'descripcion' → el cliente usó SU código interno (p.ej. PIN.140242) y el número real del
+                      fabricante (CSMD-20BT3ATT3) aparece dentro de la DESCRIPCIÓN del renglón.
+      ''            → no encontrado.
+    Parcial y descripción se marcan para que el humano confirme — nunca se dan por buenos en silencio."""
     if pc in indice:
-        return indice[pc], False
+        return indice[pc], "exacto"
     if len(pc) >= 5:
         hits: list = []
         for k, v in indice.items():
             if len(k) >= 5 and (k.startswith(pc) or pc.startswith(k)):
                 hits.extend(v)
         if hits:
-            return hits, True
-    return [], False
+            return hits, "parcial"
+    # scan de descripción: ¿algún número de parte de las cotizaciones está DENTRO del texto del renglón?
+    dc = _compact(descripcion)
+    if len(dc) >= 6:
+        hits = []
+        for k, v in indice.items():
+            if len(k) >= 6 and k in dc:
+                hits.extend(v)
+        if hits:
+            return hits, "descripcion"
+    return [], ""
 
 
 def _precio_coincide(po_precio: float | None, cot_precio: float | None) -> bool:
@@ -252,7 +264,8 @@ def cotejar(po: dict) -> dict:
         pc = _compact(pn)
         po_precio = _num(it.get("precio_unitario"))
         po_qty = _num(it.get("cantidad"))
-        candidatos, parcial = _match_lineas(pc, indice)
+        candidatos, tipo_match = _match_item(pc, it.get("descripcion", ""), indice)
+        parcial = tipo_match in ("parcial", "descripcion")
 
         if not candidatos:
             items_out.append({
@@ -281,10 +294,16 @@ def cotejar(po: dict) -> dict:
             "precio_cotizacion": mejor_ln["unit_price"],
             "estado": estado,
             "match_parcial": parcial,
+            "tipo_match": tipo_match,
             "cotizacion": {"id": mejor_q["id"], "nombre": mejor_q["nombre"]},
             "en_varias": len({q["id"] for q, _ in candidatos}) > 1,
         })
-        if parcial:
+        if tipo_match == "descripcion":
+            discrepancias.append(
+                f"«{pn}» parece ser el código interno del cliente; el número real «{mejor_ln['part_number']}» "
+                f"aparece en la descripción (cot. {mejor_q['nombre'][:30]}) — confirma que es el mismo producto."
+            )
+        elif tipo_match == "parcial":
             discrepancias.append(
                 f"«{pn}»: coincidencia PARCIAL de número de parte con «{mejor_ln['part_number']}» "
                 f"(cot. {mejor_q['nombre'][:30]}) — verifica que sea el mismo producto."
