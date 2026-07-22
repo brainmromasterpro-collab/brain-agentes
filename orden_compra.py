@@ -152,6 +152,21 @@ _NORM_SYS = (
 )
 
 
+def _parse_respuesta(raw: str) -> dict:
+    """Extrae el JSON del esquema de la respuesta del modelo. Robusto ante ```-fences y texto extra:
+    toma del primer '{' al último '}'. Lanza json.JSONDecodeError si no hay JSON válido."""
+    raw = (raw or "").strip()
+    i, j = raw.find("{"), raw.rfind("}")
+    if i >= 0 and j > i:
+        raw = raw[i:j + 1]
+    datos = json.loads(raw)
+    datos.setdefault("items", [])
+    datos.setdefault("cliente", "")
+    datos.setdefault("po_number", "")
+    datos.setdefault("moneda", "")
+    return datos
+
+
 def normalizar(texto: str, model_id: str = "") -> dict:
     """Convierte el texto crudo del PO en datos estructurados. Devuelve el dict del esquema
     (con 'error' si algo falla, para que el chat lo reporte sin romperse)."""
@@ -168,22 +183,56 @@ def normalizar(texto: str, model_id: str = "") -> dict:
             max_tokens=2000,
             temperature=0,
         )
-        raw = resp.content[0].text.strip()
-        # Quitar cercas de código si el modelo las puso pese a la instrucción.
-        if raw.startswith("```"):
-            raw = raw.split("```", 2)[1].lstrip("json").strip() if "```" in raw[3:] else raw.strip("`")
-        datos = json.loads(raw)
-        datos.setdefault("items", [])
-        datos.setdefault("cliente", "")
-        datos.setdefault("po_number", "")
-        datos.setdefault("moneda", "")
-        return datos
+        return _parse_respuesta(resp.content[0].text)
     except json.JSONDecodeError as e:
-        log.error(f"normalizar: JSON inválido: {e} | raw={raw[:200] if 'raw' in dir() else ''}")
+        log.error(f"normalizar: JSON inválido: {e}")
         return {"error": "no pude estructurar la orden (JSON inválido del extractor)", "items": []}
     except Exception as e:
         log.error(f"normalizar: {e}")
         return {"error": f"error al normalizar: {e}", "items": []}
+
+
+def _pdf_a_imagenes(data: bytes, max_pages: int = 3) -> list[bytes]:
+    """Rasteriza las primeras páginas del PDF a PNG (para PDFs ESCANEADOS sin capa de texto).
+    Cap de páginas para acotar el costo de visión."""
+    import pypdfium2 as pdfium
+    pdf = pdfium.PdfDocument(data)
+    out: list[bytes] = []
+    for i in range(min(len(pdf), max_pages)):
+        pil = pdf[i].render(scale=2).to_pil()
+        buf = io.BytesIO()
+        pil.save(buf, format="PNG")
+        out.append(buf.getvalue())
+    return out
+
+
+def normalizar_vision(imagenes: list[bytes], model_id: str = "") -> dict:
+    """Fallback para PDFs ESCANEADOS: lee la orden desde imágenes con visión de Claude.
+    Solo se usa cuando NO hay capa de texto (no encarece el caso normal)."""
+    if not imagenes:
+        return {"error": "sin imágenes que leer", "items": []}
+    import base64
+    import anthropic
+    contenido: list = [{"type": "text", "text":
+                        "Esta es una ORDEN DE COMPRA escaneada (imágenes). Extrae los datos al esquema pedido."}]
+    for img in imagenes:
+        contenido.append({"type": "image", "source": {
+            "type": "base64", "media_type": "image/png",
+            "data": base64.b64encode(img).decode()}})
+    try:
+        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        resp = client.messages.create(
+            model=model_id or PO_MODEL, system=_NORM_SYS,
+            max_tokens=2000, temperature=0,
+            messages=[{"role": "user", "content": contenido}],
+        )
+        return _parse_respuesta(resp.content[0].text)
+    except json.JSONDecodeError as e:
+        log.error(f"normalizar_vision: JSON inválido: {e}")
+        return {"error": "no pude estructurar la orden escaneada (JSON inválido)", "items": []}
+    except Exception as e:
+        log.error(f"normalizar_vision: {e}")
+        return {"error": f"no pude leer el PDF escaneado con visión: {e}", "items": []}
 
 
 def leer_po(url: str = "", data: bytes = b"", nombre: str = "", mime: str = "", model_id: str = "") -> dict:
@@ -199,6 +248,18 @@ def leer_po(url: str = "", data: bytes = b"", nombre: str = "", mime: str = "", 
 
     texto, fmt = extraer_texto(data, nombre, mime)
     if not texto.strip():
+        # PDF sin capa de texto = escaneado → fallback a visión (solo aquí, no en el caso normal).
+        if fmt == "pdf":
+            try:
+                imgs = _pdf_a_imagenes(data)
+            except Exception as e:
+                imgs = []
+                log.error(f"rasterizar PDF escaneado: {e}")
+            if imgs:
+                log.info(f"PDF sin texto (escaneado) → visión con {len(imgs)} página(s)")
+                datos = normalizar_vision(imgs, model_id=model_id)
+                datos["formato"] = "pdf(escaneado)"
+                return datos
         return {"error": f"no pude extraer texto del archivo ({fmt})", "items": [], "formato": fmt}
 
     datos = normalizar(texto, model_id=model_id)
