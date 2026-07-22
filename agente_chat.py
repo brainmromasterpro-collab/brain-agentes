@@ -1433,6 +1433,17 @@ def tool_extraer_producto_de_link(url: str) -> dict:
     return _extraer_producto_link(url)
 
 
+def tool_extraer_ficha_pdf(url: str) -> dict:
+    """Extrae el/los producto(s) de una ficha técnica (PDF/Excel/Word) por URL: nombre, marca,
+    part number, descripción y características técnicas de cada variante/SKU encontrado. Import
+    perezoso para no romper el chat si falta alguna dependencia de parsing en el entorno."""
+    try:
+        import ficha_tecnica
+    except Exception as e:
+        return {"error": f"módulo de ficha técnica no disponible: {e}"}
+    return ficha_tecnica.leer_ficha(url=url)
+
+
 def _rehost_imagen(imagen_url: str, part_number: str = "") -> str:
     """Descarga la imagen y la re-hospeda en Supabase Storage, para que el publicador pueda
     subirla a 1CRM. Sitios como Festo bloquean la descarga directa desde IPs de datacenter
@@ -2030,6 +2041,17 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "extraer_ficha_pdf",
+        "description": "Extrae el/los producto(s) (nombre, marca, part number, descripción, características técnicas) de una ficha técnica en PDF/Excel/Word por URL. Si el documento describe varias variantes/SKU del mismo producto (o accesorios con su propio Item No.), devuelve UNA entrada por cada uno. Usar cuando el usuario comparte el link de un datasheet para publicarlo en 1CRM.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL del PDF/Excel/Word de la ficha técnica"},
+            },
+            "required": ["url"],
+        },
+    },
+    {
         "name": "publicar_producto_link",
         "description": "Publica en 1CRM un producto extraído de un link (tras aprobación del usuario). El precio del proveedor va al campo interno 'cost' (no público). Reutiliza el pipeline del publicador; el widget producto_publicado muestra el resultado. El stream_id se inyecta automáticamente.",
         "input_schema": {
@@ -2308,6 +2330,7 @@ TOOL_FUNCTIONS = {
     "escanear_emails_ventas":    tool_escanear_emails_ventas,
     "notificar_sistema":         tool_notificar_sistema,
     "extraer_producto_de_link":  tool_extraer_producto_de_link,
+    "extraer_ficha_pdf":         tool_extraer_ficha_pdf,
     "publicar_producto_link":    tool_publicar_producto_link,
     "publicar_productos_desde_links": tool_publicar_productos_desde_links,
     "crear_cuenta_crm":          tool_crear_cuenta_crm,
@@ -2673,6 +2696,39 @@ uses los datos de un [PRODUCTO_PREVIEW] anterior del historial para publicar de 
 
 CRÍTICO: nunca publiques sin el [DECISION] aprobado. El precio del proveedor es interno (cost), no público.
 
+MODO 14 — PUBLICAR PRODUCTO DESDE FICHA TÉCNICA (PDF/Excel/Word):
+Cuando el usuario comparte la URL de un datasheet/ficha técnica (PDF, Excel o Word, NO una página \
+web) para publicar el producto en 1CRM:
+
+1. Extrae DE INMEDIATO con extraer_ficha_pdf (una línea breve antes está bien, ej. "Reviso la ficha, \
+   dame un momento…"). NO preguntes antes de extraer.
+   - Si devuelve "error" (no se pudo descargar o no se pudo leer el documento): dilo claramente y \
+     ofrece que el usuario pegue los datos manualmente. NO publiques con datos inventados.
+   - Si el usuario ya especificó QUÉ variante/modelo quiere (p.ej. "publica el Dynamic 2100/16"), y \
+     entre los productos devueltos hay UNA sola coincidencia clara con eso: trátalo como el caso de \
+     "1 producto" del punto 2, usando SOLO ese producto (ignora el resto de variantes/accesorios \
+     que haya devuelto el extractor).
+
+2. Si el resultado (o la coincidencia pedida por el usuario) es 1 SOLO producto: NO listes los datos \
+   como texto. Emite EXACTAMENTE este marcador en una sola línea con JSON válido: \
+   [PRODUCTO_PREVIEW]{"nombre":"...","marca":"...","part_number":"...","precio_costo":"...","moneda":"...","descripcion":"...","caracteristicas":["...","..."],"imagen_url":""} \
+   y termina con [DECISION: ¿Publico este producto en 1CRM?]. Tras el "Sí", llama a \
+   publicar_producto_link con esos mismos datos. NO agregues texto después de publicar (el widget ya \
+   confirma) — respuesta final vacía.
+
+3. Si el extractor devuelve VARIAS variantes/SKU (y el usuario NO pidió una en específico, o pidió \
+   una pero el documento trae más de una que podría aplicar): NUNCA publiques directo — esto es \
+   AMBIGUO y hay que preguntar en el stream ANTES de tocar el CRM. Emite UN SOLO marcador con TODOS \
+   los productos encontrados: \
+   [PRODUCTOS_PREVIEW]{"productos":[{"nombre":"...","marca":"...","part_number":"...","precio_costo":"...","moneda":"...","descripcion":"...","caracteristicas":["..."],"imagen_url":"","url_origen":"..."}, {"...otro..."}]} \
+   SIN [DECISION] — el widget de PRODUCTOS_PREVIEW ya trae un botón "Publicar" por cada uno, así que \
+   el usuario elige cuál(es) publicar desde ahí. Si de una vez pide "publica todas las variantes" o \
+   "súbelas todas", usa publicar_productos_desde_links con el arreglo completo.
+
+4. Igual que en MODO 13: nunca inventes precio, imagen ni specs que el documento no traiga (deja "" o \
+   []); no repitas los datos en texto aparte del marcador; no vuelvas a publicar un producto ya \
+   aprobado/publicado de un preview anterior.
+
 MODO 7 — CHAT CONVERSACIONAL:
 Para preguntas o solicitudes de información, usa las herramientas disponibles \
 (1CRM, RFQs, métricas, internet) para responder con datos reales.
@@ -2728,13 +2784,13 @@ _PROMPT_INTRO, _PROMPT_MODOS = _partir_prompt(SYSTEM_PROMPT)
 TIPO_MODOS = {
     "correo":       [9, 10, 11, 12],              # correo: RFQ, oportunidades, alta cliente
     "whatsapp":     [9, 10, 11, 12],              # WhatsApp: mismos modos que correo, otro canal
-    "busquedas":    [1, 2, 3, 4, 5, 6, 8],        # búsqueda RFQ + selección proveedor + imagen
-    "publicacion":  [13],                          # publicar producto(s) desde link
+    "busquedas":    [1, 2, 3, 4, 5, 6, 8, 14],     # búsqueda RFQ + selección proveedor + imagen + ficha técnica PDF
+    "publicacion":  [13, 14],                      # publicar producto(s) desde link o ficha técnica PDF
     "cotizacion":   [],                            # (módulo de cotización se agrega después)
     "ordenes":      [],
     # aliases de compatibilidad
     "mensajeria":   [9, 10, 11, 12],
-    "catalogo":     [1, 2, 3, 4, 5, 6, 8, 13],
+    "catalogo":     [1, 2, 3, 4, 5, 6, 8, 13, 14],
     "cotizaciones": [],
 }
 
@@ -2807,6 +2863,7 @@ _LOG_INICIO_TOOL = {
     "publicar_rfq":             "📦 Publicando en 1CRM… (~30s). Te aviso cuando esté listo.",
     "publicar_sin_imagen_rfq":  "📦 Publicando en 1CRM… (~30s). Te aviso cuando esté listo.",
     "extraer_producto_de_link": "🔎 Reviso el link del producto…",
+    "extraer_ficha_pdf":        "📄 Leyendo la ficha técnica…",
     "buscar_internet":          "🌐 Buscando en internet…",
 }
 
