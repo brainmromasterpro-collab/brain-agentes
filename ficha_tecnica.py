@@ -92,6 +92,37 @@ def normalizar_ficha(texto: str, model_id: str = "") -> dict:
         return {"error": f"error al normalizar: {e}", "productos": []}
 
 
+def extraer_imagen_pdf(data: bytes, max_paginas: int = 2) -> tuple[bytes, str] | None:
+    """Extrae la imagen embebida más grande de las primeras páginas del PDF (heurística: la foto
+    del producto suele ser la imagen más grande de la portada; descarta logos/iconos chicos por
+    tamaño). Devuelve (bytes, extensión) o None si no encuentra ninguna candidata razonable."""
+    try:
+        import fitz  # PyMuPDF
+    except Exception as e:
+        log.warning(f"PyMuPDF no disponible, no se extrae imagen del PDF: {e}")
+        return None
+    try:
+        doc = fitz.open(stream=data, filetype="pdf")
+        mejor, mejor_area = None, 0
+        for pg_num in range(min(max_paginas, len(doc))):
+            for img in doc[pg_num].get_images(full=True):
+                try:
+                    base = doc.extract_image(img[0])
+                except Exception:
+                    continue
+                w, h = base.get("width", 0), base.get("height", 0)
+                if w < 150 or h < 150:  # descarta iconos/logos chicos
+                    continue
+                if w * h > mejor_area:
+                    mejor_area = w * h
+                    mejor = (base.get("image"), base.get("ext", "png"))
+        doc.close()
+        return mejor
+    except Exception as e:
+        log.warning(f"extraer_imagen_pdf: {e}")
+        return None
+
+
 def leer_ficha(url: str = "", data: bytes = b"", nombre: str = "", mime: str = "",
                 model_id: str = "") -> dict:
     """Punto de entrada: baja el archivo (o usa data), extrae texto y lo normaliza a productos.
@@ -118,4 +149,16 @@ def leer_ficha(url: str = "", data: bytes = b"", nombre: str = "", mime: str = "
         p.setdefault("imagen_url", "")
         p.setdefault("moneda", "")
         p.setdefault("precio_costo", "")
+
+    # Imagen embebida (solo PDF por ahora): se devuelve en base64 — quien llame (agente_chat) la
+    # sube a Supabase Storage, porque esta capa SOLO lee y estructura (no toca infra externa).
+    datos["imagen_b64"] = ""
+    datos["imagen_ext"] = ""
+    if fmt == "pdf":
+        img = extraer_imagen_pdf(data)
+        if img:
+            import base64
+            datos["imagen_b64"] = base64.b64encode(img[0]).decode()
+            datos["imagen_ext"] = img[1]
+
     return datos

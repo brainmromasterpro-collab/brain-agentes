@@ -1435,13 +1435,42 @@ def tool_extraer_producto_de_link(url: str) -> dict:
 
 def tool_extraer_ficha_pdf(url: str) -> dict:
     """Extrae el/los producto(s) de una ficha técnica (PDF/Excel/Word) por URL: nombre, marca,
-    part number, descripción y características técnicas de cada variante/SKU encontrado. Import
-    perezoso para no romper el chat si falta alguna dependencia de parsing en el entorno."""
+    part number, descripción y características técnicas de cada variante/SKU encontrado. Si el PDF
+    trae una foto embebida (p.ej. la portada), se re-hospeda en Supabase Storage y se asigna como
+    imagen_url a todos los productos devueltos. Import perezoso para no romper el chat si falta
+    alguna dependencia de parsing en el entorno."""
     try:
         import ficha_tecnica
     except Exception as e:
         return {"error": f"módulo de ficha técnica no disponible: {e}"}
-    return ficha_tecnica.leer_ficha(url=url)
+
+    datos = ficha_tecnica.leer_ficha(url=url)
+    b64  = datos.pop("imagen_b64", "")
+    ext  = datos.pop("imagen_ext", "")
+    if b64:
+        try:
+            import base64 as _b64mod
+            content = _b64mod.b64decode(b64)
+            ct = "image/png" if ext == "png" else "image/jpeg"
+            if ext not in ("png", "jpeg", "jpg"):
+                # Formatos raros embebidos (jp2/tiff/etc.) → normalizar a PNG con Pillow.
+                from PIL import Image
+                import io as _io
+                im = Image.open(_io.BytesIO(content)).convert("RGB")
+                buf = _io.BytesIO()
+                im.save(buf, format="PNG")
+                content, ct, ext = buf.getvalue(), "image/png", "png"
+            path = f"ficha/{uuid.uuid4().hex[:10]}.{'jpg' if ext == 'jpeg' else ext}"
+            supabase.storage.from_("product-images").upload(
+                path=path, file=content, file_options={"content-type": ct, "upsert": "true"},
+            )
+            img_url = supabase.storage.from_("product-images").get_public_url(path)
+            for p in datos.get("productos", []):
+                p["imagen_url"] = img_url
+            log.info(f"Imagen extraída del PDF y re-hospedada: {img_url[:70]}")
+        except Exception as e:
+            log.warning(f"No se pudo subir la imagen extraída del PDF: {e}")
+    return datos
 
 
 def _rehost_imagen(imagen_url: str, part_number: str = "") -> str:
