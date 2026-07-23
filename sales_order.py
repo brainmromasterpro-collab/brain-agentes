@@ -37,7 +37,8 @@ STAGE_MUERTAS = {"Closed Lost", "Closed Dead"}
 # Cómo nos llamamos (para confirmar que la PO es para NOSOTROS). Acepta varios alias separados por
 # coma en NUESTRO_NOMBRE (p.ej. "MRO Master Pro,MRO Online 4U,MRO MasterPro").
 _NUESTROS_TOKENS = [re.sub(r"[^A-Z0-9]", "", n.upper())
-                    for n in os.environ.get("NUESTRO_NOMBRE", "MRO Master Pro").split(",") if n.strip()]
+                    for n in os.environ.get("NUESTRO_NOMBRE",
+                        "MRO Master Pro,MRO MasterPro,MRO Online 4U").split(",") if n.strip()]
 
 
 def _crm_get(path: str, params: dict | None = None) -> dict:
