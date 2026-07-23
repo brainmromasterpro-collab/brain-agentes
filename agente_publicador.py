@@ -386,6 +386,74 @@ def buscar_producto_por_codigo(modelo: str) -> tuple[str | None, list[str]]:
     return None, diags
 
 
+def buscar_o_crear_fabricante(marca: str) -> str | None:
+    """Busca la Account tipo Manufacturer que corresponde a la marca del producto (campo
+    Product.manufacturer_id, relate a Account con add_filter account_type=Manufacturer). Si no
+    existe la crea con SOLO nombre + account_type=Manufacturer (los únicos dos campos que pide
+    1CRM para dar de alta un fabricante). Devuelve el id, o None si la marca viene vacía o algo falla.
+
+    NOTA: filter_text SÍ filtra correctamente en Account (a diferencia de search[campo], que esta
+    instancia de 1CRM ignora en Product) — se probó contra la cuenta real 'Allen Bradley'."""
+    marca = (marca or "").strip()
+    if not marca:
+        return None
+    target = marca.lower()
+    try:
+        r = onecrm_get("data/Account", {"filter_text": marca, "max_num": 20})
+        for rec in (r.get("records") or []):
+            if (rec.get("name") or "").strip().lower() != target:
+                continue
+            rid = rec.get("id")
+            if not rid:
+                continue
+            detail = onecrm_get(f"data/Account/{rid}").get("record", {}) or {}
+            if detail.get("account_type") == "Manufacturer":
+                log.info(f"Fabricante '{marca}' ya existe: id={rid}")
+                return rid
+    except Exception as e:
+        log.warning(f"Búsqueda de fabricante '{marca}' falló: {e}")
+
+    try:
+        result = onecrm_post("data/Account", {"name": marca, "account_type": "Manufacturer"})
+        rid = result.get("id") or (result.get("record") or {}).get("id")
+        if rid:
+            log.info(f"Fabricante '{marca}' creado: id={rid}")
+            return rid
+        log.warning(f"POST Account fabricante sin id en respuesta: {result}")
+    except Exception as e:
+        log.error(f"No se pudo crear cuenta de fabricante '{marca}': {e}")
+    return None
+
+
+def _completar_producto_existente(product_id: str, ficha: dict, modelo: str) -> None:
+    """Si el producto YA existía en 1CRM (se detectó por manufacturers_part_no/nombre) pero le
+    faltan datos, lo completa con la ficha recién extraída — SIN pisar datos que el producto ya
+    tenía completos (nunca sobreescribe una descripción que ya es larga, ni el part number si ya
+    estaba). La imagen se maneja aparte en procesar_job_publicador (ya se re-sube si hay foto_url,
+    exista o no el producto)."""
+    try:
+        mod = discover_product_module()
+        rec = onecrm_get(f"data/{mod}/{product_id}").get("record", {}) or {}
+        patch: dict = {}
+        desc_actual = (rec.get("description") or "").strip()
+        desc_nueva  = (ficha.get("descripcion") or "").strip()
+        if len(desc_actual) < 20 and len(desc_nueva) >= 20:
+            patch["description"] = desc_nueva
+        if not (rec.get("manufacturers_part_no") or "").strip() and modelo:
+            patch["manufacturers_part_no"] = modelo
+        if not (rec.get("manufacturer_id") or "").strip():
+            fab_id = buscar_o_crear_fabricante(ficha.get("marca", ""))
+            if fab_id:
+                patch["manufacturer_id"] = fab_id
+        if patch:
+            onecrm_patch(f"data/{mod}/{product_id}", patch)
+            log.info(f"Producto existente {product_id} completado: {list(patch.keys())}")
+        else:
+            log.info(f"Producto existente {product_id} ya tenía la información completa — no se toca")
+    except Exception as e:
+        log.warning(f"No se pudo revisar/completar producto existente {product_id}: {e}")
+
+
 def crear_producto_en_crm(ficha: dict, modelo: str) -> str:
     """
     Crea el producto en 1CRM vía POST data/Product → escribe en aos_products (ProductCatalog).
@@ -452,12 +520,20 @@ def crear_producto_en_crm(ficha: dict, modelo: str) -> str:
         payload["product_category_id"] = category_id
         log.info(f"product_category_id={category_id}")
 
+    # manufacturer_id: relate a Account tipo Manufacturer — se busca por marca, y si no existe
+    # esa cuenta se crea (solo con nombre + account_type=Manufacturer, que es todo lo que pide 1CRM).
+    manufacturer_id = buscar_o_crear_fabricante(ficha.get("marca", ""))
+    if manufacturer_id:
+        payload["manufacturer_id"] = manufacturer_id
+        log.info(f"manufacturer_id={manufacturer_id}")
+
     log.info(f"POST payload: type_id={type_id or '(omitido)'} cat_id={category_id or '(omitido)'}")
 
     # Check if product already exists before POST (avoids 500 duplicate constraint)
     existing_id, pre_diags = buscar_producto_por_codigo(modelo)
     if existing_id:
         log.info(f"Producto ya existe en 1CRM (id={existing_id}) — reutilizando")
+        _completar_producto_existente(existing_id, ficha, modelo)
         return existing_id
 
     try:
@@ -483,6 +559,7 @@ def crear_producto_en_crm(ficha: dict, modelo: str) -> str:
         log.warning("POST exitoso pero sin ID en respuesta — buscando producto por código")
         existing_id, post_diags = buscar_producto_por_codigo(modelo)
         if existing_id:
+            _completar_producto_existente(existing_id, ficha, modelo)
             return existing_id
 
         resp_snippet = str(result)[:400]
@@ -496,6 +573,7 @@ def crear_producto_en_crm(ficha: dict, modelo: str) -> str:
         existing_id, err_diags = buscar_producto_por_codigo(modelo)
         if existing_id:
             log.info(f"Reutilizando producto existente id={existing_id}")
+            _completar_producto_existente(existing_id, ficha, modelo)
             return existing_id
         # Include full diagnostics in error for Supabase visibility
         raise RuntimeError(
@@ -673,6 +751,7 @@ def procesar_job_publicador(job: dict) -> None:
                 "descripcion":       ficha_manual.get("descripcion", ""),
                 "precio_referencia": ficha_manual.get("list_price", 0),  # precio público (0 por defecto)
                 "cost":              ficha_manual.get("cost", 0),        # costo interno (proveedor)
+                "marca":             marca,
             }
         else:
             # ── Obtener opciones ─────────────────────────────────────────

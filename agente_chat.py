@@ -1613,6 +1613,20 @@ def _estado_publicacion_reciente(part_number: str, clean_stream, minutos: int = 
         return ""
 
 
+def _resumen_corto(texto: str, max_len: int = 100) -> str:
+    """Recorta un texto a una descripción corta para usar como último parámetro del título:
+    la primera oración si es razonable, si no un recorte por palabra completa con '…'."""
+    texto = (texto or "").strip()
+    if not texto:
+        return ""
+    corte = texto.find(". ")
+    if 0 < corte <= max_len + 20:
+        return texto[:corte + 1]
+    if len(texto) <= max_len:
+        return texto
+    return texto[:max_len].rsplit(" ", 1)[0].rstrip(".,;:") + "…"
+
+
 def _publicar_producto_uno(
     bulk_id: str, clean_stream, nombre: str, part_number: str, marca: str = "",
     descripcion: str = "", caracteristicas: list | None = None, precio_costo: float = 0,
@@ -1620,11 +1634,13 @@ def _publicar_producto_uno(
 ) -> dict:
     """Crea el rfq + job del publicador para UN producto extraído de link, bajo el bulk_id dado.
     Lo comparten el flujo de 1 link y el de N links (bulk). Devuelve {rfq_id, job_id, nombre_crm}."""
-    # Nombre para 1CRM en el ORDEN: modelo (part number) / marca / descripción (nombre).
+    # Nombre para 1CRM en el ORDEN: modelo (part number) / marca / nombre / descripción CORTA
+    # (último parámetro). La descripción corta se saca de 'descripcion' (no de 'nombre') para que
+    # el título quede parejo sin depender de qué tan descriptivo venga el nombre de cada extractor.
     # (se omiten partes vacías o repetidas — p.ej. si el nombre extraído == part number).
     _seen: set = set()
     _partes: list = []
-    for _p in (part_number, marca, nombre):
+    for _p in (part_number, marca, nombre, _resumen_corto(descripcion)):
         _p = (_p or "").strip()
         if _p and _p.lower() not in _seen:
             _seen.add(_p.lower())
