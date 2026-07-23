@@ -34,6 +34,11 @@ TOL_ABS = 0.01
 # Etapas de cotización que ya NO son válidas como origen de una orden.
 STAGE_MUERTAS = {"Closed Lost", "Closed Dead"}
 
+# Cómo nos llamamos (para confirmar que la PO es para NOSOTROS). Acepta varios alias separados por
+# coma en NUESTRO_NOMBRE (p.ej. "MRO Master Pro,MRO Online 4U,MRO MasterPro").
+_NUESTROS_TOKENS = [re.sub(r"[^A-Z0-9]", "", n.upper())
+                    for n in os.environ.get("NUESTRO_NOMBRE", "MRO Master Pro").split(",") if n.strip()]
+
 
 def _crm_get(path: str, params: dict | None = None) -> dict:
     r = httpx.get(f"{CRM_BASE}/api.php/{path}", params=params or {}, auth=CRM_AUTH, timeout=40)
@@ -104,6 +109,26 @@ def cuenta_por_id(cuenta_id: str) -> dict | None:
         return None
     return {"id": rec["id"], "nombre": rec.get("name", ""),
             "url": f"{CRM_BASE}/index.php?module=Accounts&record={rec['id']}"}
+
+
+def _terminos_y_moneda(cuenta_id: str) -> dict:
+    """Trae los TÉRMINOS DE PAGO (default_terms) y la MONEDA de la cuenta — específicos del cliente.
+    Van en la Sales Order: terms y currency_id."""
+    d = _crm_get(f"data/Account/{cuenta_id}")
+    rec = d.get("record", d)
+    return {
+        "terminos_pago": rec.get("default_terms") or "",
+        "currency_id":   rec.get("currency_id") or "",
+        "moneda":        rec.get("currency") or "",
+    }
+
+
+def _es_para_nosotros(proveedor: str) -> bool | None:
+    """¿La orden va dirigida a NOSOTROS? True/False, o None si el PO no dice el proveedor."""
+    prov = re.sub(r"[^A-Z0-9]", "", _norm(proveedor))
+    if not prov:
+        return None
+    return any(t and (t in prov or prov in t) for t in _NUESTROS_TOKENS)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -238,6 +263,12 @@ def cotejar(po: dict) -> dict:
             "cuenta": None, "items": [], "cotizaciones_candidatas": [],
         }
 
+    # Términos de pago + moneda de ESTE cliente (van a la Sales Order).
+    tm = _terminos_y_moneda(cuenta["id"])
+
+    # ¿La orden es para NOSOTROS? (si el PO nombra a otro proveedor, hay que confirmar antes de crear).
+    para_nosotros = _es_para_nosotros(po.get("proveedor", ""))
+
     quotes = cotizaciones_cliente(cuenta["id"])
 
     # Priorizamos la referenciada, pero seguimos el proceso completo (verificamos productos/precios/
@@ -340,15 +371,24 @@ def cotejar(po: dict) -> dict:
                and not any(i.get("match_parcial") for i in items_out)
                and any(c["vigente"] for c in candidatas))
 
+    # Aviso duro si la orden parece ser para OTRO proveedor.
+    if para_nosotros is False:
+        discrepancias.insert(0, f"⚠ La orden va dirigida a «{po.get('proveedor','otro')}», no a nosotros. "
+                                f"CONFIRMA que esta orden de compra es para nosotros antes de crear la Sales Order.")
+
     return {
         "ok": True,
         "cuenta": cuenta,
         "po_number": po.get("po_number", ""),
-        "moneda": po.get("moneda", ""),
+        "proveedor": po.get("proveedor", ""),
+        "para_nosotros": para_nosotros,               # True / False / None (no lo dice)
+        "terminos_pago": tm["terminos_pago"],         # default_terms del cliente
+        "moneda": po.get("moneda", "") or tm["moneda"],
+        "currency_id": tm["currency_id"],
         "items": items_out,
         "cotizaciones_candidatas": candidatas,
         "discrepancias": discrepancias,
-        "todo_ok": todo_ok,
+        "todo_ok": todo_ok and para_nosotros is not False,
         "resumen": f"{encontrados}/{len(items_out)} productos ubicados en cotizaciones; "
                    f"{len(candidatas)} cotización(es) candidata(s); "
                    f"{len(discrepancias)} discrepancia(s).",

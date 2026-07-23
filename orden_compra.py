@@ -139,6 +139,8 @@ _NORM_SYS = (
     '  "po_number": "número de la orden de compra del cliente, tal cual aparece, o \\"\\"",\n'
     '  "cotizacion_ref": "número de cotización/presupuesto NUESTRO citado o adjunto en el documento '
     '(formato tipo Q2026-0608-2042), o \\"\\" si no aparece",\n'
+    '  "proveedor": "nombre del PROVEEDOR/vendor a quien va dirigida la orden (a quién le compran), '
+    'o \\"\\" si no aparece",\n'
     '  "moneda": "MXN | USD | \\"\\" si no se indica",\n'
     '  "items": [\n'
     '    {"part_number": "número de parte/modelo tal cual", "descripcion": "texto del renglón", '
@@ -168,6 +170,7 @@ def _parse_respuesta(raw: str) -> dict:
     datos.setdefault("cliente", "")
     datos.setdefault("po_number", "")
     datos.setdefault("cotizacion_ref", "")
+    datos.setdefault("proveedor", "")
     datos.setdefault("moneda", "")
     return datos
 
