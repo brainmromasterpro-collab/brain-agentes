@@ -259,6 +259,60 @@ def _match_item(pc: str, descripcion: str, indice: dict) -> tuple[list, str]:
     return [], ""
 
 
+def _armar_draft(cuenta: dict, tm: dict, po: dict, items_out: list,
+                 candidatas: list, quotes: list, para_nosotros) -> dict | None:
+    """Arma el borrador de la Sales Order para el PREVIO: qué se va a mandar y DE DÓNDE sale cada dato,
+    con las líneas de la cotización de referencia marcadas 'pedido/no pedido' por el PO. No escribe."""
+    if not candidatas:
+        return None
+    ref = candidatas[0]                                   # referencia = citada o de mayor cobertura
+    ref_quote = next((q for q in quotes if q["id"] == ref["id"]), None)
+    if not ref_quote:
+        return None
+
+    # po_qty por (cotización, número de parte del renglón de la cotización)
+    po_qty_map: dict = {}
+    for it in items_out:
+        cid = (it.get("cotizacion") or {}).get("id")
+        pcn = _compact(it.get("part_number_cotizacion") or "")
+        if cid and pcn:
+            po_qty_map[(cid, pcn)] = it.get("cantidad_po")
+
+    lineas = []
+    for ln in ref_quote["lines"]:
+        po_qty = po_qty_map.get((ref["id"], ln["part_compact"]))
+        pedido = po_qty is not None
+        lineas.append({
+            "part_number": ln["part_number"], "descripcion": ln["descripcion"],
+            "unit_price": ln["unit_price"], "quote_qty": ln["quantity"],
+            "po_qty": po_qty, "pedido": pedido, "incluir_default": pedido,
+            "cantidad": po_qty if pedido else ln["quantity"],   # cantidad final propuesta
+        })
+
+    return {
+        "puede_crear": para_nosotros is not False and ref.get("vigente", True),
+        "cuenta_id": cuenta["id"], "cuenta_nombre": cuenta["nombre"],
+        "quote_id": ref["id"], "quote_nombre": ref["nombre"],
+        "quote_vigente": ref.get("vigente"), "quote_stage": ref.get("quote_stage"),
+        "quote_referenciada": ref.get("referenciada", False),
+        "currency_id": tm["currency_id"], "moneda": po.get("moneda", "") or tm["moneda"],
+        "terms": tm["terminos_pago"],
+        "po_number": po.get("po_number", ""),
+        "para_nosotros": para_nosotros,
+        "lineas": lineas,
+        # Trazabilidad: de dónde sale cada dato (el usuario lo ve en el previo).
+        "origen": {
+            "cuenta": "cliente del CRM" + (" (derivado de la cotización citada)" if ref.get("referenciada") else ""),
+            "cotizacion": ref["nombre"] + (" · citada en el PO" if ref.get("referenciada") else " · mayor cobertura"),
+            "terminos": "términos de pago de la cuenta" if tm["terminos_pago"] else "⚠ la cuenta no tiene términos configurados",
+            "moneda": "moneda de la cuenta",
+            "po_number": "número de la orden de compra del cliente",
+            "cantidades": "cantidades del PO (lo que ordenó el cliente)",
+            "precios": "precios de la cotización de referencia",
+        },
+    }
+
+
 def _precio_coincide(po_precio: float | None, cot_precio: float | None) -> bool:
     if po_precio is None or cot_precio is None:
         return True  # sin precio en el PO → no se marca discrepancia de precio
@@ -401,12 +455,16 @@ def cotejar(po: dict) -> dict:
         discrepancias.insert(0, f"⚠ La orden va dirigida a «{po.get('proveedor','otro')}», no a nosotros. "
                                 f"CONFIRMA que esta orden de compra es para nosotros antes de crear la Sales Order.")
 
+    # DRAFT de la Sales Order (para el PREVIO). Referencia = candidata top (citada o mayor cobertura).
+    so_draft = _armar_draft(cuenta, tm, po, items_out, candidatas, quotes, para_nosotros)
+
     return {
         "ok": True,
         "cuenta": cuenta,
         "po_number": po.get("po_number", ""),
         "proveedor": po.get("proveedor", ""),
-        "para_nosotros": para_nosotros,               # True / False / None (no lo dice)
+        "para_nosotros": para_nosotros,
+        "so_draft": so_draft,               # True / False / None (no lo dice)
         "terminos_pago": tm["terminos_pago"],         # default_terms del cliente
         "moneda": po.get("moneda", "") or tm["moneda"],
         "currency_id": tm["currency_id"],

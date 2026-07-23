@@ -3087,6 +3087,37 @@ def _procesar_orden_compra(stream_id: str, file_url: str, nombre: str = "orden",
     log.info(f"Cotejo PO emitido | {cotejo.get('resumen','')}")
 
 
+def _crear_so_confirmada(stream_id: str, draft: dict) -> None:
+    """Crea la Sales Order tras la aprobación del usuario en el previo (metadata.so_action='crear').
+    Escribe al CRM SOLO aquí, con el draft ya confirmado. Emite el widget [SO_CREADA]."""
+    try:
+        import sales_order
+    except Exception as e:
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": f"No pude crear la Sales Order (módulo no disponible: {e}).",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+    _log_stream(stream_id, "Creando Sales Order en 1CRM…", "info")
+    res = sales_order.crear_sales_order(draft or {})
+    if not res.get("ok"):
+        _log_stream(stream_id, f"No se pudo crear la Sales Order: {res.get('error','')}", "error")
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": f"No pude crear la Sales Order: {res.get('error','error desconocido')}.",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[SO_CREADA]" + json.dumps(res, ensure_ascii=False),
+        "procesado": True, "metadata": {"so_creada": True},
+    }).execute()
+    _log_stream(stream_id, f"Sales Order {res.get('so_numero','')} creada ✓", "ok")
+    log.info(f"Sales Order creada: {res.get('so_id')} ({res.get('so_numero')})")
+
+
 def procesar_mensaje(msg: dict) -> None:
     msg_id    = msg["id"]
     stream_id = msg.get("stream_id", "")
@@ -3111,14 +3142,16 @@ def procesar_mensaje(msg: dict) -> None:
 
     # PIPELINE DE ORDEN DE COMPRA: si es un stream 'ordenes' y llega un archivo (PO), léelo y
     # coteja contra las cotizaciones del cliente — sin pasar por el modelo. Emite el widget y termina.
-    try:
-        _md0 = msg.get("metadata") or {}
-        _po_url = (_md0.get("file_url") or _md0.get("po_url")) if isinstance(_md0, dict) else None
-    except Exception:
-        _po_url = None
+    _md0 = msg.get("metadata") if isinstance(msg.get("metadata"), dict) else {}
+    _po_url = _md0.get("file_url") or _md0.get("po_url")
     if _tipo_stream in ("ordenes", "sales_order") and _po_url:
         _procesar_orden_compra(stream_id, _po_url,
                                (_md0.get("file_name") or "orden"), _md0.get("file_mime", ""))
+        return
+
+    # CREAR la Sales Order: el usuario confirmó desde el previo (metadata.so_action == "crear").
+    if _tipo_stream in ("ordenes", "sales_order") and _md0.get("so_action") == "crear":
+        _crear_so_confirmada(stream_id, _md0.get("draft") or {})
         return
 
     # Los triggers [SISTEMA:...] los maneja el widget del frontend — no necesitan respuesta de Claude
