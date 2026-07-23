@@ -49,6 +49,30 @@ def _crm_get(path: str, params: dict | None = None) -> dict:
         return {}
 
 
+def _crm_post(model: str, data: dict) -> dict:
+    r = httpx.post(f"{CRM_BASE}/api.php/data/{model}", json={"data": data}, auth=CRM_AUTH, timeout=45)
+    try:
+        return r.json()
+    except Exception:
+        return {"error": r.text[:200]}
+
+
+def _crm_patch(model: str, rec_id: str, data: dict) -> dict:
+    r = httpx.patch(f"{CRM_BASE}/api.php/data/{model}/{rec_id}", json={"data": data}, auth=CRM_AUTH, timeout=45)
+    try:
+        return r.json()
+    except Exception:
+        return {"error": r.text[:200]}
+
+
+def _crm_delete(model: str, rec_id: str) -> dict:
+    r = httpx.delete(f"{CRM_BASE}/api.php/data/{model}/{rec_id}", auth=CRM_AUTH, timeout=45)
+    try:
+        return r.json()
+    except Exception:
+        return {"error": r.text[:120]}
+
+
 def _sin_acentos(s: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFKD", s or "") if not unicodedata.combining(c))
 
@@ -393,4 +417,81 @@ def cotejar(po: dict) -> dict:
         "resumen": f"{encontrados}/{len(items_out)} productos ubicados en cotizaciones; "
                    f"{len(candidatas)} cotización(es) candidata(s); "
                    f"{len(discrepancias)} discrepancia(s).",
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# 4. ESCRITURA (Fase 2) — crear la Sales Order convirtiendo la cotización
+# ─────────────────────────────────────────────────────────────
+def crear_sales_order(draft: dict) -> dict:
+    """Crea la Sales Order a partir del draft aprobado. NO se llama sin aprobación del usuario.
+
+    draft = {
+      cuenta_id, currency_id, terms, po_number, quote_id,
+      lineas: [{part_number, cantidad, incluir}]   # incluir=False → se quita de la SO
+    }
+
+    Mecánica (verificada en 1CRM): al crear la SO con related_quote_id, 1CRM AUTO-COPIA las líneas
+    de la cotización y la marca 'Closed Accepted'. Luego ajustamos cantidades al PO (PATCH) y
+    quitamos las líneas que el usuario no seleccionó (DELETE). Devuelve {ok, so_id, url, ...}.
+    """
+    if not CRM_BASE:
+        return {"error": "1CRM no configurado"}
+    cuenta_id = draft.get("cuenta_id")
+    quote_id  = draft.get("quote_id")
+    if not cuenta_id or not quote_id:
+        return {"error": "faltan cuenta_id o quote_id para crear la Sales Order"}
+
+    # 1) Crear la SO ligada a la cotización → auto-copia líneas + auto-acepta la cotización.
+    payload = {
+        "billing_account_id": cuenta_id,
+        "related_quote_id":   quote_id,
+        "so_stage":           "Ordered",
+        "purchase_order_num": draft.get("po_number", "") or "",
+    }
+    if draft.get("currency_id"):
+        payload["currency_id"] = draft["currency_id"]
+    if draft.get("terms"):
+        payload["terms"] = draft["terms"]
+    r = _crm_post("SalesOrder", payload)
+    so_id = r.get("id")
+    if not so_id:
+        return {"error": f"no se pudo crear la Sales Order: {r}"}
+
+    # 2) Ajustar líneas: mapear por número de parte (compacto). PATCH cantidad, DELETE no-seleccionadas.
+    sel = {}
+    for ln in draft.get("lineas", []):
+        pc = _compact(ln.get("part_number", ""))
+        if pc:
+            sel[pc] = ln
+    full = _crm_get(f"data/SalesOrder/{so_id}")
+    lineas_so = (full.get("record", full).get("line_items") or [])
+    ajustadas, quitadas = 0, 0
+    for li in lineas_so:
+        pc = _compact(li.get("mfr_part_no", ""))
+        d = sel.get(pc)
+        if d is None or d.get("incluir") is False:
+            _crm_delete("SalesOrderLine", li["id"]); quitadas += 1
+            continue
+        qty = d.get("cantidad")
+        if qty is not None and _num(li.get("quantity")) != _num(qty):
+            _crm_patch("SalesOrderLine", li["id"], {"quantity": qty}); ajustadas += 1
+
+    # 3) Reafirmar cotización aceptada (normalmente ya quedó 'Closed Accepted' sola; si no, enforce).
+    q = _crm_get(f"data/Quote/{quote_id}").get("record", {})
+    if (q.get("quote_stage") or "") != "Closed Accepted":
+        _crm_patch("Quote", quote_id, {"quote_stage": "Closed Accepted"})
+    cotizacion_ya_aceptada = (q.get("quote_stage") == "Closed Accepted")
+
+    fin = _crm_get(f"data/SalesOrder/{so_id}").get("record", {})
+    return {
+        "ok": True,
+        "so_id": so_id,
+        "so_numero": fin.get("so_number"),
+        "nombre": fin.get("name", ""),
+        "lineas_finales": len(fin.get("line_items") or []),
+        "ajustadas": ajustadas,
+        "quitadas": quitadas,
+        "cotizacion_ya_estaba_aceptada": cotizacion_ya_aceptada,
+        "url": f"{CRM_BASE}/index.php?module=SalesOrders&record={so_id}",
     }
