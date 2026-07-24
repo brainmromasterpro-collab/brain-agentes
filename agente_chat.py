@@ -1225,6 +1225,28 @@ def tool_publicar_sin_imagen_rfq(rfq_id: str) -> dict:
         return {"error": str(e)}
 
 
+_CARAC_NO_TECNICA = re.compile(
+    r'\b(stock|disponibilidad|availability|available|inventory|inventario|backorder|'
+    r'lead\s*time|eta|env[íi]o|shipping|delivery|ship\s*date|fecha\s*de\s*env[íi]o|'
+    r'cantidad\s*disponible|quantity\s*available|units?\s*in\s*stock)\b',
+    re.IGNORECASE,
+)
+
+
+def _filtrar_caracteristicas_no_tecnicas(caracteristicas: list | None) -> list:
+    """Quita de la ficha técnica cualquier dato que NO sea especificación del producto en sí sino
+    inventario/logística del proveedor en el momento de la extracción (stock disponible, fecha de
+    envío estimada, lead time, etc.) — eso cambia todo el tiempo y no debe quedar grabado en el
+    catálogo de 1CRM ni mostrarse como si fuera una spec técnica."""
+    out = []
+    for c in (caracteristicas or []):
+        etiqueta = str(c).split(":", 1)[0]
+        if _CARAC_NO_TECNICA.search(etiqueta):
+            continue
+        out.append(c)
+    return out
+
+
 def _extraer_producto_link(url: str) -> dict:
     """Extrae datos de producto de la página (og tags + JSON-LD). Funciona en sitios estándar
     (Shopify/e-commerce). Sitios con protección anti-bots (ej. Festo) devuelven error 403 →
@@ -1248,7 +1270,10 @@ def _extraer_producto_link(url: str) -> dict:
         candidatos: list = []
         for m in _re.finditer(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>', html, _re.S | _re.I):
             try:
-                data = json.loads(m.group(1))
+                # strict=False: algunos sitios (thepneumaticstore) meten saltos de línea/tabs sin
+                # escapar dentro de strings del JSON-LD (típico en descripciones multilínea) — un
+                # json.loads() estricto lo rechaza por completo y se pierde TODO el Product.
+                data = json.loads(m.group(1), strict=False)
                 candidatos = list(data) if isinstance(data, list) else [data]
                 # Muchos sitios (Drupal/Yoast) envuelven los nodos en {"@graph": [...]} en vez de
                 # exponer el Product directo — sin esto se pierde el nodo Product por completo.
@@ -1300,7 +1325,7 @@ def _extraer_producto_link(url: str) -> dict:
             "precio_costo": meta("product:price:amount") or offers.get("price") or "",
             "moneda":       meta("product:price:currency") or offers.get("priceCurrency") or "",
             "descripcion":  (ld.get("description") or meta("og:description") or "")[:600],
-            "caracteristicas": caracteristicas[:14],
+            "caracteristicas": _filtrar_caracteristicas_no_tecnicas(caracteristicas)[:14],
             "imagen_url":   img or meta("og:image") or "",
         }
 
@@ -1409,7 +1434,7 @@ def _extraer_producto_link(url: str) -> dict:
                 "ok": True, "url": url, "nombre": d.get("nombre", ""), "marca": d.get("marca", ""),
                 "part_number": d.get("part_number", ""), "precio_costo": d.get("precio_costo", "") or "",
                 "moneda": d.get("moneda", "") or "", "descripcion": (d.get("descripcion", "") or "")[:600],
-                "caracteristicas": [str(c) for c in (d.get("caracteristicas") or [])][:14],
+                "caracteristicas": _filtrar_caracteristicas_no_tecnicas([str(c) for c in (d.get("caracteristicas") or [])])[:14],
                 "imagen_url": d.get("imagen_url", "") or "",
             }
         except Exception as e:
@@ -1437,25 +1462,51 @@ def _extraer_producto_link(url: str) -> dict:
             merged["imagen_url"] = p2["imagen_url"]
         return merged
 
+    def _mejor_de(a, b):
+        """Combina dos resultados de extracción, prefiriendo el dato no vacío de cada uno (y la
+        lista de características más larga). Se usa para combinar el intento rápido (sin JS) con
+        el de render completo (con JS) cuando ninguno solo trae todo (caso Littelfuse: el rápido
+        trae nombre/marca/part_number de meta tags, pero la tabla de specs solo se pinta con JS)."""
+        if not a:
+            return b
+        if not b:
+            return a
+        merged = dict(a)
+        for k in ("part_number", "marca", "descripcion", "precio_costo", "moneda", "imagen_url", "nombre"):
+            if not merged.get(k) and b.get(k):
+                merged[k] = b[k]
+        if len(b.get("caracteristicas") or []) > len(merged.get("caracteristicas") or []):
+            merged["caracteristicas"] = b["caracteristicas"]
+        return merged
+
     scraper_tmpl = os.environ.get("SCRAPER_API_URL", "").strip()
 
     if scraper_tmpl:
         # Intento 1 — RÁPIDO (sin render): solo si el template traía render activado
         fast_tmpl = scraper_tmpl.replace("browser=true", "browser=false").replace("render_js=true", "render_js=false")
+        fast_parsed = None
         if fast_tmpl != scraper_tmpl:
             r = _fetch(fast_tmpl.replace("{url}", quote_plus(url)), 30)
             if r is not None and r.status_code == 200:
-                parsed = _parse_completo(r.text)  # fallback/relleno LLM (Futek, sitios sin schema, o Product 'delgado' como Mersen)
-                if parsed:
-                    return _traducir(parsed)
-        # Intento 2 — CON RENDER (lento pero pasa sitios JS/anti-bot como Festo)
+                fast_parsed = _parse_completo(r.text)  # fallback/relleno LLM (Futek, sitios sin schema, o Product 'delgado' como Mersen)
+                if fast_parsed and fast_parsed.get("caracteristicas"):
+                    return _traducir(fast_parsed)
+                # Sin características (posible sitio JS como Littelfuse, donde la tabla de specs
+                # solo existe tras ejecutar JS) → seguir al intento con render antes de conformarse.
+        # Intento 2 — CON RENDER (lento pero pasa sitios JS/anti-bot como Festo, y trae specs que
+        # solo se pintan con JS como en Littelfuse)
         r = _fetch(scraper_tmpl.replace("{url}", quote_plus(url)), 90)
         if r is None:
+            if fast_parsed:
+                return _traducir(fast_parsed)
             return {"error": "El scraper no respondió a tiempo. Reintenta o pega los datos manualmente."}
         if r.status_code != 200:
+            if fast_parsed:
+                return _traducir(fast_parsed)
             return {"error": f"HTTP {r.status_code} — el sitio bloquea el acceso. Pega los datos manualmente."}
-        parsed = _parse_completo(r.text)  # fallback/relleno LLM (Futek, sitios sin schema, o Product 'delgado' como Mersen)
-        return _traducir(parsed) if parsed else {"error": "No encontré datos de producto en el link (¿es una página de producto?)."}
+        render_parsed = _parse_completo(r.text)  # fallback/relleno LLM (Futek, sitios sin schema, o Product 'delgado' como Mersen)
+        combinado = _mejor_de(fast_parsed, render_parsed)
+        return _traducir(combinado) if combinado else {"error": "No encontré datos de producto en el link (¿es una página de producto?)."}
 
     # Sin scraper: fetch directo
     r = _fetch(url, 25, headers=hdrs)
