@@ -1245,10 +1245,17 @@ def _extraer_producto_link(url: str) -> dict:
                 or _re.search(rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']{_re.escape(prop)}["\']', html, _re.I)
             return m.group(1) if m else None
         ld: dict = {}
+        candidatos: list = []
         for m in _re.finditer(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>', html, _re.S | _re.I):
             try:
                 data = json.loads(m.group(1))
-                for obj in (data if isinstance(data, list) else [data]):
+                candidatos = list(data) if isinstance(data, list) else [data]
+                # Muchos sitios (Drupal/Yoast) envuelven los nodos en {"@graph": [...]} en vez de
+                # exponer el Product directo — sin esto se pierde el nodo Product por completo.
+                for c in list(candidatos):
+                    if isinstance(c, dict) and isinstance(c.get("@graph"), list):
+                        candidatos.extend(c["@graph"])
+                for obj in candidatos:
                     if isinstance(obj, dict) and obj.get("@type") == "Product":
                         ld = obj
                         break
@@ -1261,9 +1268,22 @@ def _extraer_producto_link(url: str) -> dict:
             offers = offers[0] if offers else {}
         brand = ld.get("brand")
         brand = brand.get("name") if isinstance(brand, dict) else brand
+        if not brand:
+            # Fallback: el nodo Organization del mismo @graph (patrón Drupal/Yoast) suele traer
+            # el fabricante cuando el Product no expone "brand" directo (caso Mersen).
+            for obj in candidatos:
+                if isinstance(obj, dict) and obj.get("@type") == "Organization" and obj.get("name"):
+                    brand = obj["name"]
+                    break
         img = ld.get("image")
         if isinstance(img, list):
             img = img[0] if img else None
+        if isinstance(img, dict):
+            img = img.get("url") or img.get("contentUrl") or None
+        if img and not str(img).lower().startswith(("http://", "https://", "//")):
+            # Algunos sitios (Mersen) ponen solo un filename/id en "image.url", no una URL
+            # completa — inútil para descargar la foto; se prefiere og:image en ese caso.
+            img = None
         nombre = ld.get("name") or meta("og:title")
         if not nombre:
             return None
@@ -1396,6 +1416,27 @@ def _extraer_producto_link(url: str) -> dict:
             log.warning(f"_parse_llm falló: {e}")
             return None
 
+    def _parse_completo(html: str):
+        """_parse() (rápido, JSON-LD/og) + relleno con _parse_llm() cuando el resultado viene
+        'delgado' (sin part_number NI marca) — sin esto, un Product de JSON-LD que solo trae
+        nombre+imagen (caso Mersen: sin sku/mpn/brand) se quedaba así aunque el texto visible de
+        la página SÍ tuviera los datos técnicos."""
+        p = _parse(html)
+        if p and p.get("part_number") and p.get("marca"):
+            return p
+        p2 = _parse_llm(html)
+        if not p:
+            return p2
+        if not p2:
+            return p
+        merged = dict(p)
+        for k in ("part_number", "marca", "caracteristicas", "descripcion", "precio_costo", "moneda"):
+            if not merged.get(k) and p2.get(k):
+                merged[k] = p2[k]
+        if not merged.get("imagen_url") and p2.get("imagen_url"):
+            merged["imagen_url"] = p2["imagen_url"]
+        return merged
+
     scraper_tmpl = os.environ.get("SCRAPER_API_URL", "").strip()
 
     if scraper_tmpl:
@@ -1404,7 +1445,7 @@ def _extraer_producto_link(url: str) -> dict:
         if fast_tmpl != scraper_tmpl:
             r = _fetch(fast_tmpl.replace("{url}", quote_plus(url)), 30)
             if r is not None and r.status_code == 200:
-                parsed = _parse(r.text) or _parse_llm(r.text)  # fallback LLM (Futek y sitios sin schema)
+                parsed = _parse_completo(r.text)  # fallback/relleno LLM (Futek, sitios sin schema, o Product 'delgado' como Mersen)
                 if parsed:
                     return _traducir(parsed)
         # Intento 2 — CON RENDER (lento pero pasa sitios JS/anti-bot como Festo)
@@ -1413,7 +1454,7 @@ def _extraer_producto_link(url: str) -> dict:
             return {"error": "El scraper no respondió a tiempo. Reintenta o pega los datos manualmente."}
         if r.status_code != 200:
             return {"error": f"HTTP {r.status_code} — el sitio bloquea el acceso. Pega los datos manualmente."}
-        parsed = _parse(r.text) or _parse_llm(r.text)  # fallback LLM para sitios sin schema (Futek)
+        parsed = _parse_completo(r.text)  # fallback/relleno LLM (Futek, sitios sin schema, o Product 'delgado' como Mersen)
         return _traducir(parsed) if parsed else {"error": "No encontré datos de producto en el link (¿es una página de producto?)."}
 
     # Sin scraper: fetch directo
@@ -1423,7 +1464,7 @@ def _extraer_producto_link(url: str) -> dict:
     if r.status_code != 200:
         return {"error": f"HTTP {r.status_code} — el sitio bloquea el acceso automático "
                          f"(sin SCRAPER_API_URL configurado). Pega los datos manualmente."}
-    parsed = _parse(r.text) or _parse_llm(r.text)  # fallback LLM para sitios sin schema (Futek)
+    parsed = _parse_completo(r.text)  # fallback/relleno LLM (Futek, sitios sin schema, o Product 'delgado' como Mersen)
     return _traducir(parsed) if parsed else {"error": "No encontré datos de producto en el link (¿es una página de producto?)."}
 
 
