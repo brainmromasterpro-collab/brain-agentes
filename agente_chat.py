@@ -1546,12 +1546,176 @@ def _ajustar_imagen_500(content: bytes) -> bytes:
     return buf.getvalue()
 
 
+def _tiene_marca_de_agua(imagen_bytes: bytes) -> bool:
+    """Claude Vision: ¿esta foto tiene marca de agua / texto superpuesto / logo de un tercero
+    ESTAMPADO ENCIMA de la foto (nombre de sitio, dominio, banda diagonal semi-transparente, etc.)?
+    NO cuenta un logo grabado en la pieza física ni texto de un empaque — eso es normal. Ante la
+    duda, se asume que NO tiene (mejor usar la foto que gastar en una búsqueda que quizá tampoco
+    encuentre nada mejor)."""
+    try:
+        from PIL import Image
+        import io as _io
+        im = Image.open(_io.BytesIO(imagen_bytes))
+        fmt = (im.format or "JPEG").upper()
+        media_type = {"JPEG": "image/jpeg", "PNG": "image/png", "WEBP": "image/webp"}.get(fmt, "image/jpeg")
+        b64 = __import__("base64").standard_b64encode(imagen_bytes).decode("utf-8")
+        resp = claude.messages.create(
+            model="claude-haiku-4-5-20251001", max_tokens=10, timeout=20,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
+                    {"type": "text", "text": (
+                        "¿Esta imagen tiene una marca de agua, texto superpuesto (nombre de sitio, "
+                        "dominio, 'sample', franja diagonal semi-transparente) puesto ENCIMA de la "
+                        "foto? NO cuenta un logo grabado en la pieza física ni texto de un empaque/"
+                        "etiqueta del producto. Responde SOLO 'SI' o 'NO'."
+                    )},
+                ],
+            }],
+        )
+        txt = (resp.content[0].text if resp.content else "").strip().upper()
+        return txt.startswith("SI") or txt.startswith("SÍ") or txt.startswith("YES")
+    except Exception as e:
+        log.warning(f"Chequeo de marca de agua falló, se asume limpia: {e}")
+        return False
+
+
+def _buscar_imagen_limpia(marca: str, modelo: str) -> bytes | None:
+    """Cuando la foto extraída del link/PDF tiene marca de agua, busca un reemplazo limpio
+    reusando el pipeline de agente_imagen.py: Google/SerpAPI Images → Claude Vision elige la
+    mejor → Remove.bg quita fondo. Devuelve PNG 500x500 fondo blanco, o None si no hay nada
+    aceptable. Import perezoso: agente_imagen ya trae sus propias credenciales/checks."""
+    try:
+        import agente_imagen as ai
+    except Exception as e:
+        log.warning(f"agente_imagen no disponible para buscar imagen de reemplazo: {e}")
+        return None
+    try:
+        urls = ai.buscar_imagenes(marca, modelo)
+        if not urls:
+            return None
+        candidatas = ai.descargar_candidatas(urls)
+        if not candidatas:
+            return None
+        idx = ai.evaluar_con_claude_vision(marca, modelo, candidatas)
+        if idx is None:
+            return None
+        ganadora = candidatas[idx]
+        sin_fondo = ai.remover_fondo(ganadora["bytes"], ganadora["url"])
+        return ai.optimizar_500x500(sin_fondo if sin_fondo else ganadora["bytes"])
+    except Exception as e:
+        log.warning(f"Búsqueda de imagen de reemplazo falló: {e}")
+        return None
+
+
+def _buscar_logo_marca(marca: str) -> bytes | None:
+    """Último recurso cuando NO se encontró ninguna foto real del producto: busca el logo del
+    fabricante por internet (mismo buscador de imágenes). Fondo blanco + 500x500 igual que las
+    fotos de producto."""
+    marca = (marca or "").strip()
+    if not marca:
+        return None
+    try:
+        import agente_imagen as ai
+    except Exception as e:
+        log.warning(f"agente_imagen no disponible para buscar logo de marca: {e}")
+        return None
+    try:
+        urls = ai.buscar_imagenes_google(marca, "logo") or ai.buscar_imagenes_serpapi(marca, "logo")
+        if not urls:
+            return None
+        candidatas = ai.descargar_candidatas(urls)
+        if not candidatas:
+            return None
+        ganadora = candidatas[0]  # logos no necesitan Vision para elegir
+        sin_fondo = ai.remover_fondo(ganadora["bytes"], ganadora["url"])
+        return ai.optimizar_500x500(sin_fondo if sin_fondo else ganadora["bytes"])
+    except Exception as e:
+        log.warning(f"Búsqueda de logo de marca falló: {e}")
+        return None
+
+
+def _logo_mro() -> bytes | None:
+    """Último-último recurso: el logo de MRO, cuando ni la foto del producto ni el logo del
+    fabricante se pudieron conseguir. Pendiente: falta el archivo — configurar MRO_LOGO_URL."""
+    url = os.environ.get("MRO_LOGO_URL", "").strip()
+    if not url:
+        return None
+    try:
+        r = httpx.get(url, timeout=20, follow_redirects=True)
+        r.raise_for_status()
+        return r.content
+    except Exception as e:
+        log.warning(f"No se pudo descargar el logo de MRO ({url[:60]}): {e}")
+        return None
+
+
+def _subir_imagen_bytes(content: bytes, prefix: str, nombre: str = "producto") -> str:
+    """Sube bytes de imagen (PNG) ya procesados a Supabase Storage y devuelve la URL pública."""
+    safe = (nombre or "producto").replace("/", "-").replace(" ", "_")
+    path = f"{prefix}/{safe}_{uuid.uuid4().hex[:8]}.png"
+    supabase.storage.from_("product-images").upload(
+        path=path, file=content, file_options={"content-type": "image/png", "upsert": "true"},
+    )
+    return supabase.storage.from_("product-images").get_public_url(path)
+
+
+def _subir_logo_fallback(part_number: str, marca: str) -> str | None:
+    """Cuando el link/PDF no trajo NINGUNA imagen: busca el logo del fabricante, y si tampoco hay,
+    el de MRO. Sube el resultado y devuelve la URL, o None si no hay nada que mostrar."""
+    logo = _buscar_logo_marca(marca)
+    if not logo:
+        logo_mro = _logo_mro()
+        logo = _ajustar_imagen_500(logo_mro) if logo_mro else None
+    if not logo:
+        return None
+    try:
+        url = _subir_imagen_bytes(logo, "logo", part_number)
+        log.info(f"Logo de respaldo subido (sin foto de producto disponible): {url[:70]}")
+        return url
+    except Exception as e:
+        log.warning(f"No se pudo subir el logo de respaldo: {e}")
+        return None
+
+
+def _procesar_imagen_producto(content: bytes | None, marca: str = "", modelo: str = "") -> bytes | None:
+    """Punto único de calidad de imagen para productos publicados desde link o ficha técnica PDF:
+    1) si la foto trae marca de agua → busca reemplazo limpio en internet (Vision + Remove.bg).
+    2) si no hay NINGUNA foto (ni la original ni un reemplazo) → logo del fabricante.
+    3) si tampoco hay logo de marca → logo de MRO.
+    Devuelve PNG 500x500 fondo blanco, o None si de plano no hay nada que mostrar."""
+    if content:
+        try:
+            if _tiene_marca_de_agua(content):
+                log.info(f"Marca de agua detectada en imagen de {marca} {modelo} — buscando reemplazo")
+                limpia = _buscar_imagen_limpia(marca, modelo)
+                if limpia:
+                    return limpia
+                content = None  # no sirve la que traíamos ni se encontró reemplazo → sigue a logos
+        except Exception as e:
+            log.warning(f"Chequeo/reemplazo de marca de agua falló, se usa la foto original: {e}")
+
+    if content:
+        return _ajustar_imagen_500(content)
+
+    logo_marca = _buscar_logo_marca(marca)
+    if logo_marca:
+        return logo_marca
+
+    logo_mro = _logo_mro()
+    if logo_mro:
+        return _ajustar_imagen_500(logo_mro)
+
+    return None
+
+
 def tool_extraer_ficha_pdf(url: str) -> dict:
     """Extrae el/los producto(s) de una ficha técnica (PDF/Excel/Word) por URL: nombre, marca,
     part number, descripción y características técnicas de cada variante/SKU encontrado. Si el PDF
-    trae una foto embebida (p.ej. la portada), se re-hospeda en Supabase Storage y se asigna como
-    imagen_url a todos los productos devueltos. Import perezoso para no romper el chat si falta
-    alguna dependencia de parsing en el entorno."""
+    trae una foto embebida (p.ej. la portada), se verifica (marca de agua) y re-hospeda en Supabase
+    Storage, asignándose como imagen_url a todos los productos devueltos. Import perezoso para no
+    romper el chat si falta alguna dependencia de parsing en el entorno."""
     try:
         import ficha_tecnica
     except Exception as e:
@@ -1560,28 +1724,34 @@ def tool_extraer_ficha_pdf(url: str) -> dict:
     datos = ficha_tecnica.leer_ficha(url=url)
     b64  = datos.pop("imagen_b64", "")
     datos.pop("imagen_ext", "")
+    productos = datos.get("productos", [])
+    primero = productos[0] if productos else {}
+    content = None
     if b64:
         try:
             import base64 as _b64mod
-            content = _ajustar_imagen_500(_b64mod.b64decode(b64))
-            path = f"ficha/{uuid.uuid4().hex[:10]}.png"
-            supabase.storage.from_("product-images").upload(
-                path=path, file=content, file_options={"content-type": "image/png", "upsert": "true"},
-            )
-            img_url = supabase.storage.from_("product-images").get_public_url(path)
-            for p in datos.get("productos", []):
-                p["imagen_url"] = img_url
-            log.info(f"Imagen extraída del PDF, ajustada a 500x500 y re-hospedada: {img_url[:70]}")
+            content = _b64mod.b64decode(b64)
         except Exception as e:
-            log.warning(f"No se pudo subir la imagen extraída del PDF: {e}")
+            log.warning(f"No se pudo decodificar la imagen embebida del PDF: {e}")
+
+    try:
+        final = _procesar_imagen_producto(content, primero.get("marca", ""), primero.get("part_number", ""))
+        if final:
+            img_url = _subir_imagen_bytes(final, "ficha", primero.get("part_number", ""))
+            for p in productos:
+                p["imagen_url"] = img_url
+            log.info(f"Imagen de ficha técnica lista (500x500) y re-hospedada: {img_url[:70]}")
+    except Exception as e:
+        log.warning(f"No se pudo procesar/subir la imagen de la ficha técnica: {e}")
     return datos
 
 
-def _rehost_imagen(imagen_url: str, part_number: str = "") -> str:
-    """Descarga la imagen y la re-hospeda en Supabase Storage, para que el publicador pueda
-    subirla a 1CRM. Sitios como Festo bloquean la descarga directa desde IPs de datacenter
-    (Railway) → si el directo falla, se reintenta vía ScrapingAnt (proxy residencial). Si todo
-    falla, devuelve la URL original (el publicador hará su propio fallback)."""
+def _rehost_imagen(imagen_url: str, part_number: str = "", marca: str = "") -> str:
+    """Descarga la imagen, la pasa por el chequeo de calidad (marca de agua → busca reemplazo o
+    logo) y la re-hospeda en Supabase Storage, para que el publicador pueda subirla a 1CRM. Sitios
+    como Festo bloquean la descarga directa desde IPs de datacenter (Railway) → si el directo
+    falla, se reintenta vía ScrapingAnt (proxy residencial). Si todo falla, devuelve la URL
+    original (el publicador hará su propio fallback)."""
     if not imagen_url:
         return imagen_url
     from urllib.parse import quote_plus
@@ -1609,12 +1779,16 @@ def _rehost_imagen(imagen_url: str, part_number: str = "") -> str:
             return imagen_url
         content_type = r.headers.get("content-type", "image/jpeg").lower()
         try:
-            # Ajusta a 500x500 (tamaño estándar de foto de producto) y normaliza a PNG de paso
-            # (1CRM no acepta WebP/AVIF/etc y el publicador los subiría con extensión errónea).
-            content = _ajustar_imagen_500(r.content)
+            # Chequeo de calidad (marca de agua → reemplazo o logo) + ajuste a 500x500 (tamaño
+            # estándar) + normaliza a PNG de paso (1CRM no acepta WebP/AVIF/etc).
+            content = _procesar_imagen_producto(r.content, marca, part_number)
+            if not content:
+                # Ni la foto original servía (marca de agua) ni se encontró reemplazo/logo —
+                # mejor sin imagen que con una marcada.
+                return ""
             ct, ext = "image/png", "png"
         except Exception as _e_conv:
-            log.warning(f"No se pudo ajustar la imagen a 500x500 ({content_type}): {_e_conv}")
+            log.warning(f"No se pudo procesar la imagen ({content_type}): {_e_conv}")
             content, ct = r.content, content_type
             ext = "png" if "png" in content_type else "jpg"
         safe = (part_number or "producto").replace("/", "-").replace(" ", "_")
@@ -1747,7 +1921,7 @@ def _publicar_producto_uno(
     rfq_id_str = f"LINK-{now.year}-{now.month:02d}{now.day:02d}-{str(uuid.uuid4())[:6].upper()}"
     # Re-hospedar la imagen en Supabase (sitios como Festo bloquean la descarga directa del
     # publicador) para que sí se suba a 1CRM.
-    foto_final = _rehost_imagen(imagen_url, part_number) if imagen_url else None
+    foto_final = _rehost_imagen(imagen_url, part_number, marca) if imagen_url else _subir_logo_fallback(part_number, marca)
     rfq_row: dict = {
         "stream_id": clean_stream, "rfq_id": rfq_id_str,
         "modelo": part_number or nombre, "marca": marca or "",
