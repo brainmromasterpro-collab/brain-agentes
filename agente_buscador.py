@@ -245,6 +245,58 @@ def buscar_en_crm_productos(marca: str, modelo: str) -> list[dict]:
 
 
 # ─────────────────────────────────────────
+# BÚSQUEDA POR HISTORIAL DE COMPRA (PurchaseOrder) — prioridad 1
+# ─────────────────────────────────────────
+# A diferencia de buscar_en_crm_proveedores (que solo matchea por NOMBRE de marca contra
+# Accounts tipo Supplier), esto busca si YA le compramos ESTE producto (mismo part number)
+# a algún proveedor antes, revisando las líneas de Purchase Orders reales — evidencia directa,
+# no una adivinanza por nombre. Pedido explícito: priorizar un proveedor ya usado por encima
+# de proveedores por nombre y de la búsqueda web.
+def buscar_proveedor_por_historial(marca: str, modelo: str, limite_pos: int = 200) -> list[dict]:
+    if not modelo or not modelo.strip():
+        return []
+    try:
+        data = onecrm_get("data/PurchaseOrder", {"order_by": "date_modified desc", "limit": limite_pos})
+        vistos_supplier: set = set()
+        resultados: list[dict] = []
+        for po in data.get("records", []):
+            for li in (po.get("line_items") or []):
+                pn = (li.get("mfr_part_no") or "").strip()
+                if not pn or not _coincide_modelo(modelo, pn):
+                    continue
+                # La lista de PurchaseOrder viene "delgada" (sin supplier_id/currency) — se pide
+                # el detalle SOLO del PO que ya matcheó por part number (pocos, no los 200).
+                po_id = po.get("id")
+                detalle = onecrm_get(f"data/PurchaseOrder/{po_id}") if po_id else {}
+                po_full = detalle.get("record", detalle)
+                supplier_id = po_full.get("supplier_id")
+                if not supplier_id or supplier_id in vistos_supplier:
+                    continue
+                vistos_supplier.add(supplier_id)
+                cuenta = onecrm_get(f"data/Account/{supplier_id}")
+                cuenta = cuenta.get("record", cuenta) if isinstance(cuenta, dict) else {}
+                moneda_m = re.search(r'\b([A-Z]{3})\b', str(po_full.get("currency", "")))
+                resultados.append({
+                    "proveedor":       cuenta.get("name") or po.get("supplier") or "Proveedor con historial",
+                    "nombre_producto": li.get("name") or f"{marca} {modelo}",
+                    "precio_orig":     float(li.get("unit_price")) if li.get("unit_price") else None,
+                    "moneda":          moneda_m.group(1) if moneda_m else "MXN",
+                    "disponibilidad":  "bajo_pedido",
+                    "tiempo_entrega":  "Consultar (ya se le ha comprado antes)",
+                    "condicion":       "nuevo",
+                    "fuente":          "historial_po",
+                    "url":             f"{ONECRM_BASE}/index.php?module=Accounts&record={supplier_id}",
+                    "dist_autorizado": False,
+                    "notas":           f"Ya se le compró este producto antes (PO {po.get('name','')})",
+                })
+        log.info(f"Historial PO: {len(resultados)} proveedor(es) ya usados para '{modelo}'")
+        return resultados
+    except Exception as e:
+        log.error(f"Error búsqueda historial PO: {e}")
+        return []
+
+
+# ─────────────────────────────────────────
 # BÚSQUEDA EN 1CRM — PROVEEDORES
 # ─────────────────────────────────────────
 # Proveedores que NUNCA deben aparecer como opción:
@@ -799,12 +851,14 @@ def rankear_con_claude(
 
     # Separar fuentes para el prompt
     crm_productos   = [r for r in resultados_raw if r.get("fuente") == "1crm_productos"]
+    historial_po    = [r for r in resultados_raw if r.get("fuente") == "historial_po"][:2]  # máx 2
     crm_proveedores = [r for r in resultados_raw if r.get("fuente") == "1crm_proveedores"][:2]  # máx 2
     shopping        = [r for r in resultados_raw if r.get("fuente") == "google_shopping"]
-    otros           = [r for r in resultados_raw if r.get("fuente") not in ("1crm_productos", "1crm_proveedores")]
+    otros           = [r for r in resultados_raw if r.get("fuente") not in
+                       ("1crm_productos", "historial_po", "1crm_proveedores")]
 
     # Reconstruir lista limitando proveedores CRM para no desplazar fuentes con precio
-    resultados_filtrados = crm_productos + crm_proveedores + [
+    resultados_filtrados = crm_productos + historial_po + crm_proveedores + [
         r for r in otros if r not in crm_proveedores
     ]
 
@@ -838,6 +892,17 @@ Los slots restantes deben llenarse con las mejores fuentes externas (preferir go
 
 """
 
+    historial_seccion = ""
+    if historial_po:
+        historial_seccion = f"""
+⚠️ YA LE COMPRAMOS ESTO ANTES A ESTE PROVEEDOR (historial de Purchase Orders reales) — PRIORIDAD ALTA:
+{json.dumps([_para_prompt(r) for r in historial_po], ensure_ascii=False, indent=2)}
+
+REGLA: Inclúyelo en un slot de rank alto (score_confianza=5) — es evidencia de una compra REAL pasada,
+más confiable que un proveedor matcheado solo por nombre (1crm_proveedores).
+
+"""
+
     prompt = f"""Eres un agente especializado en búsqueda de productos industriales para MRO Master Pro.
 
 Tienes estos resultados de búsqueda para: **{marca} {modelo}**
@@ -845,7 +910,7 @@ Modo: {"URGENTE" if urgente else "Normal"}
 Ponderación: {ponderacion}
 Tipo de cambio USD/MXN: {fx}
 
-{crm_seccion}RESULTADOS EXTERNOS (Google Shopping, Web, Proveedores CRM):
+{crm_seccion}{historial_seccion}RESULTADOS EXTERNOS (Google Shopping, Web, Proveedores CRM):
 {json.dumps([_para_prompt(r) for r in resultados_filtrados if r.get("fuente") != "1crm_productos"], ensure_ascii=False, indent=2)}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -884,7 +949,8 @@ Tu tarea:
    - Score final = (precio_pts * {0.3 if urgente else 0.6}) + (disponibilidad_pts * {0.7 if urgente else 0.4})
 4. Score de confianza (1-5):
    - 5: producto en catálogo interno 1CRM (fuente=1crm_productos) — API directa, dato real
-   - 4: proveedor en 1CRM con historial (fuente=1crm_proveedores)
+   - 5: proveedor con historial de compra REAL para este producto (fuente=historial_po)
+   - 4: proveedor en 1CRM matcheado solo por nombre de marca (fuente=1crm_proveedores)
    - 3: Google Shopping con precio real (fuente=google_shopping)
    - 2: encontrado en website propio (fuente=sitio_propio) — visible en web, NO confirmado en 1CRM
    - 2: resultado Google web con datos claros (fuente=web)
@@ -1076,6 +1142,11 @@ def procesar_job(job: dict) -> None:
         res_productos = buscar_en_crm_productos(marca, modelo)
         resultados.extend(res_productos)
         agregar_log_job(job_id, "busqueda_1crm_productos", f"{len(res_productos)} resultados")
+
+        agregar_log_job(job_id, "busqueda_historial_po", "Buscando si ya le compramos esto a algún proveedor")
+        res_historial = buscar_proveedor_por_historial(marca, modelo)
+        resultados.extend(res_historial)
+        agregar_log_job(job_id, "busqueda_historial_po", f"{len(res_historial)} resultados")
 
         agregar_log_job(job_id, "busqueda_1crm_proveedores", "Iniciando búsqueda en 1CRM proveedores")
         res_proveedores = buscar_en_crm_proveedores(marca, modelo)

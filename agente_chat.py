@@ -3094,6 +3094,7 @@ TIPO_MODOS = {
     "publicacion":  [13, 14],                      # publicar producto(s) desde link o ficha técnica PDF
     "cotizacion":   [],                            # (módulo de cotización se agrega después)
     "ordenes":      [],
+    "compras":      [],                            # compras a proveedor: pipeline 100% determinista
     # aliases de compatibilidad
     "mensajeria":   [9, 10, 11, 12],
     "catalogo":     [1, 2, 3, 4, 5, 6, 8, 13, 14],
@@ -3400,6 +3401,92 @@ def _crear_so_confirmada(stream_id: str, draft: dict) -> None:
     log.info(f"Sales Order creada: {res.get('so_id')} ({res.get('so_numero')})")
 
 
+# ─────────────────────────────────────────────────────────────
+# PIPELINE DE COMPRAS A PROVEEDOR (stream 'compras')
+# El usuario sube uno o varios links de producto (eBay, etc.) — "si vamos a comprar algo es
+# porque ya se lo vendimos a alguien". Cotejo determinista (reusa _extraer_producto_link, ya
+# usado para publicar productos) + escritura solo tras aprobación. Mismo patrón que el pipeline
+# de órdenes de compra del cliente (_procesar_orden_compra / _crear_so_confirmada) arriba.
+# ─────────────────────────────────────────────────────────────
+def _procesar_link_proveedor(stream_id: str, urls: list[str]) -> None:
+    """Lee cada link, busca en qué Sales Order(s) abiertas aparece el producto y emite el widget
+    [COTEJO_PROVEEDOR]. NO escribe al CRM."""
+    try:
+        import compra_proveedor
+    except Exception as e:
+        log.error(f"compra_proveedor no disponible: {e}")
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": f"No pude procesar el link de proveedor (módulo no disponible: {e}).",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+
+    _log_stream(stream_id, f"Leyendo {len(urls)} link(s) de proveedor…", "info")
+    links_data = []
+    for url in urls:
+        try:
+            info = _extraer_producto_link(url)
+        except Exception as e:
+            info = None
+            log.error(f"extraer_producto_de_link({url}): {e}")
+        links_data.append(info if info else {"ok": False, "url": url})
+
+    if not any(l.get("ok") for l in links_data):
+        _log_stream(stream_id, "No pude leer ningún producto de los links dados", "error")
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": "No pude leer el producto de ese link. ¿Puedes verificar la URL o darme el "
+                       "nombre/número de parte a mano?",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+
+    _log_stream(stream_id, "Buscando en qué Sales Order(s) aparece cada producto…", "info")
+    cotejo = compra_proveedor.buscar_sales_orders_candidatas(links_data)
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[COTEJO_PROVEEDOR]" + json.dumps({"links": links_data, "cotejo": cotejo}, ensure_ascii=False),
+        "procesado": True, "metadata": {"cotejo_proveedor": True},
+    }).execute()
+    _log_stream(stream_id, cotejo.get("resumen", "Cotejo listo"), "ok")
+    log.info(f"Cotejo proveedor emitido | {cotejo.get('resumen','')}")
+
+
+def _crear_po_confirmado(stream_id: str, grupos: list) -> None:
+    """Crea el/los Purchase Order(s) + Cuenta(s) por Pagar tras la aprobación del usuario
+    (metadata.po_action='crear'). Un `grupo` = un draft de compra_proveedor.crear_po_y_ap
+    (una Sales Order, o so_id=None para gasto general). Escribe al CRM SOLO aquí, un solo sí
+    ya dado. Emite [PO_CREADO]."""
+    try:
+        import compra_proveedor
+    except Exception as e:
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": f"No pude crear la orden de compra (módulo no disponible: {e}).",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+
+    resultados = []
+    for draft in (grupos or []):
+        _log_stream(stream_id, f"Creando Purchase Order para {draft.get('proveedor_nombre','')}…", "info")
+        res = compra_proveedor.crear_po_y_ap(draft)
+        resultados.append(res)
+        if res.get("ok"):
+            _log_stream(stream_id, "Purchase Order + cuenta por pagar creados ✓", "ok")
+        else:
+            _log_stream(stream_id, f"No se pudo crear: {res.get('error','')}", "error")
+
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[PO_CREADO]" + json.dumps({"resultados": resultados}, ensure_ascii=False),
+        "procesado": True, "metadata": {"po_creado": True},
+    }).execute()
+    ok_n = sum(1 for r in resultados if r.get("ok"))
+    log.info(f"PO(s) creado(s): {ok_n}/{len(resultados)}")
+
+
 def procesar_mensaje(msg: dict) -> None:
     msg_id    = msg["id"]
     stream_id = msg.get("stream_id", "")
@@ -3434,6 +3521,25 @@ def procesar_mensaje(msg: dict) -> None:
     # CREAR la Sales Order: el usuario confirmó desde el previo (metadata.so_action == "crear").
     if _tipo_stream in ("ordenes", "sales_order") and _md0.get("so_action") == "crear":
         _crear_so_confirmada(stream_id, _md0.get("draft") or {})
+        return
+
+    # PIPELINE DE COMPRAS: stream tipo 'compras'. Router determinista (sin LLM): si el mensaje
+    # trae link(s) de producto, busca en qué Sales Order(s) machea cada uno; si el usuario ya
+    # aprobó un previo, crea el/los Purchase Order(s) + cuenta(s) por pagar.
+    if _tipo_stream == "compras" and _md0.get("po_action") == "crear":
+        _crear_po_confirmado(stream_id, _md0.get("grupos") or [])
+        return
+    if _tipo_stream == "compras":
+        _urls = re.findall(r'https?://\S+', contenido or "")
+        if _urls:
+            _procesar_link_proveedor(stream_id, _urls)
+        else:
+            supabase.table("mensajes").insert({
+                "stream_id": stream_id, "role": "assistant",
+                "content": "Mándame el link del producto que vas a comprar (eBay, etc.) y busco a "
+                           "qué Sales Order corresponde.",
+                "procesado": True, "metadata": {},
+            }).execute()
         return
 
     # Los triggers [SISTEMA:...] los maneja el widget del frontend — no necesitan respuesta de Claude
