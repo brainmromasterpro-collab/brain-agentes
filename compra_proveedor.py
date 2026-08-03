@@ -598,3 +598,50 @@ def cerrar_venta(so_id: str, entregado: bool, facturado: bool) -> dict:
     r = sales_order._crm_patch("SalesOrder", so_id, {"so_stage": nuevo_stage})
     return {"ok": "error" not in r, "so_id": so_id, "so_stage": nuevo_stage,
             "so_url": f"{CRM_BASE}/index.php?module=SalesOrders&record={so_id}"}
+
+
+# ─────────────────────────────────────────────────────────────
+# 7. DESHACER — cada confirmación puede revertirse con un clic (el usuario puede equivocarse
+#    de candidata al confirmar). Un "deshacer" nunca es silencioso: siempre reporta ok/error.
+# ─────────────────────────────────────────────────────────────
+def deshacer_po_y_ap(po_id: str, bill_id: str = "") -> dict:
+    """Revierte la Etapa 1: borra el Bill y el PurchaseOrder (con sus líneas/grupo)."""
+    if po_id:
+        d = sales_order._crm_get(f"data/PurchaseOrder/{po_id}")
+        rec = d.get("record", d)
+        grupos = set()
+        for li in (rec.get("line_items") or []):
+            sales_order._crm_delete("PurchaseOrderLine", li["id"])
+            if li.get("line_group_id"):
+                grupos.add(li["line_group_id"])
+        for g in grupos:
+            sales_order._crm_delete("PurchaseOrderLineGroup", g)
+    if bill_id:
+        sales_order._crm_delete("Bill", bill_id)
+    if po_id:
+        sales_order._crm_delete("PurchaseOrder", po_id)
+    return {"ok": True}
+
+
+def deshacer_pago(payment_id: str) -> dict:
+    """Revierte la Etapa 2: borra el Payment registrado."""
+    if not payment_id:
+        return {"error": "falta payment_id"}
+    r = sales_order._crm_delete("Payment", payment_id)
+    return {"ok": "error" not in r}
+
+
+def deshacer_recepcion(po_id: str, estado_anterior: str = "") -> dict:
+    """Revierte la Etapa 3: regresa shipping_stage al valor que tenía antes de confirmar."""
+    if not po_id:
+        return {"error": "falta po_id"}
+    r = sales_order._crm_patch("PurchaseOrder", po_id, {"shipping_stage": estado_anterior or "Ordered"})
+    return {"ok": "error" not in r, "po_id": po_id}
+
+
+def deshacer_cierre(so_id: str, estado_anterior: str = "") -> dict:
+    """Revierte la Etapa 4: regresa so_stage al valor que tenía antes de confirmar."""
+    if not so_id:
+        return {"error": "falta so_id"}
+    r = sales_order._crm_patch("SalesOrder", so_id, {"so_stage": estado_anterior or "Ordered"})
+    return {"ok": "error" not in r, "so_id": so_id}

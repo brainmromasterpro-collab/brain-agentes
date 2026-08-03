@@ -3590,9 +3590,9 @@ def _procesar_recepcion(stream_id: str, texto: str, file_url: str = "", nombre: 
     _log_stream(stream_id, f"{len(pos)} compra(s) en tránsito — elige a cuál corresponde", "ok")
 
 
-def _confirmar_recepcion_po(stream_id: str, po_id: str, tracking: str = "") -> None:
+def _confirmar_recepcion_po(stream_id: str, po_id: str, tracking: str = "", estado_anterior: str = "") -> None:
     """Registra el tracking (si viene) y/o cierra el PO (shipping_stage=Received) tras
-    confirmación del usuario. Emite [PO_RECIBIDO]."""
+    confirmación del usuario. Emite [PO_RECIBIDO] (incluye estado_anterior, para poder deshacer)."""
     try:
         import compra_proveedor
     except Exception:
@@ -3600,6 +3600,7 @@ def _confirmar_recepcion_po(stream_id: str, po_id: str, tracking: str = "") -> N
     if tracking:
         compra_proveedor.registrar_tracking(po_id, tracking)
     res = compra_proveedor.confirmar_recepcion(po_id)
+    res["estado_anterior"] = estado_anterior
     supabase.table("mensajes").insert({
         "stream_id": stream_id, "role": "assistant",
         "content": "[PO_RECIBIDO]" + json.dumps(res, ensure_ascii=False),
@@ -3607,6 +3608,67 @@ def _confirmar_recepcion_po(stream_id: str, po_id: str, tracking: str = "") -> N
     }).execute()
     _log_stream(stream_id, "Purchase Order marcado como recibido ✓" if res.get("ok") else "No se pudo cerrar el PO",
                 "ok" if res.get("ok") else "error")
+
+
+def _deshacer_po(stream_id: str, po_id: str, bill_id: str) -> None:
+    """Deshace la Etapa 1 (botón 'Deshacer' del widget de PO creado)."""
+    try:
+        import compra_proveedor
+    except Exception:
+        return
+    _log_stream(stream_id, "Deshaciendo Purchase Order + cuenta por pagar…", "info")
+    res = compra_proveedor.deshacer_po_y_ap(po_id, bill_id)
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[ACCION_DESHECHA]" + json.dumps({**res, "que": "Purchase Order y cuenta por pagar"}, ensure_ascii=False),
+        "procesado": True, "metadata": {"accion_deshecha": True},
+    }).execute()
+    _log_stream(stream_id, "Deshecho ✓" if res.get("ok") else "No se pudo deshacer", "ok" if res.get("ok") else "error")
+
+
+def _deshacer_pago(stream_id: str, payment_id: str) -> None:
+    """Deshace la Etapa 2 (borra el Payment)."""
+    try:
+        import compra_proveedor
+    except Exception:
+        return
+    res = compra_proveedor.deshacer_pago(payment_id)
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[ACCION_DESHECHA]" + json.dumps({**res, "que": "el pago registrado"}, ensure_ascii=False),
+        "procesado": True, "metadata": {"accion_deshecha": True},
+    }).execute()
+    _log_stream(stream_id, "Pago deshecho ✓" if res.get("ok") else "No se pudo deshacer", "ok" if res.get("ok") else "error")
+
+
+def _deshacer_recepcion(stream_id: str, po_id: str, estado_anterior: str) -> None:
+    """Deshace la Etapa 3 (regresa shipping_stage)."""
+    try:
+        import compra_proveedor
+    except Exception:
+        return
+    res = compra_proveedor.deshacer_recepcion(po_id, estado_anterior)
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[ACCION_DESHECHA]" + json.dumps({**res, "que": "la recepción del PO"}, ensure_ascii=False),
+        "procesado": True, "metadata": {"accion_deshecha": True},
+    }).execute()
+    _log_stream(stream_id, "Recepción deshecha ✓" if res.get("ok") else "No se pudo deshacer", "ok" if res.get("ok") else "error")
+
+
+def _deshacer_cierre(stream_id: str, so_id: str, estado_anterior: str) -> None:
+    """Deshace la Etapa 4 (regresa so_stage)."""
+    try:
+        import compra_proveedor
+    except Exception:
+        return
+    res = compra_proveedor.deshacer_cierre(so_id, estado_anterior)
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[ACCION_DESHECHA]" + json.dumps({**res, "que": "el cierre de la venta"}, ensure_ascii=False),
+        "procesado": True, "metadata": {"accion_deshecha": True},
+    }).execute()
+    _log_stream(stream_id, "Cierre deshecho ✓" if res.get("ok") else "No se pudo deshacer", "ok" if res.get("ok") else "error")
 
 
 def _procesar_cierre_venta(stream_id: str) -> None:
@@ -3625,14 +3687,15 @@ def _procesar_cierre_venta(stream_id: str) -> None:
     }).execute()
 
 
-def _confirmar_cierre_venta(stream_id: str, so_id: str, entregado: bool, facturado: bool) -> None:
+def _confirmar_cierre_venta(stream_id: str, so_id: str, entregado: bool, facturado: bool, estado_anterior: str = "") -> None:
     """Mueve so_stage según lo que el usuario confirmó (entrega y/o factura firmada). Emite
-    [SO_CERRADA_ETAPA4]."""
+    [SO_CERRADA_ETAPA4] (incluye estado_anterior, para poder deshacer)."""
     try:
         import compra_proveedor
     except Exception:
         return
     res = compra_proveedor.cerrar_venta(so_id, entregado, facturado)
+    res["estado_anterior"] = estado_anterior
     supabase.table("mensajes").insert({
         "stream_id": stream_id, "role": "assistant",
         "content": "[SO_CERRADA_ETAPA4]" + json.dumps(res, ensure_ascii=False),
@@ -3691,16 +3754,37 @@ def procesar_mensaje(msg: dict) -> None:
         if _md0.get("po_action") == "crear":
             _crear_po_confirmado(stream_id, _md0.get("grupos") or [])
             return
+        if _md0.get("po_action") == "deshacer":
+            _deshacer_po(stream_id, _md0.get("po_id", ""), _md0.get("bill_id", ""))
+            return
         if _md0.get("pago_action") == "confirmar":
             _confirmar_pago(stream_id, _md0.get("bill_id", ""), _md0.get("monto", 0),
                             _md0.get("datos_comprobante") or {})
             return
+        if _md0.get("pago_action") == "deshacer":
+            _deshacer_pago(stream_id, _md0.get("payment_id", ""))
+            return
         if _md0.get("recepcion_action") == "confirmar":
-            _confirmar_recepcion_po(stream_id, _md0.get("po_id", ""), _md0.get("tracking", ""))
+            _confirmar_recepcion_po(stream_id, _md0.get("po_id", ""), _md0.get("tracking", ""),
+                                    _md0.get("estado_anterior", ""))
+            return
+        if _md0.get("recepcion_action") == "deshacer":
+            _deshacer_recepcion(stream_id, _md0.get("po_id", ""), _md0.get("estado_anterior", ""))
             return
         if _md0.get("cierre_action") == "confirmar":
             _confirmar_cierre_venta(stream_id, _md0.get("so_id", ""),
-                                    bool(_md0.get("entregado")), bool(_md0.get("facturado")))
+                                    bool(_md0.get("entregado")), bool(_md0.get("facturado")),
+                                    _md0.get("estado_anterior", ""))
+            return
+        if _md0.get("cierre_action") == "deshacer":
+            _deshacer_cierre(stream_id, _md0.get("so_id", ""), _md0.get("estado_anterior", ""))
+            return
+        if _md0.get("cancelar_accion"):
+            supabase.table("mensajes").insert({
+                "stream_id": stream_id, "role": "assistant",
+                "content": "Entendido, no hice nada con eso. Mándame el link/foto/dato correcto cuando quieras.",
+                "procesado": True, "metadata": {},
+            }).execute()
             return
 
         # Clasificación de evidencia nueva (sin botón todavía).
