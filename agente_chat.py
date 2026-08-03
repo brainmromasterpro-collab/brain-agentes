@@ -3579,15 +3579,22 @@ def _procesar_recepcion(stream_id: str, texto: str, file_url: str = "", nombre: 
         except Exception as e:
             contenido_foto = {"error": str(e)}
 
+    tracking_texto = texto.strip() if texto and not file_url else ""
+    # Angostar candidatos por lo detectado en la foto (o el tracking) — con muchos PO's abiertos
+    # reales, mostrar los 40 sin filtrar obliga al usuario a buscar a mano el correcto.
+    texto_para_match = " ".join((contenido_foto or {}).get("items_detectados") or []) if contenido_foto else ""
+    candidatos = compra_proveedor.filtrar_candidatos_recepcion(pos, texto_para_match, tracking_texto)
+
     supabase.table("mensajes").insert({
         "stream_id": stream_id, "role": "assistant",
         "content": "[COTEJO_RECEPCION]" + json.dumps({
-            "tracking_texto": texto.strip() if texto and not file_url else "",
-            "contenido_foto": contenido_foto, "candidatos": pos,
+            "tracking_texto": tracking_texto,
+            "contenido_foto": contenido_foto, "candidatos": candidatos,
+            "sin_match": len(candidatos) == len(pos) and len(pos) > 1,
         }, ensure_ascii=False),
         "procesado": True, "metadata": {"cotejo_recepcion": True},
     }).execute()
-    _log_stream(stream_id, f"{len(pos)} compra(s) en tránsito — elige a cuál corresponde", "ok")
+    _log_stream(stream_id, f"{len(candidatos)} compra(s) candidata(s) en tránsito", "ok")
 
 
 def _confirmar_recepcion_po(stream_id: str, po_id: str, tracking: str = "", estado_anterior: str = "") -> None:

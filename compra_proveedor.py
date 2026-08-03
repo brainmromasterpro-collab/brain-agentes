@@ -517,6 +517,29 @@ def pos_esperando_recepcion(limite: int = 40) -> list[dict]:
     return out
 
 
+def filtrar_candidatos_recepcion(pos: list[dict], texto_detectado: str = "", tracking: str = "",
+                                 max_fallback: int = 8) -> list[dict]:
+    """Angosta los PO's candidatos matcheando lo detectado en la foto (o el tracking) contra
+    part number/nombre de sus líneas — mismo criterio de coincidencia por substring que
+    sales_order._match_item. Con muchos PO's abiertos reales, mostrar los 40 sin filtrar es
+    inservible: el usuario tendría que buscar a mano el correcto entre docenas.
+    Si NADA matchea, se devuelven los `max_fallback` más recientes (mejor limitado y honesto
+    que una lista larga) — nunca se oculta el correcto quedándose en cero candidatos."""
+    texto = sales_order._compact(f"{texto_detectado} {tracking}")
+    if len(texto) >= 4:
+        coincidencias = []
+        for po in pos:
+            for ln in (po.get("lineas") or []):
+                pn = sales_order._compact(ln.get("mfr_part_no") or "")
+                nm = sales_order._compact(ln.get("name") or "")
+                if (pn and len(pn) >= 4 and pn in texto) or (nm and len(nm) >= 6 and nm in texto):
+                    coincidencias.append(po)
+                    break
+        if coincidencias:
+            return coincidencias
+    return pos[:max_fallback]
+
+
 def registrar_tracking(po_id: str, tracking: str) -> dict:
     """Anota el tracking en la descripción del PO (no hay campo nativo de tracking en
     PurchaseOrder — se deja como nota legible)."""
