@@ -131,7 +131,7 @@ def _mapa_ya_comprado(limite: int = 30) -> dict:
         so_id = rec.get("from_so_id")
         if so_id and so_id not in mapa:
             mapa[so_id] = {"id": po_id, "nombre": rec.get("name", ""),
-                           "url": f"{CRM_BASE}/index.php?module=PurchaseOrders&record={po_id}"}
+                           "url": f"{CRM_BASE}/index.php?module=PurchaseOrders&action=DetailView&record={po_id}"}
     return mapa
 
 
@@ -207,7 +207,7 @@ def buscar_sales_orders_candidatas(links_data: list[dict]) -> dict:
             "so_id": so_id,
             "so_nombre": g["so"]["nombre"],
             "so_numero": detalle["so_number"],
-            "so_url": f"{CRM_BASE}/index.php?module=SalesOrders&record={so_id}",
+            "so_url": f"{CRM_BASE}/index.php?module=SalesOrders&action=DetailView&record={so_id}",
             "cliente": detalle["cliente"],
             "currency_id": detalle["currency_id"],
             "ya_comprado": yc,
@@ -338,11 +338,11 @@ def crear_po_y_ap(draft: dict) -> dict:
     return {
         "ok": True,
         "po_id": po_id,
-        "po_url": f"{CRM_BASE}/index.php?module=PurchaseOrders&record={po_id}",
+        "po_url": f"{CRM_BASE}/index.php?module=PurchaseOrders&action=DetailView&record={po_id}",
         "bill_id": bill_id,
-        "bill_url": f"{CRM_BASE}/index.php?module=Bills&record={bill_id}",
+        "bill_url": f"{CRM_BASE}/index.php?module=Bills&action=DetailView&record={bill_id}",
         "so_id": so_id or None,
-        "so_url": f"{CRM_BASE}/index.php?module=SalesOrders&record={so_id}" if so_id else None,
+        "so_url": f"{CRM_BASE}/index.php?module=SalesOrders&action=DetailView&record={so_id}" if so_id else None,
         "proveedor": draft.get("proveedor_nombre", ""),
         "total": total,
     }
@@ -412,7 +412,7 @@ def bills_abiertas(limite: int = 40) -> list[dict]:
             "proveedor": (cuenta or {}).get("nombre", ""),
             "proveedor_id": rec.get("supplier_id", ""),
             "related_purchase_order_id": rec.get("related_purchase_order_id", ""),
-            "url": f"{CRM_BASE}/index.php?module=Bills&record={bid}",
+            "url": f"{CRM_BASE}/index.php?module=Bills&action=DetailView&record={bid}",
         })
     return out
 
@@ -478,9 +478,9 @@ def registrar_pago(bill_id: str, monto: float, datos_comprobante: dict | None = 
     return {
         "ok": True,
         "payment_id": pay_id,
-        "payment_url": f"{CRM_BASE}/index.php?module=Payments&record={pay_id}",
+        "payment_url": f"{CRM_BASE}/index.php?module=Payments&action=DetailView&record={pay_id}",
         "bill_id": bill_id,
-        "bill_url": f"{CRM_BASE}/index.php?module=Bills&record={bill_id}",
+        "bill_url": f"{CRM_BASE}/index.php?module=Bills&action=DetailView&record={bill_id}",
         "monto": monto,
         "aviso": "Pago registrado y ligado al Bill. El saldo (amount_due) de 1CRM no se actualiza "
                  "solo — si necesitas que se vea saldada también en la UI nativa de 1CRM, aplícalo "
@@ -510,7 +510,7 @@ def pos_esperando_recepcion(limite: int = 40) -> list[dict]:
         out.append({
             "id": pid, "nombre": rec.get("name", ""), "shipping_stage": rec.get("shipping_stage"),
             "proveedor": (cuenta or {}).get("nombre", ""), "description": rec.get("description", ""),
-            "url": f"{CRM_BASE}/index.php?module=PurchaseOrders&record={pid}",
+            "url": f"{CRM_BASE}/index.php?module=PurchaseOrders&action=DetailView&record={pid}",
             "lineas": [{"name": li.get("name"), "mfr_part_no": li.get("mfr_part_no"),
                         "quantity": li.get("quantity")} for li in (rec.get("line_items") or [])],
         })
@@ -552,7 +552,7 @@ def registrar_tracking(po_id: str, tracking: str) -> dict:
     nueva_desc = f"{desc_actual}\n{nota}" if desc_actual else nota
     r = sales_order._crm_patch("PurchaseOrder", po_id, {"description": nueva_desc})
     return {"ok": "error" not in r, "po_id": po_id,
-            "po_url": f"{CRM_BASE}/index.php?module=PurchaseOrders&record={po_id}", "tracking": tracking}
+            "po_url": f"{CRM_BASE}/index.php?module=PurchaseOrders&action=DetailView&record={po_id}", "tracking": tracking}
 
 
 _INSTR_PAQUETE = (
@@ -578,7 +578,7 @@ def confirmar_recepcion(po_id: str) -> dict:
     que el contenido coincide con lo esperado."""
     r = sales_order._crm_patch("PurchaseOrder", po_id, {"shipping_stage": "Received"})
     return {"ok": "error" not in r, "po_id": po_id,
-            "po_url": f"{CRM_BASE}/index.php?module=PurchaseOrders&record={po_id}"}
+            "po_url": f"{CRM_BASE}/index.php?module=PurchaseOrders&action=DetailView&record={po_id}"}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -608,7 +608,7 @@ def sos_pendientes_cierre(limite: int = 40) -> list[dict]:
         cuenta = sales_order.cuenta_por_id(rec.get("billing_account_id", ""))
         out.append({"id": sid, "nombre": rec.get("name", ""), "so_stage": rec.get("so_stage"),
                     "cliente": (cuenta or {}).get("nombre", ""),
-                    "url": f"{CRM_BASE}/index.php?module=SalesOrders&record={sid}"})
+                    "url": f"{CRM_BASE}/index.php?module=SalesOrders&action=DetailView&record={sid}"})
     return out
 
 
@@ -620,7 +620,7 @@ def cerrar_venta(so_id: str, entregado: bool, facturado: bool) -> dict:
         return {"error": "ni entregado ni facturado — no hay nada que actualizar"}
     r = sales_order._crm_patch("SalesOrder", so_id, {"so_stage": nuevo_stage})
     return {"ok": "error" not in r, "so_id": so_id, "so_stage": nuevo_stage,
-            "so_url": f"{CRM_BASE}/index.php?module=SalesOrders&record={so_id}"}
+            "so_url": f"{CRM_BASE}/index.php?module=SalesOrders&action=DetailView&record={so_id}"}
 
 
 # ─────────────────────────────────────────────────────────────

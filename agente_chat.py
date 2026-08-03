@@ -701,7 +701,7 @@ def tool_listar_cotizaciones_crm(estado: str = "", cliente_id: str = "", limite:
                 "moneda":   r.get("currency_id", "USD"),
                 "cliente":  r.get("billing_account_name", ""),
                 "cierre":   r.get("date_quote_expected_closed", ""),
-                "url_crm":  f"{ONECRM_BASE}/index.php?module=Quotes&record={r.get('id')}",
+                "url_crm":  f"{ONECRM_BASE}/index.php?module=Quotes&action=DetailView&record={r.get('id')}",
             }
             for r in records
         ],

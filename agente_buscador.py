@@ -285,7 +285,7 @@ def buscar_proveedor_por_historial(marca: str, modelo: str, limite_pos: int = 20
                     "tiempo_entrega":  "Consultar (ya se le ha comprado antes)",
                     "condicion":       "nuevo",
                     "fuente":          "historial_po",
-                    "url":             f"{ONECRM_BASE}/index.php?module=Accounts&record={supplier_id}",
+                    "url":             f"{ONECRM_BASE}/index.php?module=Accounts&action=DetailView&record={supplier_id}",
                     "dist_autorizado": False,
                     "notas":           f"Ya se le compró este producto antes (PO {po.get('name','')})",
                 })
@@ -349,7 +349,7 @@ def buscar_en_crm_proveedores(marca: str, modelo: str) -> list[dict]:
                 "tiempo_entrega": "Consultar",
                 "condicion": "nuevo",
                 "fuente": "1crm_proveedores",
-                "url": r.get("website") or f"{ONECRM_BASE}/index.php?module=Accounts&record={r.get('id')}",
+                "url": r.get("website") or f"{ONECRM_BASE}/index.php?module=Accounts&action=DetailView&record={r.get('id')}",
                 "dist_autorizado": False,
                 "notas": f"Tel: {r.get('phone_office', '')}",
             })

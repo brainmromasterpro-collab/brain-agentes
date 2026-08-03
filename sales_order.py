@@ -120,7 +120,7 @@ def buscar_cuenta(nombre: str) -> dict | None:
     return {
         "id":     mejor.get("id"),
         "nombre": mejor.get("name", ""),
-        "url":    f"{CRM_BASE}/index.php?module=Accounts&record={mejor.get('id')}",
+        "url":    f"{CRM_BASE}/index.php?module=Accounts&action=DetailView&record={mejor.get('id')}",
     }
 
 
@@ -133,7 +133,7 @@ def cuenta_por_id(cuenta_id: str) -> dict | None:
     if not rec.get("id"):
         return None
     return {"id": rec["id"], "nombre": rec.get("name", ""),
-            "url": f"{CRM_BASE}/index.php?module=Accounts&record={rec['id']}"}
+            "url": f"{CRM_BASE}/index.php?module=Accounts&action=DetailView&record={rec['id']}"}
 
 
 def _terminos_y_moneda(cuenta_id: str) -> dict:
@@ -438,7 +438,7 @@ def cotejar(po: dict) -> dict:
             "items_cubiertos": cov, "total_items_po": len(po.get("items", [])),
             "referenciada": es_ref,
             **vig,
-            "url": f"{CRM_BASE}/index.php?module=Quotes&record={q['id']}",
+            "url": f"{CRM_BASE}/index.php?module=Quotes&action=DetailView&record={q['id']}",
         })
         if not vig["vigente"]:
             discrepancias.append(f"La cotización «{q['nombre'][:30]}» está {vig['motivo']}.")
@@ -551,5 +551,5 @@ def crear_sales_order(draft: dict) -> dict:
         "ajustadas": ajustadas,
         "quitadas": quitadas,
         "cotizacion_ya_estaba_aceptada": cotizacion_ya_aceptada,
-        "url": f"{CRM_BASE}/index.php?module=SalesOrders&record={so_id}",
+        "url": f"{CRM_BASE}/index.php?module=SalesOrders&action=DetailView&record={so_id}",
     }
