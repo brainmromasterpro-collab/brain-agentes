@@ -1247,12 +1247,68 @@ def _filtrar_caracteristicas_no_tecnicas(caracteristicas: list | None) -> list:
     return out
 
 
+def _extraer_producto_ebay_serpapi(url: str, item_id: str) -> dict | None:
+    """Lee un producto de eBay vía SerpAPI (engine=ebay_product) — eBay bloquea con HTTP 403
+    cualquier fetch directo desde servidor (confirmado en vivo), SerpAPI lo resuelve del lado de
+    ellos. Devuelve None si no hay SERPAPI_KEY o si no encuentra el producto (cae al intento
+    genérico de abajo, no rompe el flujo)."""
+    api_key = os.environ.get("SERPAPI_KEY", "").strip()
+    if not api_key:
+        return None
+    try:
+        r = httpx.get("https://serpapi.com/search.json", params={
+            "engine": "ebay_product", "ebay_item_id": item_id, "api_key": api_key,
+        }, timeout=25)
+        if r.status_code != 200:
+            log.warning(f"SerpAPI ebay_product HTTP {r.status_code} para item {item_id}")
+            return None
+        data = r.json()
+    except Exception as e:
+        log.warning(f"SerpAPI ebay_product falló para {item_id}: {e}")
+        return None
+
+    prod = data.get("product_result") or {}
+    if not prod or not prod.get("title"):
+        return None
+
+    specs = prod.get("item_specifics") or []
+    def _spec(*claves):
+        for s in specs:
+            if (s.get("name") or "").strip().lower() in claves:
+                return s.get("value") or ""
+        return ""
+
+    precio = prod.get("price") or {}
+    imagenes = prod.get("images") or ([prod["image"]] if prod.get("image") else [])
+    caracteristicas = [f"{s.get('name')}: {s.get('value')}" for s in specs if s.get("name") and s.get("value")]
+
+    return {
+        "ok": True, "url": url,
+        "nombre": prod.get("title") or "",
+        "marca": _spec("brand", "marca", "manufacturer"),
+        "part_number": _spec("mpn", "part number", "manufacturer part number", "número de pieza fabricante"),
+        "precio_costo": precio.get("extracted_price") or precio.get("raw") or "",
+        "moneda": "USD",
+        "descripcion": (prod.get("description") or "")[:600],
+        "caracteristicas": _filtrar_caracteristicas_no_tecnicas(caracteristicas)[:14],
+        "imagen_url": imagenes[0] if imagenes else "",
+    }
+
+
 def _extraer_producto_link(url: str) -> dict:
     """Extrae datos de producto de la página (og tags + JSON-LD). Funciona en sitios estándar
-    (Shopify/e-commerce). Sitios con protección anti-bots (ej. Festo) devuelven error 403 →
-    requieren navegador headless (fase 2, aún no disponible)."""
+    (Shopify/e-commerce). Sitios con protección anti-bots (ej. Festo, eBay) devuelven error 403 →
+    eBay se resuelve arriba con SerpAPI; otros requieren navegador headless (aún no disponible)."""
     import re as _re
     from urllib.parse import quote_plus
+
+    m_ebay = _re.search(r'ebay\.[a-z.]+/itm/(?:[^/?]+/)?(\d+)', url, _re.I)
+    if m_ebay:
+        r_ebay = _extraer_producto_ebay_serpapi(url, m_ebay.group(1))
+        if r_ebay:
+            return r_ebay
+        # SerpAPI no disponible o sin resultado → sigue el intento genérico de abajo (poco
+        # probable que funcione en eBay, pero no cuesta nada intentarlo).
     hdrs = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
@@ -3433,11 +3489,15 @@ def _procesar_link_proveedor(stream_id: str, urls: list[str]) -> None:
         links_data.append(info if info else {"ok": False, "url": url})
 
     if not any(l.get("ok") for l in links_data):
-        _log_stream(stream_id, "No pude leer ningún producto de los links dados", "error")
+        # Mostrar el motivo REAL (ej. "el sitio bloquea el acceso automático") en vez de un
+        # genérico "verifica la URL" que hace pensar que el link estaba mal cuando no es el caso.
+        errores = [l.get("error") for l in links_data if l.get("error")]
+        detalle = f" ({errores[0]})" if errores else ""
+        _log_stream(stream_id, f"No pude leer ningún producto de los links dados{detalle}", "error")
         supabase.table("mensajes").insert({
             "stream_id": stream_id, "role": "assistant",
-            "content": "No pude leer el producto de ese link. ¿Puedes verificar la URL o darme el "
-                       "nombre/número de parte a mano?",
+            "content": f"No pude leer el producto de ese link{detalle}. Dame el nombre, número de "
+                       f"parte y precio a mano y sigo con eso.",
             "procesado": True, "metadata": {},
         }).execute()
         return
