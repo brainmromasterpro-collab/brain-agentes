@@ -1247,29 +1247,42 @@ def _filtrar_caracteristicas_no_tecnicas(caracteristicas: list | None) -> list:
     return out
 
 
-def _extraer_producto_ebay_serpapi(url: str, item_id: str) -> dict | None:
+def _extraer_producto_ebay_serpapi(url: str, item_id: str, diag: list | None = None) -> dict | None:
     """Lee un producto de eBay vía SerpAPI (engine=ebay_product) — eBay bloquea con HTTP 403
     cualquier fetch directo desde servidor (confirmado en vivo), SerpAPI lo resuelve del lado de
     ellos. Devuelve None si no hay SERPAPI_KEY o si no encuentra el producto (cae al intento
-    genérico de abajo, no rompe el flujo)."""
+    genérico de abajo, no rompe el flujo). `diag` (opcional) acumula el motivo exacto — se usa
+    para loguear a stream_logs y poder diagnosticar sin depender de los logs de Railway."""
+    def _d(msg: str):
+        log.warning(f"SerpAPI ebay_product [{item_id}]: {msg}")
+        if diag is not None:
+            diag.append(msg)
+
     api_key = os.environ.get("SERPAPI_KEY", "").strip()
     if not api_key:
+        _d("sin SERPAPI_KEY configurada")
         return None
     try:
         r = httpx.get("https://serpapi.com/search.json", params={
             "engine": "ebay_product", "ebay_item_id": item_id, "api_key": api_key,
         }, timeout=25)
         if r.status_code != 200:
-            log.warning(f"SerpAPI ebay_product HTTP {r.status_code} para item {item_id}")
+            _d(f"HTTP {r.status_code} — {r.text[:200]}")
             return None
         data = r.json()
     except Exception as e:
-        log.warning(f"SerpAPI ebay_product falló para {item_id}: {e}")
+        _d(f"excepción: {e}")
+        return None
+
+    if data.get("error"):
+        _d(f"SerpAPI devolvió error: {data['error']}")
         return None
 
     prod = data.get("product_result") or {}
     if not prod or not prod.get("title"):
+        _d(f"sin product_result/title en la respuesta — claves recibidas: {list(data.keys())}")
         return None
+    _d(f"OK — título leído: {prod.get('title','')[:60]}")
 
     specs = prod.get("item_specifics") or []
     def _spec(*claves):
@@ -1295,16 +1308,18 @@ def _extraer_producto_ebay_serpapi(url: str, item_id: str) -> dict | None:
     }
 
 
-def _extraer_producto_link(url: str) -> dict:
+def _extraer_producto_link(url: str, diag: list | None = None) -> dict:
     """Extrae datos de producto de la página (og tags + JSON-LD). Funciona en sitios estándar
     (Shopify/e-commerce). Sitios con protección anti-bots (ej. Festo, eBay) devuelven error 403 →
-    eBay se resuelve arriba con SerpAPI; otros requieren navegador headless (aún no disponible)."""
+    eBay se resuelve arriba con SerpAPI; otros requieren navegador headless (aún no disponible).
+    `diag` (opcional) acumula el motivo exacto de cada intento fallido, para loguear a
+    stream_logs y diagnosticar sin depender de los logs de Railway."""
     import re as _re
     from urllib.parse import quote_plus
 
     m_ebay = _re.search(r'ebay\.[a-z.]+/itm/(?:[^/?]+/)?(\d+)', url, _re.I)
     if m_ebay:
-        r_ebay = _extraer_producto_ebay_serpapi(url, m_ebay.group(1))
+        r_ebay = _extraer_producto_ebay_serpapi(url, m_ebay.group(1), diag)
         if r_ebay:
             return r_ebay
         # SerpAPI no disponible o sin resultado → sigue el intento genérico de abajo (poco
@@ -1553,10 +1568,14 @@ def _extraer_producto_link(url: str) -> dict:
         # solo se pintan con JS como en Littelfuse)
         r = _fetch(scraper_tmpl.replace("{url}", quote_plus(url)), 90)
         if r is None:
+            if diag is not None:
+                diag.append("scraper genérico: no respondió a tiempo")
             if fast_parsed:
                 return _traducir(fast_parsed)
             return {"error": "El scraper no respondió a tiempo. Reintenta o pega los datos manualmente."}
         if r.status_code != 200:
+            if diag is not None:
+                diag.append(f"scraper genérico: HTTP {r.status_code} — {r.text[:150]}")
             if fast_parsed:
                 return _traducir(fast_parsed)
             return {"error": f"HTTP {r.status_code} — el sitio bloquea el acceso. Pega los datos manualmente."}
@@ -3481,12 +3500,18 @@ def _procesar_link_proveedor(stream_id: str, urls: list[str]) -> None:
     _log_stream(stream_id, f"Leyendo {len(urls)} link(s) de proveedor…", "info")
     links_data = []
     for url in urls:
+        diag: list = []
         try:
-            info = _extraer_producto_link(url)
+            info = _extraer_producto_link(url, diag)
         except Exception as e:
             info = None
+            diag.append(f"excepción: {e}")
             log.error(f"extraer_producto_de_link({url}): {e}")
         links_data.append(info if info else {"ok": False, "url": url})
+        # Diagnóstico a stream_logs: qué intentó y por qué falló cada paso — así se puede ver
+        # sin depender de los logs de Railway (ej. "sin SERPAPI_KEY", "HTTP 423 del scraper").
+        for paso in diag:
+            _log_stream(stream_id, f"  ↳ {url[:50]}: {paso}", "info")
 
     if not any(l.get("ok") for l in links_data):
         # Mostrar el motivo REAL (ej. "el sitio bloquea el acceso automático") en vez de un
