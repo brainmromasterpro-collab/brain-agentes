@@ -3487,6 +3487,161 @@ def _crear_po_confirmado(stream_id: str, grupos: list) -> None:
     log.info(f"PO(s) creado(s): {ok_n}/{len(resultados)}")
 
 
+def _bajar_imagenes(file_url: str, nombre: str = "", mime: str = "") -> list:
+    """Baja un archivo (imagen o PDF) y lo devuelve como lista de imágenes PNG en bytes — si es
+    PDF lo rasteriza (reusa orden_compra), si ya es imagen lo regresa tal cual. Mismo patrón que
+    el fallback a visión de orden_compra.leer_po."""
+    import orden_compra
+    data = orden_compra.descargar(file_url)
+    ext = orden_compra._ext(nombre, mime)
+    if ext == "pdf":
+        return orden_compra._pdf_a_imagenes(data)
+    return [data]
+
+
+def _procesar_comprobante_pago(stream_id: str, file_url: str, nombre: str = "", mime: str = "") -> None:
+    """ETAPA 2 (pagos): lee el comprobante subido y lo coteja contra las Bills abiertas por
+    monto. Emite [COTEJO_PAGO]. NO escribe al CRM."""
+    try:
+        import compra_proveedor
+    except Exception as e:
+        log.error(f"compra_proveedor no disponible: {e}")
+        return
+    _log_stream(stream_id, "Leyendo comprobante de pago…", "info")
+    try:
+        imgs = _bajar_imagenes(file_url, nombre, mime)
+    except Exception as e:
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": f"No pude descargar el comprobante: {e}",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+    comprobante = compra_proveedor.leer_comprobante(imgs)
+    if comprobante.get("error"):
+        _log_stream(stream_id, f"No pude leer el comprobante: {comprobante['error']}", "error")
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": f"No pude leer el comprobante: {comprobante['error']}",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+    cotejo = compra_proveedor.buscar_bill_candidata(comprobante)
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[COTEJO_PAGO]" + json.dumps({"comprobante": comprobante, "cotejo": cotejo}, ensure_ascii=False),
+        "procesado": True, "metadata": {"cotejo_pago": True},
+    }).execute()
+    _log_stream(stream_id, f"Comprobante leído — {len(cotejo.get('candidatas', []))} cuenta(s) candidata(s)", "ok")
+
+
+def _confirmar_pago(stream_id: str, bill_id: str, monto: float, datos_comprobante: dict) -> None:
+    """Crea el Payment ligado a la Bill tras aprobación del usuario. Emite [PAGO_REGISTRADO]."""
+    try:
+        import compra_proveedor
+    except Exception as e:
+        return
+    _log_stream(stream_id, "Registrando pago…", "info")
+    res = compra_proveedor.registrar_pago(bill_id, monto, datos_comprobante)
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[PAGO_REGISTRADO]" + json.dumps(res, ensure_ascii=False),
+        "procesado": True, "metadata": {"pago_registrado": True},
+    }).execute()
+    _log_stream(stream_id, "Pago registrado ✓" if res.get("ok") else f"No se pudo registrar: {res.get('error','')}",
+                "ok" if res.get("ok") else "error")
+
+
+def _procesar_recepcion(stream_id: str, texto: str, file_url: str = "", nombre: str = "", mime: str = "") -> None:
+    """ETAPA 3 (recepción): si llega texto con forma de tracking, lo registra en el PO en
+    tránsito; si llega una foto, la coteja contra las líneas del PO esperado. Emite
+    [COTEJO_RECEPCION]. NO cierra el PO solo — eso requiere confirmación explícita."""
+    try:
+        import compra_proveedor
+    except Exception as e:
+        log.error(f"compra_proveedor no disponible: {e}")
+        return
+    pos = compra_proveedor.pos_esperando_recepcion()
+    if not pos:
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": "No tengo ninguna compra en tránsito esperando recepción ahorita.",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+
+    contenido_foto = None
+    if file_url:
+        _log_stream(stream_id, "Leyendo foto del paquete recibido…", "info")
+        try:
+            imgs = _bajar_imagenes(file_url, nombre, mime)
+            contenido_foto = compra_proveedor.leer_contenido_paquete(imgs)
+        except Exception as e:
+            contenido_foto = {"error": str(e)}
+
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[COTEJO_RECEPCION]" + json.dumps({
+            "tracking_texto": texto.strip() if texto and not file_url else "",
+            "contenido_foto": contenido_foto, "candidatos": pos,
+        }, ensure_ascii=False),
+        "procesado": True, "metadata": {"cotejo_recepcion": True},
+    }).execute()
+    _log_stream(stream_id, f"{len(pos)} compra(s) en tránsito — elige a cuál corresponde", "ok")
+
+
+def _confirmar_recepcion_po(stream_id: str, po_id: str, tracking: str = "") -> None:
+    """Registra el tracking (si viene) y/o cierra el PO (shipping_stage=Received) tras
+    confirmación del usuario. Emite [PO_RECIBIDO]."""
+    try:
+        import compra_proveedor
+    except Exception:
+        return
+    if tracking:
+        compra_proveedor.registrar_tracking(po_id, tracking)
+    res = compra_proveedor.confirmar_recepcion(po_id)
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[PO_RECIBIDO]" + json.dumps(res, ensure_ascii=False),
+        "procesado": True, "metadata": {"po_recibido": True},
+    }).execute()
+    _log_stream(stream_id, "Purchase Order marcado como recibido ✓" if res.get("ok") else "No se pudo cerrar el PO",
+                "ok" if res.get("ok") else "error")
+
+
+def _procesar_cierre_venta(stream_id: str) -> None:
+    """ETAPA 4 (cierre de venta): lista las Sales Orders pendientes de cierre para que el usuario
+    elija cuál y confirme entrega/factura. Emite [COTEJO_CIERRE]."""
+    try:
+        import compra_proveedor
+    except Exception as e:
+        log.error(f"compra_proveedor no disponible: {e}")
+        return
+    sos = compra_proveedor.sos_pendientes_cierre()
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[COTEJO_CIERRE]" + json.dumps({"candidatos": sos}, ensure_ascii=False),
+        "procesado": True, "metadata": {"cotejo_cierre": True},
+    }).execute()
+
+
+def _confirmar_cierre_venta(stream_id: str, so_id: str, entregado: bool, facturado: bool) -> None:
+    """Mueve so_stage según lo que el usuario confirmó (entrega y/o factura firmada). Emite
+    [SO_CERRADA_ETAPA4]."""
+    try:
+        import compra_proveedor
+    except Exception:
+        return
+    res = compra_proveedor.cerrar_venta(so_id, entregado, facturado)
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[SO_CERRADA_ETAPA4]" + json.dumps(res, ensure_ascii=False),
+        "procesado": True, "metadata": {"so_cerrada_etapa4": True},
+    }).execute()
+    _log_stream(stream_id, f"Sales Order actualizada a «{res.get('so_stage','')}» ✓" if res.get("ok") else "No se pudo actualizar",
+                "ok" if res.get("ok") else "error")
+
+
 def procesar_mensaje(msg: dict) -> None:
     msg_id    = msg["id"]
     stream_id = msg.get("stream_id", "")
@@ -3523,21 +3678,59 @@ def procesar_mensaje(msg: dict) -> None:
         _crear_so_confirmada(stream_id, _md0.get("draft") or {})
         return
 
-    # PIPELINE DE COMPRAS: stream tipo 'compras'. Router determinista (sin LLM): si el mensaje
-    # trae link(s) de producto, busca en qué Sales Order(s) machea cada uno; si el usuario ya
-    # aprobó un previo, crea el/los Purchase Order(s) + cuenta(s) por pagar.
-    if _tipo_stream == "compras" and _md0.get("po_action") == "crear":
-        _crear_po_confirmado(stream_id, _md0.get("grupos") or [])
-        return
+    # PIPELINE DE COMPRAS: stream tipo 'compras'. Router determinista (sin LLM) que despacha a la
+    # tarea correspondiente según la evidencia que llegue — el usuario no necesita saber a qué
+    # "sub-chat" pertenece. Etapa 1 (match SO + crear PO/AP) primero; luego confirmaciones de las
+    # etapas 2-4 (pagos, recepción, cierre de venta) por metadata explícita del botón que apretó.
     if _tipo_stream == "compras":
+        _file_url  = _md0.get("file_url", "")
+        _file_name = _md0.get("file_name", "")
+        _file_mime = _md0.get("file_mime", "")
+
+        # Confirmaciones (botón ya apretado en un widget de previo) — van primero.
+        if _md0.get("po_action") == "crear":
+            _crear_po_confirmado(stream_id, _md0.get("grupos") or [])
+            return
+        if _md0.get("pago_action") == "confirmar":
+            _confirmar_pago(stream_id, _md0.get("bill_id", ""), _md0.get("monto", 0),
+                            _md0.get("datos_comprobante") or {})
+            return
+        if _md0.get("recepcion_action") == "confirmar":
+            _confirmar_recepcion_po(stream_id, _md0.get("po_id", ""), _md0.get("tracking", ""))
+            return
+        if _md0.get("cierre_action") == "confirmar":
+            _confirmar_cierre_venta(stream_id, _md0.get("so_id", ""),
+                                    bool(_md0.get("entregado")), bool(_md0.get("facturado")))
+            return
+
+        # Clasificación de evidencia nueva (sin botón todavía).
         _urls = re.findall(r'https?://\S+', contenido or "")
+        _low = (contenido or "").lower()
+        _es_factura = bool(re.search(r'factura|firmad|entregu|entregad|cerrar\s+venta', _low))
+        _es_tracking_texto = (not _file_url and not _urls and
+                              bool(re.search(r'tracking|gu[ií]a|rastreo|n[uú]mero de env[ií]o', _low) or
+                                   re.search(r'\b[A-Z0-9]{8,30}\b', contenido or "")))
+
         if _urls:
             _procesar_link_proveedor(stream_id, _urls)
+        elif _file_url and _es_factura:
+            _procesar_cierre_venta(stream_id)
+        elif _file_url and re.search(r'paquete|lleg|recib|contenido', _low):
+            _procesar_recepcion(stream_id, contenido, _file_url, _file_name, _file_mime)
+        elif _file_url:
+            # Default para un archivo sin más contexto: comprobante de pago (el caso más común
+            # del transcript — "pagué algo, saco una foto").
+            _procesar_comprobante_pago(stream_id, _file_url, _file_name, _file_mime)
+        elif _es_factura:
+            _procesar_cierre_venta(stream_id)
+        elif _es_tracking_texto:
+            _procesar_recepcion(stream_id, contenido)
         else:
             supabase.table("mensajes").insert({
                 "stream_id": stream_id, "role": "assistant",
-                "content": "Mándame el link del producto que vas a comprar (eBay, etc.) y busco a "
-                           "qué Sales Order corresponde.",
+                "content": "Mándame el link del producto que vas a comprar, una foto/PDF del "
+                           "comprobante de pago, el tracking de un envío, o dime que subes la "
+                           "factura firmada — y sigo desde ahí.",
                 "procesado": True, "metadata": {},
             }).execute()
         return

@@ -346,3 +346,255 @@ def crear_po_y_ap(draft: dict) -> dict:
         "proveedor": draft.get("proveedor_nombre", ""),
         "total": total,
     }
+
+
+def _leer_con_vision(imagenes: list[bytes], instruccion: str, model_id: str = "") -> dict:
+    """Helper compartido: manda imágenes + una instrucción a Claude vision y parsea el JSON de
+    respuesta. Usado por leer_comprobante y leer_contenido_paquete (mismo patrón que
+    orden_compra.normalizar_vision)."""
+    if not imagenes:
+        return {"error": "sin imágenes que leer"}
+    import base64
+    import json as _json
+    import anthropic
+    contenido: list = [{"type": "text", "text": instruccion}]
+    for img in imagenes:
+        contenido.append({"type": "image", "source": {
+            "type": "base64", "media_type": "image/png", "data": base64.b64encode(img).decode()}})
+    try:
+        client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+        resp = client.messages.create(
+            model=model_id or os.environ.get("PO_MODEL", "claude-haiku-4-5-20251001"),
+            max_tokens=500, temperature=0,
+            messages=[{"role": "user", "content": contenido}],
+        )
+        raw = (resp.content[0].text if resp.content else "").strip()
+        i, j = raw.find("{"), raw.rfind("}")
+        if i >= 0 and j > i:
+            raw = raw[i:j + 1]
+        return _json.loads(raw)
+    except Exception as e:
+        log.error(f"_leer_con_vision: {e}")
+        return {"error": f"no pude leer la imagen: {e}"}
+
+
+# ─────────────────────────────────────────────────────────────
+# 4. PAGOS (Etapa 2) — conciliar comprobante de pago contra Bills abiertas
+# ─────────────────────────────────────────────────────────────
+# HALLAZGO VERIFICADO (create+delete controlado): Payment.related_invoice_id SÍ acepta el id de
+# un Bill y se guarda (pese a que su bean_name diga "Invoice" en la metadata — mismo patrón de
+# "editable:false no bloquea la API" ya visto), PERO Bill.amount_due NO se recalcula solo, y
+# TAMPOCO es editable por PATCH directo (campo protegido/calculado por la lógica interna de
+# 1CRM, fuera de alcance de la API cruda). Por eso: el pago SÍ queda creado y trazable (Payment
+# ligado al Bill), pero el estatus "pagada" que reporta ESTE sistema se basa en la EXISTENCIA de
+# ese Payment — igual criterio que "ya comprado" en el PO (relación como fuente de verdad, no un
+# campo). Si se necesita que 1CRM también lo muestre saldado en su propia UI, hay que aplicarlo
+# ahí manualmente — no es alcanzable desde aquí.
+def bills_abiertas(limite: int = 40) -> list[dict]:
+    """Bills (cuentas por pagar) recientes con saldo pendiente (amount_due > 0), con el nombre
+    del proveedor resuelto. La lista de 1CRM viene delgada (sin amount_due/supplier_id) — se pide
+    detalle de las últimas `limite`, mismo patrón que sales_orders_abiertas/pos_esperando_recepcion."""
+    data = sales_order._crm_get("data/Bill", {"order_by": "date_modified desc", "limit": limite})
+    out: list[dict] = []
+    for b in data.get("records", []):
+        bid = b.get("id")
+        if not bid:
+            continue
+        d = sales_order._crm_get(f"data/Bill/{bid}")
+        rec = d.get("record", d)
+        due = sales_order._num(rec.get("amount_due"))
+        if not due or due <= 0:
+            continue
+        cuenta = sales_order.cuenta_por_id(rec.get("supplier_id", ""))
+        out.append({
+            "id": bid, "nombre": rec.get("name", ""),
+            "amount_due": due, "currency_id": rec.get("currency_id", ""),
+            "proveedor": (cuenta or {}).get("nombre", ""),
+            "proveedor_id": rec.get("supplier_id", ""),
+            "related_purchase_order_id": rec.get("related_purchase_order_id", ""),
+            "url": f"{CRM_BASE}/index.php?module=Bills&record={bid}",
+        })
+    return out
+
+
+_INSTR_COMPROBANTE = (
+    "Esta imagen es un COMPROBANTE DE PAGO/TRANSFERENCIA a un proveedor. Devuelve SOLO un JSON "
+    "(sin ``` ni explicaciones) con el esquema exacto:\n"
+    '{"monto": number o null, "moneda": "MXN"|"USD"|"", "fecha": "YYYY-MM-DD" o "", '
+    '"referencia": "folio/referencia/beneficiario tal cual aparece, o \\"\\"", '
+    '"notas": "cualquier dato dudoso"}\n'
+    "NO inventes cifras: si el monto no es legible con claridad, usa null."
+)
+
+
+def leer_comprobante(imagenes: list[bytes], model_id: str = "") -> dict:
+    """Lee un comprobante de pago (foto/captura/PDF ya rasterizado a imágenes) con visión de
+    Claude. Extrae SOLO lo que esté claramente legible — NO inventa cifras."""
+    datos = _leer_con_vision(imagenes, _INSTR_COMPROBANTE, model_id)
+    datos.setdefault("monto", None)
+    datos.setdefault("moneda", "")
+    datos.setdefault("referencia", "")
+    return datos
+
+
+def buscar_bill_candidata(comprobante: dict, bills: list[dict] | None = None) -> dict:
+    """Cruza el comprobante leído contra las Bills abiertas por MONTO (tolerancia 1% o 1 unidad,
+    lo mayor) — el monto es el dato más confiable de un comprobante. Devuelve
+    {candidatas, multiples, por_monto}. NO asume un match único en silencio si hay ambigüedad: el
+    usuario confirma cuál es en el widget."""
+    todas = bills if bills is not None else bills_abiertas()
+    monto = sales_order._num(comprobante.get("monto"))
+    if monto is None:
+        return {"candidatas": todas, "multiples": len(todas) > 1, "por_monto": False}
+    cands = [b for b in todas if abs(b["amount_due"] - monto) <= max(1.0, 0.01 * b["amount_due"])]
+    return {"candidatas": cands or todas, "multiples": len(cands) > 1, "por_monto": bool(cands)}
+
+
+def registrar_pago(bill_id: str, monto: float, datos_comprobante: dict | None = None) -> dict:
+    """Crea el Payment ligado al Bill (registrado y trazable). OJO: no cierra el Bill en la UI
+    nativa de 1CRM (amount_due no se recalcula vía API, verificado) — el estatus 'pagada' que
+    reporta este sistema se basa en la EXISTENCIA de este Payment, no en el campo de 1CRM."""
+    if not CRM_BASE:
+        return {"error": "1CRM no configurado"}
+    d = sales_order._crm_get(f"data/Bill/{bill_id}")
+    bill = d.get("record", d)
+    if not bill.get("id"):
+        return {"error": f"no encontré la Bill {bill_id}"}
+    extra = datos_comprobante or {}
+    payload = {
+        "amount": monto,
+        "currency_id": bill.get("currency_id") or "",
+        "payment_date": extra.get("fecha") or datetime.date.today().isoformat(),
+        "direction": "outgoing",
+        "payment_type": extra.get("payment_type") or "Wire Transfer",
+        "account_id": bill.get("supplier_id"),
+        "related_invoice_id": bill_id,
+        "customer_reference": extra.get("referencia") or "",
+    }
+    r = sales_order._crm_post("Payment", payload)
+    pay_id = r.get("id")
+    if not pay_id:
+        return {"error": f"no se pudo crear el Payment: {r}"}
+    return {
+        "ok": True,
+        "payment_id": pay_id,
+        "payment_url": f"{CRM_BASE}/index.php?module=Payments&record={pay_id}",
+        "bill_id": bill_id,
+        "bill_url": f"{CRM_BASE}/index.php?module=Bills&record={bill_id}",
+        "monto": monto,
+        "aviso": "Pago registrado y ligado al Bill. El saldo (amount_due) de 1CRM no se actualiza "
+                 "solo — si necesitas que se vea saldada también en la UI nativa de 1CRM, aplícalo "
+                 "ahí manualmente.",
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# 5. RECEPCIÓN (Etapa 3) — tracking + confirmación de contenido → cierra el PurchaseOrder
+# ─────────────────────────────────────────────────────────────
+# PurchaseOrder no tiene un campo dedicado a tracking number — se guarda como nota en
+# `description` (campo libre, siempre presente). `shipping_stage` SÍ es nativo y su PATCH está
+# VERIFICADO en vivo (Draft/Ordered/Partially Received/Received) — es lo que cierra el PO.
+def pos_esperando_recepcion(limite: int = 40) -> list[dict]:
+    """Purchase Orders con mercancía en tránsito (shipping_stage Ordered o Partially Received)."""
+    data = sales_order._crm_get("data/PurchaseOrder", {"order_by": "date_modified desc", "limit": limite})
+    out: list[dict] = []
+    for po in data.get("records", []):
+        pid = po.get("id")
+        if not pid:
+            continue
+        d = sales_order._crm_get(f"data/PurchaseOrder/{pid}")
+        rec = d.get("record", d)
+        if rec.get("shipping_stage") not in ("Ordered", "Partially Received"):
+            continue
+        cuenta = sales_order.cuenta_por_id(rec.get("supplier_id", ""))
+        out.append({
+            "id": pid, "nombre": rec.get("name", ""), "shipping_stage": rec.get("shipping_stage"),
+            "proveedor": (cuenta or {}).get("nombre", ""), "description": rec.get("description", ""),
+            "url": f"{CRM_BASE}/index.php?module=PurchaseOrders&record={pid}",
+            "lineas": [{"name": li.get("name"), "mfr_part_no": li.get("mfr_part_no"),
+                        "quantity": li.get("quantity")} for li in (rec.get("line_items") or [])],
+        })
+    return out
+
+
+def registrar_tracking(po_id: str, tracking: str) -> dict:
+    """Anota el tracking en la descripción del PO (no hay campo nativo de tracking en
+    PurchaseOrder — se deja como nota legible)."""
+    d = sales_order._crm_get(f"data/PurchaseOrder/{po_id}")
+    rec = d.get("record", d)
+    if not rec.get("id"):
+        return {"error": f"no encontré el Purchase Order {po_id}"}
+    desc_actual = (rec.get("description") or "").strip()
+    nota = f"Tracking: {tracking}"
+    nueva_desc = f"{desc_actual}\n{nota}" if desc_actual else nota
+    r = sales_order._crm_patch("PurchaseOrder", po_id, {"description": nueva_desc})
+    return {"ok": "error" not in r, "po_id": po_id,
+            "po_url": f"{CRM_BASE}/index.php?module=PurchaseOrders&record={po_id}", "tracking": tracking}
+
+
+_INSTR_PAQUETE = (
+    "Esta es una foto de un paquete/mercancía RECIBIDA de un proveedor. Describe QUÉ productos y "
+    "CUÁNTAS piezas de cada uno se alcanzan a ver (colores, modelos, cantidades visibles). "
+    "Devuelve SOLO un JSON: "
+    '{"items_detectados": ["ej: 2 sensores rojos", "1 sensor verde"], "notas": ""}. '
+    "No inventes cantidades que no se vean con claridad — dilo en notas."
+)
+
+
+def leer_contenido_paquete(imagenes: list[bytes], model_id: str = "") -> dict:
+    """Describe con visión lo que se ve en la foto del paquete recibido. NUNCA decide solo si
+    coincide con el PO esperado — el usuario confirma en el widget viendo ambos lados uno junto
+    al otro (mismas reglas de 'no inventar' que el resto del sistema)."""
+    datos = _leer_con_vision(imagenes, _INSTR_PAQUETE, model_id)
+    datos.setdefault("items_detectados", [])
+    return datos
+
+
+def confirmar_recepcion(po_id: str) -> dict:
+    """Cierra el Purchase Order (shipping_stage=Received) — solo tras confirmación del usuario de
+    que el contenido coincide con lo esperado."""
+    r = sales_order._crm_patch("PurchaseOrder", po_id, {"shipping_stage": "Received"})
+    return {"ok": "error" not in r, "po_id": po_id,
+            "po_url": f"{CRM_BASE}/index.php?module=PurchaseOrders&record={po_id}"}
+
+
+# ─────────────────────────────────────────────────────────────
+# 6. CIERRE DE VENTA (Etapa 4) — entrega + factura firmada → cierra la Sales Order
+# ─────────────────────────────────────────────────────────────
+# so_stage (nativo, PATCH VERIFICADO en vivo) ya modela justo esta distinción: entregado sin
+# facturar / facturado sin entregar / cerrado con ambos — no hace falta inventar un campo nuevo.
+_SO_STAGE_CIERRE = {
+    (True, True):   "Closed - Shipped and Invoiced",
+    (True, False):  "Shipped and not Invoiced",
+    (False, True):  "Invoiced NOT SHIPPED",
+}
+
+
+def sos_pendientes_cierre(limite: int = 40) -> list[dict]:
+    """Sales Orders que aún no están cerradas (Closed - Shipped and Invoiced)."""
+    data = sales_order._crm_get("data/SalesOrder", {"order_by": "date_modified desc", "limit": limite})
+    out: list[dict] = []
+    for so in data.get("records", []):
+        sid = so.get("id")
+        if not sid:
+            continue
+        d = sales_order._crm_get(f"data/SalesOrder/{sid}")
+        rec = d.get("record", d)
+        if rec.get("so_stage") in SO_STAGE_CERRADAS:
+            continue
+        cuenta = sales_order.cuenta_por_id(rec.get("billing_account_id", ""))
+        out.append({"id": sid, "nombre": rec.get("name", ""), "so_stage": rec.get("so_stage"),
+                    "cliente": (cuenta or {}).get("nombre", ""),
+                    "url": f"{CRM_BASE}/index.php?module=SalesOrders&record={sid}"})
+    return out
+
+
+def cerrar_venta(so_id: str, entregado: bool, facturado: bool) -> dict:
+    """Mueve so_stage según lo que el usuario confirma que ya pasó (entrega y/o firma de
+    factura) — VERIFICADO en vivo. Si ninguno de los dos ocurrió, no hay nada que mover."""
+    nuevo_stage = _SO_STAGE_CIERRE.get((entregado, facturado))
+    if not nuevo_stage:
+        return {"error": "ni entregado ni facturado — no hay nada que actualizar"}
+    r = sales_order._crm_patch("SalesOrder", so_id, {"so_stage": nuevo_stage})
+    return {"ok": "error" not in r, "so_id": so_id, "so_stage": nuevo_stage,
+            "so_url": f"{CRM_BASE}/index.php?module=SalesOrders&record={so_id}"}
