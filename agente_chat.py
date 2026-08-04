@@ -1280,11 +1280,15 @@ def _extraer_producto_ebay_serpapi(url: str, item_id: str, dominio: str = "ebay.
         _d(f"SerpAPI devolvió error: {data['error']}")
         return None
 
-    prod = data.get("product_result") or {}
+    # La clave real es "product_results" (plural) — confirmado en vivo con el log de diagnóstico
+    # (la primera versión probaba "product_result" y siempre caía a "sin datos"). Puede venir como
+    # objeto directo o como lista de un elemento según el caso, así que se maneja ambas formas.
+    prod_raw = data.get("product_results")
+    prod = (prod_raw[0] if isinstance(prod_raw, list) and prod_raw else prod_raw) or {}
     if not prod or not prod.get("title"):
-        _d(f"sin product_result/title en la respuesta — claves recibidas: {list(data.keys())}")
+        _d(f"sin product_results/title — claves de data: {list(data.keys())} | claves de product_results: {list(prod.keys()) if isinstance(prod, dict) else type(prod)}")
         return None
-    _d(f"OK — título leído: {prod.get('title','')[:60]}")
+    _d(f"OK — título leído: {prod.get('title','')[:60]} | claves disponibles: {list(prod.keys())}")
 
     specs = prod.get("item_specifics") or []
     def _spec(*claves):
