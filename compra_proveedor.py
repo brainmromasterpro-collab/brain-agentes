@@ -167,6 +167,19 @@ def buscar_sales_orders_candidatas(links_data: list[dict]) -> dict:
         texto_busqueda = f"{link.get('nombre','')} {link.get('descripcion','')}"
         candidatos, tipo_match = sales_order._match_item(pc, texto_busqueda, indice)
 
+        # Respaldo para códigos CORTOS (<6 chars, ej. "NE555"): sales_order._match_item exige
+        # min 6 chars en el escaneo por descripción para evitar falsos positivos, lo cual excluye
+        # códigos cortos válidos. Aquí se permite desde 4 chars pero exigiendo coincidencia de
+        # PALABRA COMPLETA (no substring suelto) en el título/descripción del link — frecuente en
+        # anuncios de dropshipping donde el part_number no viene limpio en ningún campo separado.
+        if not candidatos:
+            texto_norm = re.sub(r'[^A-Z0-9\s]', ' ', texto_busqueda.upper())
+            palabras = set(texto_norm.split())
+            for k, v in indice.items():
+                if 4 <= len(k) < 6 and k in palabras:
+                    candidatos.extend(v)
+                    tipo_match = "descripcion"
+
         if not candidatos:
             sin_match.append({**link, "motivo": "ningún producto de una Sales Order abierta coincide"})
             continue

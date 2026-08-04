@@ -1288,27 +1288,70 @@ def _extraer_producto_ebay_serpapi(url: str, item_id: str, dominio: str = "ebay.
     if not prod or not prod.get("title"):
         _d(f"sin product_results/title — claves de data: {list(data.keys())} | claves de product_results: {list(prod.keys()) if isinstance(prod, dict) else type(prod)}")
         return None
-    _d(f"OK — título leído: {prod.get('title','')[:60]} | claves disponibles: {list(prod.keys())}")
+    # Esquema real de esta API (NO el de "eBay Shopping"/item_specifics que se asumió al
+    # principio): title, short_description, buy{...}, media{...}, specifications{...}. Se
+    # extrae de forma defensiva porque no hay forma de probarlo sin una key propia — si algo
+    # sale vacío otra vez, el log de abajo muestra la forma real de cada bloque para corregir
+    # sin otra ronda a ciegas.
+    buy = prod.get("buy") or {}
+    media = prod.get("media") or {}
+    specs_raw = prod.get("specifications")
+    _d(f"buy={json.dumps(buy, ensure_ascii=False)[:300]} | media={json.dumps(media, ensure_ascii=False)[:200]} | specifications={json.dumps(specs_raw, ensure_ascii=False)[:400]}")
 
-    specs = prod.get("item_specifics") or []
-    def _spec(*claves):
-        for s in specs:
-            if (s.get("name") or "").strip().lower() in claves:
-                return s.get("value") or ""
-        return ""
+    # precio: probar las formas más comunes de SerpAPI (objeto con extracted_price, o num directo)
+    precio_obj = buy.get("price") if isinstance(buy, dict) else None
+    precio_costo = ""
+    if isinstance(precio_obj, dict):
+        precio_costo = precio_obj.get("extracted_price") or precio_obj.get("raw") or precio_obj.get("value") or ""
+    elif precio_obj is not None:
+        precio_costo = precio_obj
 
-    precio = prod.get("price") or {}
-    imagenes = prod.get("images") or ([prod["image"]] if prod.get("image") else [])
-    caracteristicas = [f"{s.get('name')}: {s.get('value')}" for s in specs if s.get("name") and s.get("value")]
+    # imágenes: puede ser {"images": [...]} o una lista directa de urls/objetos
+    imgs_raw = media.get("images") if isinstance(media, dict) else media
+    imagenes = []
+    for im in (imgs_raw or []):
+        if isinstance(im, str):
+            imagenes.append(im)
+        elif isinstance(im, dict):
+            imagenes.append(im.get("link") or im.get("url") or im.get("image") or "")
+    imagenes = [i for i in imagenes if i]
+
+    # specifications: puede ser lista de {name,value}, o dict {categoria: {campo: valor}}
+    caracteristicas: list[str] = []
+    marca = ""
+    part_number = ""
+    def _match_spec(nombre_campo: str, valor: str):
+        nonlocal marca, part_number
+        n = (nombre_campo or "").strip().lower()
+        if n in ("brand", "marca", "manufacturer"):
+            marca = marca or valor
+        if n in ("mpn", "part number", "manufacturer part number", "número de pieza fabricante"):
+            part_number = part_number or valor
+        if nombre_campo and valor:
+            caracteristicas.append(f"{nombre_campo}: {valor}")
+
+    if isinstance(specs_raw, list):
+        for s in specs_raw:
+            if isinstance(s, dict):
+                _match_spec(s.get("name") or s.get("key") or "", s.get("value") or "")
+    elif isinstance(specs_raw, dict):
+        for grupo in specs_raw.values():
+            if isinstance(grupo, dict):
+                for k, v in grupo.items():
+                    _match_spec(k, v if isinstance(v, str) else str(v))
+            elif isinstance(grupo, list):
+                for s in grupo:
+                    if isinstance(s, dict):
+                        _match_spec(s.get("name") or s.get("key") or "", s.get("value") or "")
 
     return {
         "ok": True, "url": url,
         "nombre": prod.get("title") or "",
-        "marca": _spec("brand", "marca", "manufacturer"),
-        "part_number": _spec("mpn", "part number", "manufacturer part number", "número de pieza fabricante"),
-        "precio_costo": precio.get("extracted_price") or precio.get("raw") or "",
+        "marca": marca,
+        "part_number": part_number,
+        "precio_costo": precio_costo,
         "moneda": "USD",
-        "descripcion": (prod.get("description") or "")[:600],
+        "descripcion": (prod.get("short_description") or "")[:600],
         "caracteristicas": _filtrar_caracteristicas_no_tecnicas(caracteristicas)[:14],
         "imagen_url": imagenes[0] if imagenes else "",
     }
