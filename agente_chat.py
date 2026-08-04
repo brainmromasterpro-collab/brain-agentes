@@ -1247,12 +1247,14 @@ def _filtrar_caracteristicas_no_tecnicas(caracteristicas: list | None) -> list:
     return out
 
 
-def _extraer_producto_ebay_serpapi(url: str, item_id: str, diag: list | None = None) -> dict | None:
-    """Lee un producto de eBay vía SerpAPI (engine=ebay_product) — eBay bloquea con HTTP 403
-    cualquier fetch directo desde servidor (confirmado en vivo), SerpAPI lo resuelve del lado de
-    ellos. Devuelve None si no hay SERPAPI_KEY o si no encuentra el producto (cae al intento
-    genérico de abajo, no rompe el flujo). `diag` (opcional) acumula el motivo exacto — se usa
-    para loguear a stream_logs y poder diagnosticar sin depender de los logs de Railway."""
+def _extraer_producto_ebay_serpapi(url: str, item_id: str, dominio: str = "ebay.com", diag: list | None = None) -> dict | None:
+    """Lee un producto de eBay vía SerpAPI (engine=ebay_product) — eBay bloquea con HTTP 403/423
+    cualquier fetch directo desde servidor (confirmado en vivo, incluso vía el scraper genérico),
+    SerpAPI lo resuelve del lado de ellos. Devuelve None si no hay SERPAPI_KEY o si no encuentra
+    el producto (cae al intento genérico de abajo, no rompe el flujo). El parámetro correcto es
+    `product_id` (NO `ebay_item_id` — verificado con el error explícito de SerpAPI en vivo).
+    `diag` (opcional) acumula el motivo exacto — se usa para loguear a stream_logs y poder
+    diagnosticar sin depender de los logs de Railway."""
     def _d(msg: str):
         log.warning(f"SerpAPI ebay_product [{item_id}]: {msg}")
         if diag is not None:
@@ -1264,7 +1266,7 @@ def _extraer_producto_ebay_serpapi(url: str, item_id: str, diag: list | None = N
         return None
     try:
         r = httpx.get("https://serpapi.com/search.json", params={
-            "engine": "ebay_product", "ebay_item_id": item_id, "api_key": api_key,
+            "engine": "ebay_product", "product_id": item_id, "ebay_domain": dominio, "api_key": api_key,
         }, timeout=25)
         if r.status_code != 200:
             _d(f"HTTP {r.status_code} — {r.text[:200]}")
@@ -1317,9 +1319,9 @@ def _extraer_producto_link(url: str, diag: list | None = None) -> dict:
     import re as _re
     from urllib.parse import quote_plus
 
-    m_ebay = _re.search(r'ebay\.[a-z.]+/itm/(?:[^/?]+/)?(\d+)', url, _re.I)
+    m_ebay = _re.search(r'(ebay\.[a-z.]+)/itm/(?:[^/?]+/)?(\d+)', url, _re.I)
     if m_ebay:
-        r_ebay = _extraer_producto_ebay_serpapi(url, m_ebay.group(1), diag)
+        r_ebay = _extraer_producto_ebay_serpapi(url, m_ebay.group(2), m_ebay.group(1), diag)
         if r_ebay:
             return r_ebay
         # SerpAPI no disponible o sin resultado → sigue el intento genérico de abajo (poco
