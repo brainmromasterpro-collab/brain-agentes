@@ -681,3 +681,61 @@ def deshacer_cierre(so_id: str, estado_anterior: str = "") -> dict:
         return {"error": "falta so_id"}
     r = sales_order._crm_patch("SalesOrder", so_id, {"so_stage": estado_anterior or "Ordered"})
     return {"ok": "error" not in r, "so_id": so_id}
+
+
+# ─────────────────────────────────────────────────────────────
+# 8. ESTADO OPERATIVO — rollup Vendido→Comprado→Pagado→Recibido→Facturado de una Sales Order
+# ─────────────────────────────────────────────────────────────
+# HALLAZGO EN VIVO: el endpoint de LISTA de PurchaseOrder/Bill/Payment con order_by=date_modified
+# desc + limit NO refleja registros recién creados de forma confiable (probado: un PO creado y
+# verificado por GET directo minutos antes no aparecía entre los primeros 60 de la lista, con solo
+# 26 resultados devueltos pese a limit=60 — huele a caché o a que order_by/limit no se respetan de
+# verdad en este endpoint, mismo espíritu que el hallazgo de filters[x] ya documentado). Por eso
+# esta función NO escanea listas: recibe los po_ids/bill_ids YA CONOCIDOS (el llamador los saca
+# del historial de mensajes de Supabase, que es la fuente de verdad confiable) y solo hace GET
+# de detalle por id — eso sí funciona siempre, confirmado repetidas veces en la sesión.
+def estado_operativo_so(so_id: str, po_ids: list[str] | None = None, bill_ids: list[str] | None = None,
+                        bill_ids_pagadas: set[str] | None = None) -> dict:
+    """Arma el rollup de una Sales Order a partir de los PO's/Bills que YA SE SABE que le
+    pertenecen (por el historial de la conversación) — no intenta redescubrirlos escaneando 1CRM.
+    `bill_ids_pagadas` = subconjunto de bill_ids para los que ya se registró un Payment (el
+    llamador lo saca del historial también — amount_due no sirve, ver nota arriba)."""
+    bill_ids_pagadas = bill_ids_pagadas or set()
+    d = sales_order._crm_get(f"data/SalesOrder/{so_id}")
+    so = d.get("record", d)
+    if not so.get("id"):
+        return {"error": f"no encontré la Sales Order {so_id}"}
+    cuenta = sales_order.cuenta_por_id(so.get("billing_account_id", ""))
+
+    pos_ligados = []
+    for pid in (po_ids or []):
+        rec = sales_order._crm_get(f"data/PurchaseOrder/{pid}").get("record", {})
+        if rec.get("id"):
+            pos_ligados.append(rec)
+
+    bills_ligadas = []
+    for bid in (bill_ids or []):
+        rec = sales_order._crm_get(f"data/Bill/{bid}").get("record", {})
+        if rec.get("id"):
+            bills_ligadas.append(rec)
+
+    total_po = len(pos_ligados)
+    recibidos = sum(1 for p in pos_ligados if p.get("shipping_stage") == "Received")
+    total_bill = len(bills_ligadas)
+    # amount_due no sirve para saber si está pagada (verificado: no se actualiza solo — ver
+    # deshacer_pago/registrar_pago) — "pagada" se decide por si el historial ya registró un
+    # Payment para esa Bill, que el llamador pasa en bill_ids_pagadas.
+    pagadas = sum(1 for b in bills_ligadas if b["id"] in bill_ids_pagadas)
+
+    return {
+        "so_id": so_id, "so_nombre": so.get("name", ""), "so_numero": so.get("so_number"),
+        "so_stage": so.get("so_stage", ""), "cliente": (cuenta or {}).get("nombre", ""),
+        "so_url": f"{CRM_BASE}/index.php?module=SalesOrders&action=DetailView&record={so_id}",
+        "comprado": {"total": total_po, "hecho": total_po,
+                     "pos": [{"id": p["id"], "nombre": p.get("name", ""),
+                              "url": f"{CRM_BASE}/index.php?module=PurchaseOrders&action=DetailView&record={p['id']}"}
+                             for p in pos_ligados]},
+        "pagado": {"total": total_bill, "hecho": pagadas},
+        "recibido": {"total": total_po, "hecho": recibidos},
+        "facturado": so.get("so_stage") == "Closed - Shipped and Invoiced",
+    }

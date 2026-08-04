@@ -3846,6 +3846,72 @@ def _confirmar_cierre_venta(stream_id: str, so_id: str, entregado: bool, factura
                 "ok" if res.get("ok") else "error")
 
 
+def _procesar_estado_operativo(stream_id: str) -> None:
+    """Rollup Vendido→Comprado→Pagado→Recibido→Facturado de las Sales Orders con actividad en
+    este stream. Reconstruye qué PO/Bill le pertenece a cada SO desde el HISTORIAL de mensajes
+    (fuente confiable — el endpoint de lista de 1CRM no refleja registros recientes, verificado
+    en vivo), no escaneando 1CRM a ciegas. Emite [ESTADO_OPERATIVO]."""
+    try:
+        import compra_proveedor
+    except Exception as e:
+        log.error(f"compra_proveedor no disponible: {e}")
+        return
+
+    por_so: dict = {}   # so_id -> {po_ids:set, bill_ids:set, bill_ids_pagadas:set}
+    try:
+        rows = (supabase.table("mensajes").select("content")
+                .eq("stream_id", stream_id)
+                .or_("content.ilike.%PO_CREADO%,content.ilike.%PAGO_REGISTRADO%")
+                .execute())
+        for r in (rows.data or []):
+            content = r.get("content") or ""
+            if content.startswith("[PO_CREADO]"):
+                try:
+                    payload = json.loads(content[len("[PO_CREADO]"):])
+                except Exception:
+                    continue
+                for res in payload.get("resultados", []):
+                    if not res.get("ok") or not res.get("so_id"):
+                        continue
+                    entry = por_so.setdefault(res["so_id"], {"po_ids": set(), "bill_ids": set(), "bill_ids_pagadas": set()})
+                    if res.get("po_id"):
+                        entry["po_ids"].add(res["po_id"])
+                    if res.get("bill_id"):
+                        entry["bill_ids"].add(res["bill_id"])
+            elif content.startswith("[PAGO_REGISTRADO]"):
+                try:
+                    res = json.loads(content[len("[PAGO_REGISTRADO]"):])
+                except Exception:
+                    continue
+                if res.get("ok") and res.get("bill_id"):
+                    for entry in por_so.values():
+                        if res["bill_id"] in entry["bill_ids"]:
+                            entry["bill_ids_pagadas"].add(res["bill_id"])
+    except Exception as e:
+        log.warning(f"No se pudo leer historial para estado operativo: {e}")
+
+    if not por_so:
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": "No tengo ninguna compra registrada en este stream todavía para armar el estado operativo.",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+
+    _log_stream(stream_id, f"Armando estado operativo de {len(por_so)} venta(s)…", "info")
+    ventas = [
+        compra_proveedor.estado_operativo_so(
+            sid, po_ids=list(v["po_ids"]), bill_ids=list(v["bill_ids"]), bill_ids_pagadas=v["bill_ids_pagadas"])
+        for sid, v in por_so.items()
+    ]
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[ESTADO_OPERATIVO]" + json.dumps({"ventas": ventas}, ensure_ascii=False),
+        "procesado": True, "metadata": {"estado_operativo": True},
+    }).execute()
+    _log_stream(stream_id, "Estado operativo listo", "ok")
+
+
 def procesar_mensaje(msg: dict) -> None:
     msg_id    = msg["id"]
     stream_id = msg.get("stream_id", "")
@@ -3932,7 +3998,9 @@ def procesar_mensaje(msg: dict) -> None:
         _urls = re.findall(r'https?://\S+', contenido or "")
         _low = (contenido or "").lower()
         _es_factura = bool(re.search(r'factura|firmad|entregu|entregad|cerrar\s+venta', _low))
-        _es_tracking_texto = (not _file_url and not _urls and
+        _es_estado = (not _file_url and not _urls and
+                     bool(re.search(r'c[oó]mo va|estado (de la venta|operativo)|estatus de la venta|rollup|resumen de (la )?venta', _low)))
+        _es_tracking_texto = (not _file_url and not _urls and not _es_estado and
                               bool(re.search(r'tracking|gu[ií]a|rastreo|n[uú]mero de env[ií]o', _low) or
                                    re.search(r'\b[A-Z0-9]{8,30}\b', contenido or "")))
 
@@ -3946,6 +4014,8 @@ def procesar_mensaje(msg: dict) -> None:
             # Default para un archivo sin más contexto: comprobante de pago (el caso más común
             # del transcript — "pagué algo, saco una foto").
             _procesar_comprobante_pago(stream_id, _file_url, _file_name, _file_mime)
+        elif _es_estado:
+            _procesar_estado_operativo(stream_id)
         elif _es_factura:
             _procesar_cierre_venta(stream_id)
         elif _es_tracking_texto:
@@ -3954,8 +4024,8 @@ def procesar_mensaje(msg: dict) -> None:
             supabase.table("mensajes").insert({
                 "stream_id": stream_id, "role": "assistant",
                 "content": "Mándame el link del producto que vas a comprar, una foto/PDF del "
-                           "comprobante de pago, el tracking de un envío, o dime que subes la "
-                           "factura firmada — y sigo desde ahí.",
+                           "comprobante de pago, el tracking de un envío, dime que subes la "
+                           "factura firmada, o pregúntame \"cómo va la venta\" — y sigo desde ahí.",
                 "procesado": True, "metadata": {},
             }).execute()
         return
