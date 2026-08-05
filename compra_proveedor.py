@@ -260,13 +260,18 @@ def _crear_lineas_po(po_id: str, currency_id: str, lineas: list[dict]) -> int:
         return 0
     creadas = 0
     for ln in lineas:
+        cantidad = ln.get("quantity", 1) or 1
+        precio_unit = ln.get("unit_price") or ln.get("precio_costo") or 0
         payload = {
             "purchase_orders_id": po_id,
             "line_group_id": grp_id,
             "name": ln.get("name") or ln.get("nombre") or "Producto",
             "mfr_part_no": ln.get("mfr_part_no") or ln.get("part_number") or "",
-            "quantity": ln.get("quantity", 1),
-            "unit_price": ln.get("unit_price") or ln.get("precio_costo") or 0,
+            "quantity": cantidad,
+            "unit_price": precio_unit,
+            # 1CRM NO calcula el extendido solo (verificado en vivo: unit_price*quantity con
+            # ext_price ausente se queda en None) — hay que mandarlo explícito.
+            "ext_price": float(precio_unit) * float(cantidad),
         }
         r = sales_order._crm_post("PurchaseOrderLine", payload)
         if r.get("id"):
