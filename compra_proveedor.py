@@ -360,8 +360,17 @@ def crear_po_y_ap(draft: dict) -> dict:
     hoy = datetime.date.today().isoformat()
     so_id = draft.get("so_id") or ""
 
+    # El título tiene que traer el/los número(s) de parte — no solo el nombre de la SO/cliente,
+    # para poder identificar el PO de un vistazo (mismo criterio que ya usan los nombres reales
+    # de PO/SO en el CRM, ej. "SC0516 IFM Flow monitor...").
+    partes = [ln.get("mfr_part_no") or ln.get("part_number") for ln in lineas]
+    partes = [p for p in partes if p]
+    modelos = ", ".join(dict.fromkeys(partes))  # sin duplicados, conserva el orden
+    nombre_base = draft.get("nombre") or f"Compra {draft.get('proveedor_nombre','')}"
+    nombre_po = f"{modelos} — {nombre_base}" if modelos else nombre_base
+
     po_payload = {
-        "name": draft.get("nombre") or (f"Compra {draft['proveedor_nombre']}"),
+        "name": nombre_po,
         "supplier_id": supplier_id,
         "shipping_stage": "Ordered",
         "currency_id": currency_id,
@@ -383,7 +392,7 @@ def crear_po_y_ap(draft: dict) -> dict:
     _crear_lineas_po(po_id, currency_id, lineas)
 
     bill_payload = {
-        "name": f"AP — {draft.get('proveedor_nombre','')} — {draft.get('nombre','')}".strip(" —"),
+        "name": f"AP — {draft.get('proveedor_nombre','')} — {nombre_po}".strip(" —"),
         "supplier_id": supplier_id,
         "related_purchase_order_id": po_id,
         "currency_id": currency_id,
