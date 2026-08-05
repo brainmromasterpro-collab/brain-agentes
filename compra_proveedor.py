@@ -252,16 +252,30 @@ def buscar_sales_orders_candidatas(links_data: list[dict]) -> dict:
 # ─────────────────────────────────────────────────────────────
 def _crear_lineas_po(po_id: str, currency_id: str, lineas: list[dict]) -> int:
     """PurchaseOrder no auto-crea líneas desde el POST de creación (verificado en vivo):
-    hace falta un PurchaseOrderLineGroup y luego cada PurchaseOrderLine apuntando a él."""
+    hace falta un PurchaseOrderLineGroup y luego cada PurchaseOrderLine apuntando a él.
+
+    `unit_price_usd`/`ext_price_usd` de cada línea TAMBIÉN hay que mandarlos explícitos —
+    verificado en vivo: sin ellos se quedan en None pese a que el PO padre sí trae bien
+    amount_usdollar/subtotal_usd/pretax_usd. Sospecha fundada (a confirmar con Gabriel viendo
+    la UI): si el total que se muestra en pantalla se arma sumando estos campos por línea en
+    vez de leer subtotal/amount directo, una suma con null da NaN en JS — coincide con el
+    síntoma reportado ("sigue saliendo con NaN")."""
     grp = sales_order._crm_post("PurchaseOrderLineGroup", {"parent_id": po_id})
     grp_id = grp.get("id")
     if not grp_id:
         log.error(f"No se pudo crear PurchaseOrderLineGroup para PO {po_id}: {grp}")
         return 0
+
+    # Tasa de cambio real que 1CRM ya resolvió sola al crear el PO (se ve en el propio registro
+    # aunque no se haya mandado explícita) — se usa para el equivalente en USD de cada línea.
+    po_rec = sales_order._crm_get(f"data/PurchaseOrder/{po_id}").get("record", {})
+    exchange_rate = sales_order._num(po_rec.get("exchange_rate")) or 1.0
+
     creadas = 0
     for ln in lineas:
         cantidad = ln.get("quantity", 1) or 1
         precio_unit = ln.get("unit_price") or ln.get("precio_costo") or 0
+        ext = float(precio_unit) * float(cantidad)
         payload = {
             "purchase_orders_id": po_id,
             "line_group_id": grp_id,
@@ -271,7 +285,9 @@ def _crear_lineas_po(po_id: str, currency_id: str, lineas: list[dict]) -> int:
             "unit_price": precio_unit,
             # 1CRM NO calcula el extendido solo (verificado en vivo: unit_price*quantity con
             # ext_price ausente se queda en None) — hay que mandarlo explícito.
-            "ext_price": float(precio_unit) * float(cantidad),
+            "ext_price": ext,
+            "unit_price_usd": float(precio_unit) / exchange_rate,
+            "ext_price_usd": ext / exchange_rate,
         }
         r = sales_order._crm_post("PurchaseOrderLine", payload)
         if r.get("id"):
