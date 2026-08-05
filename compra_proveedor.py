@@ -330,6 +330,10 @@ def crear_po_y_ap(draft: dict) -> dict:
         "shipping_stage": "Ordered",
         "currency_id": currency_id,
         "amount": total,
+        # 1CRM NO deriva subtotal/pretax de las líneas (verificado en vivo: se quedan en 0 aunque
+        # las líneas ya traigan su ext_price) — hay que mandarlos explícitos, igual que amount.
+        "subtotal": total,
+        "pretax": total,
     }
     if draft.get("terminos_pago"):
         po_payload["terms"] = draft["terminos_pago"]
