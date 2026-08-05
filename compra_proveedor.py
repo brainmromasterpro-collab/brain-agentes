@@ -230,6 +230,11 @@ def buscar_sales_orders_candidatas(links_data: list[dict]) -> dict:
             "cliente": detalle["cliente"],
             "currency_id": detalle["currency_id"],
             "terminos_pago": detalle["terminos_pago"],
+            # Condiciones de pago es un campo OBLIGATORIO en 1CRM (pedido explícito de Gabriel:
+            # nunca crear el PO en silencio sin esto) — se avisa aquí para que el usuario lo
+            # configure en la cuenta del cliente antes de confirmar; crear_po_y_ap también lo
+            # bloquea como segunda barrera aunque el frontend ya lo prevenga.
+            "sin_terminos_pago": not detalle["terminos_pago"],
             "ya_comprado": yc,
             "proveedor_nombre": proveedor_sugerido,
             "lineas": lineas_sugeridas,
@@ -338,6 +343,13 @@ def crear_po_y_ap(draft: dict) -> dict:
     lineas = draft.get("lineas") or []
     if not lineas:
         return {"error": "faltan líneas para crear la orden de compra"}
+    # Condiciones de pago es obligatorio en 1CRM (pedido explícito de Gabriel) — solo se exige
+    # cuando hay una Sales Order de por medio (con cliente real detrás); un gasto general
+    # (so_id vacío) no tiene cliente del que sacar términos.
+    if draft.get("so_id") and not draft.get("terminos_pago"):
+        return {"error": "El cliente de esta Sales Order no tiene Condiciones de pago configuradas "
+                         "en 1CRM (campo obligatorio) — configúralas en la cuenta del cliente antes "
+                         "de crear la orden de compra."}
 
     supplier_id = _buscar_o_crear_proveedor(draft.get("proveedor_nombre", ""))
     if not supplier_id:
