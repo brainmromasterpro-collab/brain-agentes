@@ -97,23 +97,28 @@ def sales_orders_abiertas(limite: int = 150) -> list[dict]:
 
 def _so_detalle(so_id: str) -> dict:
     """Detalle completo de UNA Sales Order candidata (so_stage, cliente, currency_id, so_number,
-    términos de pago del cliente) — se llama solo para las pocas que ya matchearon, no para las
-    150 del índice. `billing_account` viene vacío en la API (verificado en vivo) — el nombre del
-    cliente hay que resolverlo aparte con `billing_account_id` (reusa sales_order.cuenta_por_id).
-    Los términos de pago se piden porque el cliente pidió que el PO herede los términos que
-    tenemos con ESE cliente (mismo campo `default_terms` que ya usa sales_order.crear_sales_order
-    vía _terminos_y_moneda)."""
+    términos y perfil fiscal de la cuenta) — se llama solo para las pocas que ya matchearon, no
+    para las 150 del índice. `billing_account` viene vacío en la API (verificado en vivo) — el
+    nombre del cliente hay que resolverlo aparte con `billing_account_id`.
+
+    OJO — campo de términos CORRECTO (decidido con Gabriel): la cuenta tiene DOS campos de
+    términos distintos: `default_terms` ("Condiciones de la Venta", lo que usa
+    sales_order.crear_sales_order vía _terminos_y_moneda — NO usar aquí) y
+    `default_purchase_terms` ("Condiciones de la Compra" — el correcto para un Purchase Order,
+    aunque el proveedor real sea otro como eBay). También se trae `tax_code_id` (perfil fiscal de
+    la cuenta) para aplicarlo a las líneas del PO."""
     d = sales_order._crm_get(f"data/SalesOrder/{so_id}")
     rec = d.get("record", d)
     billing_account_id = rec.get("billing_account_id", "")
     cuenta = sales_order.cuenta_por_id(billing_account_id)
-    tm = sales_order._terminos_y_moneda(billing_account_id) if billing_account_id else {}
+    cuenta_full = sales_order._crm_get(f"data/Account/{billing_account_id}").get("record", {}) if billing_account_id else {}
     return {
         "so_stage": rec.get("so_stage", ""),
         "so_number": rec.get("so_number"),
         "cliente": (cuenta or {}).get("nombre", ""),
         "currency_id": rec.get("currency_id") or "",
-        "terminos_pago": tm.get("terminos_pago", ""),
+        "terminos_pago": cuenta_full.get("default_purchase_terms", "") or "",
+        "tax_code_id": cuenta_full.get("tax_code_id") or "",
     }
 
 
@@ -230,6 +235,7 @@ def buscar_sales_orders_candidatas(links_data: list[dict]) -> dict:
             "cliente": detalle["cliente"],
             "currency_id": detalle["currency_id"],
             "terminos_pago": detalle["terminos_pago"],
+            "tax_code_id": detalle["tax_code_id"],
             # Condiciones de pago es un campo OBLIGATORIO en 1CRM (pedido explícito de Gabriel:
             # nunca crear el PO en silencio sin esto) — se avisa aquí para que el usuario lo
             # configure en la cuenta del cliente antes de confirmar; crear_po_y_ap también lo
@@ -255,7 +261,7 @@ def buscar_sales_orders_candidatas(links_data: list[dict]) -> dict:
 # ─────────────────────────────────────────────────────────────
 # 3. ESCRITURA — crear el PurchaseOrder + Bill de UN grupo (tras aprobación)
 # ─────────────────────────────────────────────────────────────
-def _crear_lineas_po(po_id: str, currency_id: str, lineas: list[dict]) -> int:
+def _crear_lineas_po(po_id: str, currency_id: str, lineas: list[dict], tax_class_id: str = "") -> int:
     """PurchaseOrder no auto-crea líneas desde el POST de creación (verificado en vivo):
     hace falta un PurchaseOrderLineGroup y luego cada PurchaseOrderLine apuntando a él.
 
@@ -302,6 +308,10 @@ def _crear_lineas_po(po_id: str, currency_id: str, lineas: list[dict]) -> int:
             "unit_price_usd": float(precio_unit) / exchange_rate,
             "ext_price_usd": ext / exchange_rate,
         }
+        # Perfil fiscal del cliente de la Sales Order (pedido de Gabriel): aplica su tax_code a
+        # cada línea para que el PO calcule impuestos según ESE cliente, no un default genérico.
+        if tax_class_id:
+            payload["tax_class_id"] = tax_class_id
         r = sales_order._crm_post("PurchaseOrderLine", payload)
         if r.get("id"):
             creadas += 1
@@ -389,7 +399,7 @@ def crear_po_y_ap(draft: dict) -> dict:
     if not po_id:
         return {"error": f"no se pudo crear el Purchase Order: {r}"}
 
-    _crear_lineas_po(po_id, currency_id, lineas)
+    _crear_lineas_po(po_id, currency_id, lineas, draft.get("tax_code_id", ""))
 
     bill_payload = {
         "name": f"AP — {draft.get('proveedor_nombre','')} — {nombre_po}".strip(" —"),
