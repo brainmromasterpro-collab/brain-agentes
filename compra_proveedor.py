@@ -254,22 +254,30 @@ def _crear_lineas_po(po_id: str, currency_id: str, lineas: list[dict]) -> int:
     """PurchaseOrder no auto-crea líneas desde el POST de creación (verificado en vivo):
     hace falta un PurchaseOrderLineGroup y luego cada PurchaseOrderLine apuntando a él.
 
-    `unit_price_usd`/`ext_price_usd` de cada línea TAMBIÉN hay que mandarlos explícitos —
-    verificado en vivo: sin ellos se quedan en None pese a que el PO padre sí trae bien
-    amount_usdollar/subtotal_usd/pretax_usd. Sospecha fundada (a confirmar con Gabriel viendo
-    la UI): si el total que se muestra en pantalla se arma sumando estos campos por línea en
-    vez de leer subtotal/amount directo, una suma con null da NaN en JS — coincide con el
-    síntoma reportado ("sigue saliendo con NaN")."""
-    grp = sales_order._crm_post("PurchaseOrderLineGroup", {"parent_id": po_id})
+    CAUSA REAL del "Subtotal/Total: NaN" en la vista normal (confirmada en vivo viendo la UI):
+    `PurchaseOrderLineGroup` tiene sus PROPIOS campos `subtotal`/`subtotal_usd`/`total`/`total_usd`
+    — la vista los usa para la fila de totales del grupo, NO los suma de las líneas ni lee el
+    subtotal del PO padre. Sin ellos (solo se mandaba `parent_id`) quedan en None → NaN al
+    sumarlos en el front. También cada línea necesita `unit_price_usd`/`ext_price_usd` propios
+    (mismo principio: nada se deriva solo)."""
+    # Se calcula el total del grupo ANTES de crearlo (ya se tienen todas las líneas) para
+    # mandar subtotal/total en el mismo POST de creación, no un PATCH aparte.
+    exchange_rate = 1.0
+    po_rec = sales_order._crm_get(f"data/PurchaseOrder/{po_id}").get("record", {})
+    if po_rec.get("exchange_rate"):
+        exchange_rate = sales_order._num(po_rec["exchange_rate"]) or 1.0
+    total_grupo = sum(float(ln.get("unit_price") or ln.get("precio_costo") or 0) * float(ln.get("quantity", 1) or 1)
+                      for ln in lineas)
+
+    grp = sales_order._crm_post("PurchaseOrderLineGroup", {
+        "parent_id": po_id,
+        "subtotal": total_grupo, "subtotal_usd": total_grupo / exchange_rate,
+        "total": total_grupo, "total_usd": total_grupo / exchange_rate,
+    })
     grp_id = grp.get("id")
     if not grp_id:
         log.error(f"No se pudo crear PurchaseOrderLineGroup para PO {po_id}: {grp}")
         return 0
-
-    # Tasa de cambio real que 1CRM ya resolvió sola al crear el PO (se ve en el propio registro
-    # aunque no se haya mandado explícita) — se usa para el equivalente en USD de cada línea.
-    po_rec = sales_order._crm_get(f"data/PurchaseOrder/{po_id}").get("record", {})
-    exchange_rate = sales_order._num(po_rec.get("exchange_rate")) or 1.0
 
     creadas = 0
     for ln in lineas:
