@@ -1298,13 +1298,27 @@ def _extraer_producto_ebay_serpapi(url: str, item_id: str, dominio: str = "ebay.
     specs_raw = prod.get("specifications")
     _d(f"buy={json.dumps(buy, ensure_ascii=False)[:300]} | media={json.dumps(media, ensure_ascii=False)[:200]} | specifications={json.dumps(specs_raw, ensure_ascii=False)[:400]}")
 
-    # precio: probar las formas más comunes de SerpAPI (objeto con extracted_price, o num directo)
-    precio_obj = buy.get("price") if isinstance(buy, dict) else None
+    # precio: confirmado en vivo (log de diagnóstico) que vive un nivel más adentro de lo que se
+    # asumió — buy.<opcion_de_compra>.price.amount, donde <opcion_de_compra> es la que aplique al
+    # anuncio (buy_it_now / auction / best_offer). Se prueban las tres, en ese orden de prioridad.
     precio_costo = ""
-    if isinstance(precio_obj, dict):
-        precio_costo = precio_obj.get("extracted_price") or precio_obj.get("raw") or precio_obj.get("value") or ""
-    elif precio_obj is not None:
-        precio_costo = precio_obj
+    moneda_ebay = ""
+    if isinstance(buy, dict):
+        for opcion in ("buy_it_now", "auction", "best_offer"):
+            bloque = buy.get(opcion)
+            if isinstance(bloque, dict):
+                precio_obj = bloque.get("price")
+                if isinstance(precio_obj, dict) and precio_obj.get("amount") is not None:
+                    precio_costo = precio_obj["amount"]
+                    moneda_ebay = precio_obj.get("currency") or ""
+                    break
+    if not precio_costo:
+        # Respaldo por si alguna vez viene plano (formas ya vistas en otras engines de SerpAPI)
+        precio_obj = buy.get("price") if isinstance(buy, dict) else None
+        if isinstance(precio_obj, dict):
+            precio_costo = precio_obj.get("extracted_price") or precio_obj.get("raw") or precio_obj.get("value") or ""
+        elif precio_obj is not None:
+            precio_costo = precio_obj
 
     # imágenes: puede ser {"images": [...]} o una lista directa de urls/objetos
     imgs_raw = media.get("images") if isinstance(media, dict) else media
@@ -1350,7 +1364,7 @@ def _extraer_producto_ebay_serpapi(url: str, item_id: str, dominio: str = "ebay.
         "marca": marca,
         "part_number": part_number,
         "precio_costo": precio_costo,
-        "moneda": "USD",
+        "moneda": moneda_ebay or "USD",
         "descripcion": (prod.get("short_description") or "")[:600],
         "caracteristicas": _filtrar_caracteristicas_no_tecnicas(caracteristicas)[:14],
         "imagen_url": imagenes[0] if imagenes else "",

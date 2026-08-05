@@ -96,18 +96,24 @@ def sales_orders_abiertas(limite: int = 150) -> list[dict]:
 
 
 def _so_detalle(so_id: str) -> dict:
-    """Detalle completo de UNA Sales Order candidata (so_stage, cliente, currency_id, so_number)
-    — se llama solo para las pocas que ya matchearon, no para las 150 del índice.
-    `billing_account` viene vacío en la API (verificado en vivo) — el nombre del cliente hay que
-    resolverlo aparte con `billing_account_id` (reusa sales_order.cuenta_por_id)."""
+    """Detalle completo de UNA Sales Order candidata (so_stage, cliente, currency_id, so_number,
+    términos de pago del cliente) — se llama solo para las pocas que ya matchearon, no para las
+    150 del índice. `billing_account` viene vacío en la API (verificado en vivo) — el nombre del
+    cliente hay que resolverlo aparte con `billing_account_id` (reusa sales_order.cuenta_por_id).
+    Los términos de pago se piden porque el cliente pidió que el PO herede los términos que
+    tenemos con ESE cliente (mismo campo `default_terms` que ya usa sales_order.crear_sales_order
+    vía _terminos_y_moneda)."""
     d = sales_order._crm_get(f"data/SalesOrder/{so_id}")
     rec = d.get("record", d)
-    cuenta = sales_order.cuenta_por_id(rec.get("billing_account_id", ""))
+    billing_account_id = rec.get("billing_account_id", "")
+    cuenta = sales_order.cuenta_por_id(billing_account_id)
+    tm = sales_order._terminos_y_moneda(billing_account_id) if billing_account_id else {}
     return {
         "so_stage": rec.get("so_stage", ""),
         "so_number": rec.get("so_number"),
         "cliente": (cuenta or {}).get("nombre", ""),
         "currency_id": rec.get("currency_id") or "",
+        "terminos_pago": tm.get("terminos_pago", ""),
     }
 
 
@@ -223,6 +229,7 @@ def buscar_sales_orders_candidatas(links_data: list[dict]) -> dict:
             "so_url": f"{CRM_BASE}/index.php?module=SalesOrders&action=DetailView&record={so_id}",
             "cliente": detalle["cliente"],
             "currency_id": detalle["currency_id"],
+            "terminos_pago": detalle["terminos_pago"],
             "ya_comprado": yc,
             "proveedor_nombre": proveedor_sugerido,
             "lineas": lineas_sugeridas,
@@ -319,6 +326,8 @@ def crear_po_y_ap(draft: dict) -> dict:
         "currency_id": currency_id,
         "amount": total,
     }
+    if draft.get("terminos_pago"):
+        po_payload["terms"] = draft["terminos_pago"]
     if so_id:
         po_payload["from_so_id"] = so_id
     r = sales_order._crm_post("PurchaseOrder", po_payload)
@@ -336,6 +345,7 @@ def crear_po_y_ap(draft: dict) -> dict:
         "amount": total,
         "bill_date": hoy,
         "due_date": hoy,
+        **({"terms": draft["terminos_pago"]} if draft.get("terminos_pago") else {}),
         "line_items": [{
             "name": ln.get("name") or ln.get("nombre") or "Producto",
             "quantity": ln.get("quantity", 1),
