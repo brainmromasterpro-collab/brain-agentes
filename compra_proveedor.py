@@ -662,10 +662,21 @@ def leer_contenido_paquete(imagenes: list[bytes], model_id: str = "") -> dict:
 
 def confirmar_recepcion(po_id: str) -> dict:
     """Cierra el Purchase Order (shipping_stage=Received) — solo tras confirmación del usuario de
-    que el contenido coincide con lo esperado."""
+    que el contenido coincide con lo esperado. Lo que llega a recepción SUMA al stock del
+    catálogo (pedido de Gabriel)."""
     r = sales_order._crm_patch("PurchaseOrder", po_id, {"shipping_stage": "Received"})
-    return {"ok": "error" not in r, "po_id": po_id,
-            "po_url": f"{CRM_BASE}/index.php?module=PurchaseOrders&action=DetailView&record={po_id}"}
+    ok = "error" not in r
+    ajustes: list = []
+    if ok:
+        rec = sales_order._crm_get(f"data/PurchaseOrder/{po_id}").get("record", {})
+        for li in (rec.get("line_items") or []):
+            pn = li.get("mfr_part_no")
+            cantidad = sales_order._num(li.get("quantity")) or 0
+            if pn and cantidad:
+                ajustes.append(_ajustar_stock(pn, cantidad))
+    return {"ok": ok, "po_id": po_id,
+            "po_url": f"{CRM_BASE}/index.php?module=PurchaseOrders&action=DetailView&record={po_id}",
+            "ajustes_stock": ajustes}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -701,13 +712,25 @@ def sos_pendientes_cierre(limite: int = 40) -> list[dict]:
 
 def cerrar_venta(so_id: str, entregado: bool, facturado: bool) -> dict:
     """Mueve so_stage según lo que el usuario confirma que ya pasó (entrega y/o firma de
-    factura) — VERIFICADO en vivo. Si ninguno de los dos ocurrió, no hay nada que mover."""
+    factura) — VERIFICADO en vivo. Si ninguno de los dos ocurrió, no hay nada que mover.
+    Al FACTURAR, RESTA del stock del catálogo (pedido de Gabriel) — la entrega sin factura no
+    toca el stock, solo el momento de facturar."""
     nuevo_stage = _SO_STAGE_CIERRE.get((entregado, facturado))
     if not nuevo_stage:
         return {"error": "ni entregado ni facturado — no hay nada que actualizar"}
     r = sales_order._crm_patch("SalesOrder", so_id, {"so_stage": nuevo_stage})
-    return {"ok": "error" not in r, "so_id": so_id, "so_stage": nuevo_stage,
-            "so_url": f"{CRM_BASE}/index.php?module=SalesOrders&action=DetailView&record={so_id}"}
+    ok = "error" not in r
+    ajustes: list = []
+    if ok and facturado:
+        rec = sales_order._crm_get(f"data/SalesOrder/{so_id}").get("record", {})
+        for li in (rec.get("line_items") or []):
+            pn = li.get("mfr_part_no")
+            cantidad = sales_order._num(li.get("quantity")) or 0
+            if pn and cantidad:
+                ajustes.append(_ajustar_stock(pn, -cantidad))
+    return {"ok": ok, "so_id": so_id, "so_stage": nuevo_stage,
+            "so_url": f"{CRM_BASE}/index.php?module=SalesOrders&action=DetailView&record={so_id}",
+            "ajustes_stock": ajustes}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -742,19 +765,38 @@ def deshacer_pago(payment_id: str) -> dict:
 
 
 def deshacer_recepcion(po_id: str, estado_anterior: str = "") -> dict:
-    """Revierte la Etapa 3: regresa shipping_stage al valor que tenía antes de confirmar."""
+    """Revierte la Etapa 3: regresa shipping_stage al valor que tenía antes de confirmar, y
+    resta del stock lo que `confirmar_recepcion` había sumado (reversión simétrica)."""
     if not po_id:
         return {"error": "falta po_id"}
+    rec = sales_order._crm_get(f"data/PurchaseOrder/{po_id}").get("record", {})
+    ajustes: list = []
+    for li in (rec.get("line_items") or []):
+        pn = li.get("mfr_part_no")
+        cantidad = sales_order._num(li.get("quantity")) or 0
+        if pn and cantidad:
+            ajustes.append(_ajustar_stock(pn, -cantidad))
     r = sales_order._crm_patch("PurchaseOrder", po_id, {"shipping_stage": estado_anterior or "Ordered"})
-    return {"ok": "error" not in r, "po_id": po_id}
+    return {"ok": "error" not in r, "po_id": po_id, "ajustes_stock": ajustes}
 
 
 def deshacer_cierre(so_id: str, estado_anterior: str = "") -> dict:
-    """Revierte la Etapa 4: regresa so_stage al valor que tenía antes de confirmar."""
+    """Revierte la Etapa 4: regresa so_stage al valor que tenía antes de confirmar. Si el estado
+    actual (antes de deshacer) tenía facturado=True, regresa el stock que se había restado —
+    si solo estaba "entregado" sin facturar, no toca el stock (nunca se le restó)."""
     if not so_id:
         return {"error": "falta so_id"}
+    rec = sales_order._crm_get(f"data/SalesOrder/{so_id}").get("record", {})
+    estaba_facturado = rec.get("so_stage") in ("Closed - Shipped and Invoiced", "Invoiced NOT SHIPPED")
+    ajustes: list = []
+    if estaba_facturado:
+        for li in (rec.get("line_items") or []):
+            pn = li.get("mfr_part_no")
+            cantidad = sales_order._num(li.get("quantity")) or 0
+            if pn and cantidad:
+                ajustes.append(_ajustar_stock(pn, cantidad))
     r = sales_order._crm_patch("SalesOrder", so_id, {"so_stage": estado_anterior or "Ordered"})
-    return {"ok": "error" not in r, "so_id": so_id}
+    return {"ok": "error" not in r, "so_id": so_id, "ajustes_stock": ajustes}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -813,3 +855,45 @@ def estado_operativo_so(so_id: str, po_ids: list[str] | None = None, bill_ids: l
         "recibido": {"total": total_po, "hecho": recibidos},
         "facturado": so.get("so_stage") == "Closed - Shipped and Invoiced",
     }
+
+
+# ─────────────────────────────────────────────────────────────
+# 9. STOCK — recepción SUMA al catálogo, facturación RESTA (pedido explícito de Gabriel)
+# ─────────────────────────────────────────────────────────────
+# Módulo real del catálogo: "Product" (no "AOS_Products" — verificado en vivo, meta/modules
+# muestra module=ProductCatalog/primary_model=Product). `all_stock` ("Cantidad en stock, todos
+# los almacenes") viene `editable:false` en la metadata pero SÍ acepta PATCH directo (mismo
+# patrón de "editable:false no bloquea la API" de todo este proyecto — probado con create+patch
+# controlado). No existe un módulo de Warehouse/Inventory separado expuesto por la API — el stock
+# vive solo en este campo agregado del producto.
+def _buscar_producto_catalogo(part_number: str) -> dict | None:
+    """Busca UN producto del catálogo por número de parte. `filter_text` es el único parámetro
+    que sí filtra de verdad para este módulo (verificado en vivo) — `search[manufacturers_part_no]`
+    NO filtra, devuelve la lista completa sin filtrar."""
+    part_number = (part_number or "").strip()
+    if not part_number:
+        return None
+    data = sales_order._crm_get("data/Product", {"filter_text": part_number, "max_num": 5})
+    pc = sales_order._compact(part_number)
+    for r in data.get("records", []):
+        rid = r.get("id")
+        if not rid:
+            continue
+        rec = sales_order._crm_get(f"data/Product/{rid}").get("record", {})
+        if pc and (sales_order._compact(rec.get("manufacturers_part_no", "")) == pc
+                   or sales_order._compact(rec.get("model", "")) == pc):
+            return {"id": rid, "all_stock": sales_order._num(rec.get("all_stock")) or 0, "nombre": rec.get("name", "")}
+    return None
+
+
+def _ajustar_stock(part_number: str, delta: float) -> dict:
+    """Suma (recepción, delta>0) o resta (facturación, delta<0) del stock del producto del
+    catálogo que matchee ese número de parte. NO es fatal si no se encuentra — el flujo de
+    compras/ventas no depende de que el producto esté en el catálogo, solo se reporta."""
+    prod = _buscar_producto_catalogo(part_number)
+    if not prod:
+        return {"ok": False, "part_number": part_number, "motivo": "producto no encontrado en el catálogo"}
+    nuevo = (prod["all_stock"] or 0) + delta
+    r = sales_order._crm_patch("Product", prod["id"], {"all_stock": nuevo})
+    return {"ok": "error" not in r, "part_number": part_number, "producto": prod["nombre"],
+            "stock_anterior": prod["all_stock"], "stock_nuevo": nuevo, "delta": delta}
