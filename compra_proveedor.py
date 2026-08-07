@@ -582,7 +582,10 @@ def registrar_pago(bill_id: str, monto: float, datos_comprobante: dict | None = 
 # `description` (campo libre, siempre presente). `shipping_stage` SÍ es nativo y su PATCH está
 # VERIFICADO en vivo (Draft/Ordered/Partially Received/Received) — es lo que cierra el PO.
 def pos_esperando_recepcion(limite: int = 40) -> list[dict]:
-    """Purchase Orders con mercancía en tránsito (shipping_stage Ordered o Partially Received)."""
+    """Purchase Orders con mercancía en tránsito (shipping_stage Ordered o Partially Received),
+    con el Sales Order/cliente vinculado — pedido explícito de Gabriel: al elegir a cuál PO
+    corresponde una recepción, se tiene que ver también la venta detrás ("recuerda que hay
+    también un sales order vinculado")."""
     data = sales_order._crm_get("data/PurchaseOrder", {"order_by": "date_modified desc", "limit": limite})
     out: list[dict] = []
     for po in data.get("records", []):
@@ -594,10 +597,19 @@ def pos_esperando_recepcion(limite: int = 40) -> list[dict]:
         if rec.get("shipping_stage") not in ("Ordered", "Partially Received"):
             continue
         cuenta = sales_order.cuenta_por_id(rec.get("supplier_id", ""))
+        so_id = rec.get("from_so_id") or ""
+        so_nombre, so_cliente = "", ""
+        if so_id:
+            so_rec = sales_order._crm_get(f"data/SalesOrder/{so_id}").get("record", {})
+            so_nombre = so_rec.get("name", "")
+            so_cuenta = sales_order.cuenta_por_id(so_rec.get("billing_account_id", ""))
+            so_cliente = (so_cuenta or {}).get("nombre", "")
         out.append({
             "id": pid, "nombre": rec.get("name", ""), "shipping_stage": rec.get("shipping_stage"),
             "proveedor": (cuenta or {}).get("nombre", ""), "description": rec.get("description", ""),
             "url": f"{CRM_BASE}/index.php?module=PurchaseOrders&action=DetailView&record={pid}",
+            "so_id": so_id, "so_nombre": so_nombre, "so_cliente": so_cliente,
+            "so_url": f"{CRM_BASE}/index.php?module=SalesOrders&action=DetailView&record={so_id}" if so_id else "",
             "lineas": [{"name": li.get("name"), "mfr_part_no": li.get("mfr_part_no"),
                         "quantity": li.get("quantity")} for li in (rec.get("line_items") or [])],
         })
@@ -663,7 +675,9 @@ def leer_contenido_paquete(imagenes: list[bytes], model_id: str = "") -> dict:
 def confirmar_recepcion(po_id: str) -> dict:
     """Cierra el Purchase Order (shipping_stage=Received) — solo tras confirmación del usuario de
     que el contenido coincide con lo esperado. Lo que llega a recepción SUMA al stock del
-    catálogo (pedido de Gabriel)."""
+    catálogo (pedido de Gabriel). NOTA: esta versión asume que TODO el PO llegó de una sola vez —
+    para el flujo real de "puede venir en varios pedidos diferentes" usar
+    `confirmar_recepcion_parcial`, que sí lleva la cuenta de entregas previas."""
     r = sales_order._crm_patch("PurchaseOrder", po_id, {"shipping_stage": "Received"})
     ok = "error" not in r
     ajustes: list = []
@@ -677,6 +691,82 @@ def confirmar_recepcion(po_id: str) -> dict:
     return {"ok": ok, "po_id": po_id,
             "po_url": f"{CRM_BASE}/index.php?module=PurchaseOrders&action=DetailView&record={po_id}",
             "ajustes_stock": ajustes}
+
+
+_INSTR_PACKING_LIST = (
+    "Esta imagen puede ser un PACKING LIST (lista de empaque) de un proveedor, o solo una foto/"
+    "captura de un envío en camino. Si es un packing list o se alcanzan a leer productos y "
+    "cantidades con claridad, devuelve SOLO un JSON:\n"
+    '{"es_packing_list": true, "items": [{"nombre": "...", "mfr_part_no": "... o \\"\\"", '
+    '"cantidad": number}], "notas": ""}\n'
+    "Si NO se alcanzan a leer cantidades/productos con claridad (ej. solo es una captura de "
+    "tracking o una foto genérica), devuelve:\n"
+    '{"es_packing_list": false, "items": [], "notas": "breve descripción de qué se ve"}\n'
+    "NO inventes cantidades ni números de parte que no estén legibles."
+)
+
+
+def leer_packing_list(imagenes: list[bytes], model_id: str = "") -> dict:
+    """Lee un packing list (o detecta que NO lo es) con visión — a diferencia de
+    leer_contenido_paquete (que solo describe en texto libre), esto extrae cantidades
+    ESTRUCTURADAS por producto, necesarias para saber cuánto sumar al stock de ESTA entrega
+    específica (puede no ser el PO completo — "pueden venir en varios pedidos diferentes")."""
+    datos = _leer_con_vision(imagenes, _INSTR_PACKING_LIST, model_id)
+    datos.setdefault("es_packing_list", False)
+    datos.setdefault("items", [])
+    return datos
+
+
+def cantidades_esperadas_po(po_id: str, ya_recibido: dict[str, float] | None = None) -> list[dict]:
+    """Cuánto falta por recibir de cada línea del PO, descontando lo ya confirmado en entregas
+    previas (`ya_recibido`, calculado por el llamador desde el historial de recepciones
+    confirmadas de este PO). Base para la tabla editable del widget de confirmación."""
+    ya_recibido = ya_recibido or {}
+    rec = sales_order._crm_get(f"data/PurchaseOrder/{po_id}").get("record", {})
+    out = []
+    for li in (rec.get("line_items") or []):
+        pn = li.get("mfr_part_no") or ""
+        pc = sales_order._compact(pn)
+        esperado = sales_order._num(li.get("quantity")) or 0
+        recibido_previo = ya_recibido.get(pc, 0) or 0
+        out.append({
+            "name": li.get("name", ""), "mfr_part_no": pn,
+            "cantidad_esperada": esperado, "cantidad_recibida_previo": recibido_previo,
+            "cantidad_restante": max(0, esperado - recibido_previo),
+        })
+    return out
+
+
+def confirmar_recepcion_parcial(po_id: str, cantidades_esta_entrega: dict[str, float],
+                                ya_recibido_previo: dict[str, float] | None = None) -> dict:
+    """Confirma UNA entrega (puede ser parcial — "pueden venir en varios pedidos diferentes" para
+    completar el mismo PO). Suma `cantidades_esta_entrega` (claves = part_number COMPACTADO) al
+    stock del catálogo. Decide Partially Received vs Received comparando el total acumulado
+    (entregas previas + esta) contra lo que pedía cada línea del PO — solo cierra a Received
+    cuando TODAS las líneas ya se cubrieron por completo."""
+    ya_recibido_previo = ya_recibido_previo or {}
+    rec = sales_order._crm_get(f"data/PurchaseOrder/{po_id}").get("record", {})
+    if not rec.get("id"):
+        return {"error": f"no encontré el Purchase Order {po_id}"}
+
+    ajustes: list = []
+    completo = True
+    for li in (rec.get("line_items") or []):
+        pn = li.get("mfr_part_no") or ""
+        pc = sales_order._compact(pn)
+        esperado = sales_order._num(li.get("quantity")) or 0
+        cantidad_esta_vez = cantidades_esta_entrega.get(pc, 0) or 0
+        if cantidad_esta_vez:
+            ajustes.append(_ajustar_stock(pn, cantidad_esta_vez))
+        recibido_total = (ya_recibido_previo.get(pc, 0) or 0) + cantidad_esta_vez
+        if recibido_total < esperado:
+            completo = False
+
+    nuevo_stage = "Received" if completo else "Partially Received"
+    r = sales_order._crm_patch("PurchaseOrder", po_id, {"shipping_stage": nuevo_stage})
+    return {"ok": "error" not in r, "po_id": po_id, "shipping_stage": nuevo_stage, "completo": completo,
+            "ajustes_stock": ajustes,
+            "po_url": f"{CRM_BASE}/index.php?module=PurchaseOrders&action=DetailView&record={po_id}"}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -774,6 +864,25 @@ def deshacer_recepcion(po_id: str, estado_anterior: str = "") -> dict:
     for li in (rec.get("line_items") or []):
         pn = li.get("mfr_part_no")
         cantidad = sales_order._num(li.get("quantity")) or 0
+        if pn and cantidad:
+            ajustes.append(_ajustar_stock(pn, -cantidad))
+    r = sales_order._crm_patch("PurchaseOrder", po_id, {"shipping_stage": estado_anterior or "Ordered"})
+    return {"ok": "error" not in r, "po_id": po_id, "ajustes_stock": ajustes}
+
+
+def deshacer_recepcion_parcial(po_id: str, cantidades_a_revertir: dict[str, float],
+                               estado_anterior: str = "") -> dict:
+    """Revierte UNA entrega parcial específica (no todo el PO — puede haber otras entregas
+    confirmadas antes o después): resta del stock solo `cantidades_a_revertir` (claves = part
+    number compactado) y regresa shipping_stage al valor que tenía ANTES de esa entrega."""
+    if not po_id:
+        return {"error": "falta po_id"}
+    rec = sales_order._crm_get(f"data/PurchaseOrder/{po_id}").get("record", {})
+    ajustes: list = []
+    for li in (rec.get("line_items") or []):
+        pn = li.get("mfr_part_no") or ""
+        pc = sales_order._compact(pn)
+        cantidad = cantidades_a_revertir.get(pc, 0) or 0
         if pn and cantidad:
             ajustes.append(_ajustar_stock(pn, -cantidad))
     r = sales_order._crm_patch("PurchaseOrder", po_id, {"shipping_stage": estado_anterior or "Ordered"})
