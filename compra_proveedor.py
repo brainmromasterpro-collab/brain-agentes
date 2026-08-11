@@ -717,6 +717,37 @@ def leer_packing_list(imagenes: list[bytes], model_id: str = "") -> dict:
     return datos
 
 
+_INSTR_DOC_RECEIVING = (
+    "Esta imagen es un documento relacionado con la recepción de mercancía de un proveedor. "
+    "Clasifícala en UNO de estos tipos y extrae lo que puedas:\n"
+    "- 'packing_list': lista de empaque con productos y cantidades que vienen en el envío.\n"
+    "- 'order_confirmation': confirmación/acuse de pedido del proveedor (confirma que va a surtir "
+    "la orden), normalmente SIN indicar todavía que se envió.\n"
+    "- 'recepcion_paquete': FOTO de un paquete/caja físico ya recibido (se ve la mercancía o la "
+    "caja), normalmente con una etiqueta/guía de envío pegada.\n"
+    "- 'tracking': etiqueta de envío o captura donde lo principal es un número de guía/tracking, "
+    "sin lista de productos.\n"
+    "- 'otro': cualquier otra cosa.\n"
+    "Devuelve SOLO un JSON:\n"
+    '{"tipo": "packing_list|order_confirmation|recepcion_paquete|tracking|otro", '
+    '"items": [{"nombre": "...", "mfr_part_no": "... o \\"\\"", "cantidad": number}], '
+    '"tracking": "número de guía si se ve, o \\"\\"", "notas": "breve descripción"}\n'
+    "Incluye items[] SOLO cuando se lean productos+cantidades con claridad (típico del packing "
+    "list). NO inventes cantidades, números de parte ni guías que no estén legibles."
+)
+
+
+def leer_documento_receiving(imagenes: list[bytes], model_id: str = "") -> dict:
+    """Clasifica con visión un documento de recepción en un tipo (packing_list / order_confirmation
+    / recepcion_paquete / tracking / otro) y extrae items+guía cuando se puedan leer. Un solo punto
+    de entrada para todo el ciclo de receiving v2 — el router decide qué hacer según `tipo`."""
+    datos = _leer_con_vision(imagenes, _INSTR_DOC_RECEIVING, model_id)
+    datos.setdefault("tipo", "otro")
+    datos.setdefault("items", [])
+    datos.setdefault("tracking", "")
+    return datos
+
+
 def cantidades_esperadas_po(po_id: str, ya_recibido: dict[str, float] | None = None) -> list[dict]:
     """Cuánto falta por recibir de cada línea del PO, descontando lo ya confirmado en entregas
     previas (`ya_recibido`, calculado por el llamador desde el historial de recepciones
@@ -741,9 +772,12 @@ def confirmar_recepcion_parcial(po_id: str, cantidades_esta_entrega: dict[str, f
                                 ya_recibido_previo: dict[str, float] | None = None) -> dict:
     """Confirma UNA entrega (puede ser parcial — "pueden venir en varios pedidos diferentes" para
     completar el mismo PO). Suma `cantidades_esta_entrega` (claves = part_number COMPACTADO) al
-    stock del catálogo. Decide Partially Received vs Received comparando el total acumulado
-    (entregas previas + esta) contra lo que pedía cada línea del PO — solo cierra a Received
-    cuando TODAS las líneas ya se cubrieron por completo."""
+    stock del catálogo SIEMPRE (inventario físico real, aparte del estado del PO).
+
+    REGLA de Gabriel: el `shipping_stage` NATIVO del PO NO se toca en entregas parciales — se queda
+    como está (Ordered) y el avance vive como estatus DERIVADO del historial. Solo cuando el ciclo
+    está COMPLETO (todas las líneas cubiertas por entregas previas + esta) se hace el PATCH a
+    `Received`. Nunca se escribe `Partially Received` nativo."""
     ya_recibido_previo = ya_recibido_previo or {}
     rec = sales_order._crm_get(f"data/PurchaseOrder/{po_id}").get("record", {})
     if not rec.get("id"):
@@ -762,9 +796,15 @@ def confirmar_recepcion_parcial(po_id: str, cantidades_esta_entrega: dict[str, f
         if recibido_total < esperado:
             completo = False
 
-    nuevo_stage = "Received" if completo else "Partially Received"
-    r = sales_order._crm_patch("PurchaseOrder", po_id, {"shipping_stage": nuevo_stage})
-    return {"ok": "error" not in r, "po_id": po_id, "shipping_stage": nuevo_stage, "completo": completo,
+    stage_previo = rec.get("shipping_stage") or "Ordered"
+    if completo:
+        r = sales_order._crm_patch("PurchaseOrder", po_id, {"shipping_stage": "Received"})
+        ok, shipping_stage = ("error" not in r), "Received"
+    else:
+        # Entrega parcial: el PO nativo se queda como está — el "parcial" es estatus derivado.
+        ok, shipping_stage = True, stage_previo
+    return {"ok": ok, "po_id": po_id, "shipping_stage": shipping_stage, "completo": completo,
+            "estatus_receiving": "recibido" if completo else "parcial",
             "ajustes_stock": ajustes,
             "po_url": f"{CRM_BASE}/index.php?module=PurchaseOrders&action=DetailView&record={po_id}"}
 

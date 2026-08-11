@@ -3726,12 +3726,47 @@ def _recibido_previo_po(stream_id: str, po_id: str) -> dict:
     return acumulado
 
 
-def _procesar_evidencia_recepcion(stream_id: str, texto: str, file_url: str = "", nombre: str = "", mime: str = "") -> None:
-    """ETAPA 3 (recepción) — PASO 1: llega evidencia (link/foto/texto de tracking, o un packing
-    list). Se lee (si es imagen, con visión — detecta si es packing list con cantidades o solo
-    una confirmación genérica), se angostan los PO's candidatos (mostrando también la Sales
-    Order/cliente detrás, pedido explícito de Gabriel) y se emite [RECEIVING_COTEJO] para que el
-    usuario elija a cuál corresponde. NO crea nada todavía — eso es el paso 2."""
+def _receivings_activos(stream_id: str) -> list:
+    """Receivings ACTIVOS (activados pero no recibidos por completo) de este stream, derivados del
+    historial (misma filosofía que _recibido_previo_po). Se toma el ÚLTIMO [RECEIVING_ESTADO] por
+    po_id (estatus esperando/en_transito) y se descartan los que ya tengan un [RECEIVING_CONFIRMADO]
+    con completo=True. El [RECEIVING_ESTADO] guarda el packing list de referencia y el contexto del
+    PO/SO — no hay que volver a pegarle a 1CRM."""
+    estados: dict = {}
+    completos: set = set()
+    try:
+        rows = (supabase.table("mensajes").select("content")
+                .eq("stream_id", stream_id).ilike("content", "%RECEIVING_%")
+                .order("created_at").execute())
+        for r in (rows.data or []):
+            content = r.get("content") or ""
+            if content.startswith("[RECEIVING_ESTADO]"):
+                try:
+                    p = json.loads(content[len("[RECEIVING_ESTADO]"):])
+                except Exception:
+                    continue
+                if p.get("po_id"):
+                    estados[p["po_id"]] = p  # asc -> el último gana
+            elif content.startswith("[RECEIVING_CONFIRMADO]"):
+                try:
+                    p = json.loads(content[len("[RECEIVING_CONFIRMADO]"):])
+                except Exception:
+                    continue
+                if p.get("po_id") and p.get("completo"):
+                    completos.add(p["po_id"])
+    except Exception as e:
+        log.warning(f"No se pudieron leer los receivings activos de {stream_id}: {e}")
+    return [e for pid, e in estados.items() if pid not in completos]
+
+
+def _procesar_evidencia_receiving(stream_id: str, texto: str, file_url: str = "", nombre: str = "", mime: str = "") -> None:
+    """Punto de entrada del RECEIVING v2. Clasifica la evidencia (con visión si es imagen) y la
+    manda al evento del ciclo de vida que corresponda — secuencia flexible, cualquiera puede
+    llegar primero:
+      • packing_list / order_confirmation -> ACTIVAR el receiving (cotejo para elegir el PO).
+      • tracking (texto de guía o etiqueta) -> marcar EN TRÁNSITO.
+      • recepcion_paquete (foto del paquete con guía) -> iniciar RECEPCIÓN (elegir cuál pendiente).
+    """
     try:
         import compra_proveedor
     except Exception as e:
@@ -3741,90 +3776,222 @@ def _procesar_evidencia_recepcion(stream_id: str, texto: str, file_url: str = ""
     if not pos:
         supabase.table("mensajes").insert({
             "stream_id": stream_id, "role": "assistant",
-            "content": "No tengo ninguna compra en tránsito esperando recepción ahorita.",
+            "content": "No tengo ninguna compra en tránsito ahorita. Cuando tengas el order "
+                       "confirmation o el packing list de un proveedor, mándamelo y arranco el receiving.",
             "procesado": True, "metadata": {},
         }).execute()
         return
 
-    packing_list = None
+    doc = None
     if file_url:
-        _log_stream(stream_id, "Leyendo la evidencia de recepción…", "info")
+        _log_stream(stream_id, "Leyendo el documento de recepción…", "info")
         try:
             imgs = _bajar_imagenes(file_url, nombre, mime)
-            packing_list = compra_proveedor.leer_packing_list(imgs)
+            doc = compra_proveedor.leer_documento_receiving(imgs)
         except Exception as e:
-            packing_list = {"error": str(e)}
+            doc = {"tipo": "otro", "error": str(e), "items": [], "tracking": ""}
 
-    tracking_texto = texto.strip() if texto and not file_url else ""
-    texto_para_match = " ".join(f"{it.get('nombre','')} {it.get('mfr_part_no','')}" for it in (packing_list or {}).get("items", [])) \
-        if packing_list else ""
-    candidatos = compra_proveedor.filtrar_candidatos_recepcion(pos, texto_para_match, tracking_texto)
+    tipo = (doc or {}).get("tipo", "")
+    tracking_txt = (doc or {}).get("tracking", "") or (texto.strip() if texto and not file_url else "")
 
+    if tipo == "recepcion_paquete":
+        _cotejo_recepcion(stream_id, doc, tracking_txt)
+        return
+    if tipo == "tracking" or (not file_url and tracking_txt):
+        _cotejo_tracking(stream_id, tracking_txt)
+        return
+    # order_confirmation / packing_list / imagen ambigua -> activar el receiving
+    _cotejo_activar(stream_id, doc, tracking_txt, pos)
+
+
+def _cotejo_activar(stream_id: str, doc: dict | None, tracking: str, pos: list) -> None:
+    """Detectó un order confirmation / packing list -> muestra a qué PO ligarlo (con su SO/cliente).
+    El packing list detectado viaja para guardarse como lista de referencia al activar."""
+    import compra_proveedor
+    items = (doc or {}).get("items") or []
+    texto_match = " ".join(f"{it.get('nombre','')} {it.get('mfr_part_no','')}" for it in items)
+    candidatos = compra_proveedor.filtrar_candidatos_recepcion(pos, texto_match, tracking)
     supabase.table("mensajes").insert({
         "stream_id": stream_id, "role": "assistant",
         "content": "[RECEIVING_COTEJO]" + json.dumps({
-            "tracking_texto": tracking_texto, "packing_list": packing_list, "candidatos": candidatos,
+            "modo": "activar", "doc": doc, "tracking": tracking, "candidatos": candidatos,
             "sin_match": len(candidatos) == len(pos) and len(pos) > 1,
         }, ensure_ascii=False),
         "procesado": True, "metadata": {"receiving_cotejo": True},
     }).execute()
-    _log_stream(stream_id, f"{len(candidatos)} compra(s) candidata(s) en tránsito", "ok")
+    _log_stream(stream_id, f"{len(candidatos)} PO candidato(s) para activar el receiving", "ok")
 
 
-def _crear_receiving_pendiente(stream_id: str, po_id: str, tracking: str, packing_list: dict | None) -> None:
-    """ETAPA 3 — PASO 2: el usuario ya eligió a cuál PO corresponde → registra el tracking (si
-    vino) y crea el "receiving" como PENDIENTE (NO toca 1CRM/stock todavía — eso es el paso 3,
-    explícito). Sirve aunque no haya packing list o venga incompleto: igual se crea pendiente,
-    con la tabla de cantidades esperadas restantes para que el usuario confirme cuando pueda,
-    prellenada con lo detectado si el packing list sí traía cantidades."""
+def _cotejo_tracking(stream_id: str, tracking: str) -> None:
+    """Llegó un tracking. Si hay UN solo receiving activo, lo marca en tránsito directo; si hay
+    varios (o ninguno activado aún), muestra el cotejo para elegir a cuál corresponde."""
+    activos = _receivings_activos(stream_id)
+    if len(activos) == 1:
+        _marcar_en_transito(stream_id, activos[0]["po_id"], tracking)
+        return
+    if not activos:
+        # No hay receiving activado todavía — se elige el PO directamente (crea el estado al vuelo).
+        import compra_proveedor
+        pos = compra_proveedor.pos_esperando_recepcion()
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": "[RECEIVING_COTEJO]" + json.dumps({
+                "modo": "tracking", "tracking": tracking, "candidatos": pos,
+                "sin_match": len(pos) > 1,
+            }, ensure_ascii=False),
+            "procesado": True, "metadata": {"receiving_cotejo": True},
+        }).execute()
+        return
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[RECEIVING_COTEJO]" + json.dumps({
+            "modo": "tracking", "tracking": tracking,
+            "candidatos": [{"id": a["po_id"], "nombre": a.get("po_nombre", ""), "proveedor": a.get("proveedor", ""),
+                            "so_nombre": a.get("so_nombre", ""), "so_cliente": a.get("so_cliente", ""),
+                            "lineas": a.get("lineas_po", [])} for a in activos],
+            "sin_match": True,
+        }, ensure_ascii=False),
+        "procesado": True, "metadata": {"receiving_cotejo": True},
+    }).execute()
+
+
+def _cotejo_recepcion(stream_id: str, doc: dict | None, guia: str) -> None:
+    """Llegó la foto del paquete. Muestra los receivings PENDIENTES para que el usuario elija a
+    cuál corresponde la recepción; al elegir se arma el checklist de items recibidos."""
+    activos = _receivings_activos(stream_id)
+    if not activos:
+        # No hubo activación previa (packing list) — se cae al listado de PO's en tránsito directo.
+        import compra_proveedor
+        pos = compra_proveedor.pos_esperando_recepcion()
+        candidatos = [{"po_id": p["id"], "po_nombre": p.get("nombre", ""), "proveedor": p.get("proveedor", ""),
+                       "so_nombre": p.get("so_nombre", ""), "so_cliente": p.get("so_cliente", ""),
+                       "estatus": "esperando", "packing_list": None, "lineas_po": p.get("lineas", [])} for p in pos]
+    else:
+        candidatos = activos
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[RECEIVING_COTEJO]" + json.dumps({
+            "modo": "recepcion", "guia": guia, "doc": doc, "candidatos": candidatos,
+            "sin_match": len(candidatos) > 1,
+        }, ensure_ascii=False),
+        "procesado": True, "metadata": {"receiving_cotejo": True},
+    }).execute()
+    _log_stream(stream_id, f"{len(candidatos)} recepción(es) pendiente(s) para cotejar", "ok")
+
+
+def _activar_receiving(stream_id: str, po_id: str, candidato: dict, doc: dict | None, tracking: str = "") -> None:
+    """El usuario ligó el order confirmation / packing list a un PO -> nace el receiving en estatus
+    'esperando' (o 'en_transito' si además vino un tracking). Guarda el packing list como lista de
+    REFERENCIA. NO toca el shipping_stage nativo del PO (regla de Gabriel: eso solo al completar)."""
+    packing_ref = None
+    d = doc or {}
+    if (d.get("items") or []):
+        packing_ref = {"items": d.get("items"), "notas": d.get("notas", "")}
+    estatus = "en_transito" if tracking else "esperando"
+    estado = {
+        "po_id": po_id,
+        "po_nombre": candidato.get("nombre", ""),
+        "proveedor": candidato.get("proveedor", ""),
+        "so_id": candidato.get("so_id", ""), "so_nombre": candidato.get("so_nombre", ""),
+        "so_cliente": candidato.get("so_cliente", ""),
+        "po_url": candidato.get("url", ""), "so_url": candidato.get("so_url", ""),
+        "estatus": estatus, "packing_list": packing_ref, "tracking": tracking,
+        "lineas_po": candidato.get("lineas", []),
+        "tipo_doc": d.get("tipo", ""),
+    }
+    if tracking:
+        try:
+            import compra_proveedor
+            compra_proveedor.registrar_tracking(po_id, tracking)
+        except Exception:
+            pass
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[RECEIVING_ESTADO]" + json.dumps(estado, ensure_ascii=False),
+        "procesado": True, "metadata": {"receiving_estado": True},
+    }).execute()
+    _log_stream(stream_id, f"Receiving activado ({estatus}) para {estado['po_nombre']}", "ok")
+
+
+def _marcar_en_transito(stream_id: str, po_id: str, tracking: str) -> None:
+    """Registra el tracking y mueve el receiving a 'en tránsito' — reemitiendo el [RECEIVING_ESTADO]
+    con los datos que ya tenía (packing list de referencia incluido)."""
+    activos = {a["po_id"]: a for a in _receivings_activos(stream_id)}
+    base = activos.get(po_id)
+    if not base:
+        # Nunca se activó — se construye el contexto desde 1CRM.
+        try:
+            import compra_proveedor
+            pos = compra_proveedor.pos_esperando_recepcion()
+            p = next((x for x in pos if x["id"] == po_id), None)
+        except Exception:
+            p = None
+        base = {"po_id": po_id, "po_nombre": (p or {}).get("nombre", ""),
+                "proveedor": (p or {}).get("proveedor", ""), "so_id": (p or {}).get("so_id", ""),
+                "so_nombre": (p or {}).get("so_nombre", ""), "so_cliente": (p or {}).get("so_cliente", ""),
+                "po_url": (p or {}).get("url", ""), "so_url": (p or {}).get("so_url", ""),
+                "packing_list": None, "lineas_po": (p or {}).get("lineas", [])}
+    try:
+        import compra_proveedor
+        compra_proveedor.registrar_tracking(po_id, tracking)
+    except Exception:
+        pass
+    estado = {**base, "estatus": "en_transito", "tracking": tracking}
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[RECEIVING_ESTADO]" + json.dumps(estado, ensure_ascii=False),
+        "procesado": True, "metadata": {"receiving_estado": True},
+    }).execute()
+    _log_stream(stream_id, f"Tracking registrado — {estado.get('po_nombre','')} en tránsito", "ok")
+
+
+def _iniciar_recepcion(stream_id: str, po_id: str, guia: str = "") -> None:
+    """El usuario eligió a qué receiving pendiente corresponde el paquete -> arma el CHECKLIST de
+    items recibidos: cada línea del PO con su cantidad esperada, lo que ya se recibió antes, lo que
+    falta y (si hubo packing list de referencia) cuánto decía ese packing list."""
     try:
         import compra_proveedor
     except Exception as e:
         log.error(f"compra_proveedor no disponible: {e}")
         return
-    if tracking:
-        compra_proveedor.registrar_tracking(po_id, tracking)
-
     po_rec = compra_proveedor.sales_order._crm_get(f"data/PurchaseOrder/{po_id}").get("record", {})
-    estado_anterior = po_rec.get("shipping_stage", "")
+    estado_anterior = po_rec.get("shipping_stage", "Ordered")
 
     ya_recibido = _recibido_previo_po(stream_id, po_id)
     esperadas = compra_proveedor.cantidades_esperadas_po(po_id, ya_recibido)
 
-    # Si el packing list trajo cantidades legibles, se usan para prellenar la tabla editable en
-    # vez de la cantidad restante completa (match por part number compactado).
-    detectadas: dict = {}
-    if packing_list and packing_list.get("es_packing_list"):
-        for it in (packing_list.get("items") or []):
-            pc = compra_proveedor.sales_order._compact(it.get("mfr_part_no") or it.get("nombre") or "")
-            if pc:
-                detectadas[pc] = (detectadas.get(pc, 0) or 0) + (it.get("cantidad") or 0)
+    # Packing list de referencia guardado al activar (si hubo).
+    ref = {}
+    for a in _receivings_activos(stream_id):
+        if a["po_id"] == po_id and a.get("packing_list"):
+            for it in (a["packing_list"].get("items") or []):
+                pc = compra_proveedor.sales_order._compact(it.get("mfr_part_no") or it.get("nombre") or "")
+                if pc:
+                    ref[pc] = (ref.get(pc, 0) or 0) + (it.get("cantidad") or 0)
+
     for linea in esperadas:
         pc = compra_proveedor.sales_order._compact(linea.get("mfr_part_no") or linea.get("name") or "")
-        if pc in detectadas:
-            linea["cantidad_sugerida"] = detectadas[pc]
-        else:
-            linea["cantidad_sugerida"] = linea["cantidad_restante"]
+        packing = ref.get(pc)
+        linea["cantidad_packing"] = packing
+        # sugerido = lo que falta, acotado por lo que decía el packing list si existe
+        sug = linea["cantidad_restante"] if packing is None else min(linea["cantidad_restante"], packing)
+        linea["cantidad_sugerida"] = sug
+        linea["recibido"] = sug > 0  # precheck si se espera recibir algo
 
-    payload = {"po_id": po_id, "tracking": tracking, "lineas": esperadas,
-               "estado_anterior": estado_anterior,
-               "packing_list_notas": (packing_list or {}).get("notas", "")}
+    payload = {"po_id": po_id, "guia": guia, "lineas": esperadas, "estado_anterior": estado_anterior}
     supabase.table("mensajes").insert({
         "stream_id": stream_id, "role": "assistant",
-        "content": "[RECEIVING_PENDIENTE]" + json.dumps(payload, ensure_ascii=False),
-        "procesado": True, "metadata": {"receiving_pendiente": True},
+        "content": "[RECEIVING_RECEPCION]" + json.dumps(payload, ensure_ascii=False),
+        "procesado": True, "metadata": {"receiving_recepcion": True},
     }).execute()
-    _log_stream(stream_id, "Recepción registrada como pendiente — confirma cuando tengas las cantidades", "ok")
+    _log_stream(stream_id, "Checklist de recepción listo — marca lo que recibiste", "ok")
 
 
-def _procesar_confirmar_recepcion_parcial(stream_id: str, po_id: str, cantidades: dict, estado_anterior: str = "") -> None:
-    """ETAPA 3 — PASO 3: el usuario confirma las cantidades de ESTA entrega (puede ser parcial).
-    `cantidades` llega del widget con las claves = `mfr_part_no` TAL CUAL se mostraron en la tabla
-    (legible) — aquí se compactan antes de llamar a compra_proveedor (que trabaja con part number
-    compactado, igual que el resto del sistema). Suma al stock, decide Partially Received vs
-    Received según lo acumulado (esta entrega + las previas del historial). Emite
-    [RECEIVING_CONFIRMADO] con las claves ya compactadas, para que _recibido_previo_po las pueda
-    sumar consistentemente en la próxima entrega."""
+def _confirmar_recepcion_checklist(stream_id: str, po_id: str, cantidades: dict, estado_anterior: str = "") -> None:
+    """El usuario confirmó el checklist (items + cantidades recibidas de ESTA entrega). Suma al
+    stock; el shipping_stage nativo del PO solo pasa a Received si el ciclo quedó completo (regla
+    de Gabriel). `cantidades` = {mfr_part_no legible: cantidad} -> se compacta aquí. Emite
+    [RECEIVING_CONFIRMADO]."""
     try:
         import compra_proveedor
     except Exception as e:
@@ -3833,8 +4000,8 @@ def _procesar_confirmar_recepcion_parcial(stream_id: str, po_id: str, cantidades
     cantidades_compactas = {}
     for pn, cant in (cantidades or {}).items():
         pc = compra_proveedor.sales_order._compact(pn)
-        if pc:
-            cantidades_compactas[pc] = (cantidades_compactas.get(pc, 0) or 0) + (cant or 0)
+        if pc and (cant or 0) > 0:
+            cantidades_compactas[pc] = (cantidades_compactas.get(pc, 0) or 0) + cant
     ya_recibido_previo = _recibido_previo_po(stream_id, po_id)
     res = compra_proveedor.confirmar_recepcion_parcial(po_id, cantidades_compactas, ya_recibido_previo)
     res["cantidades"] = cantidades_compactas
@@ -3845,14 +4012,14 @@ def _procesar_confirmar_recepcion_parcial(stream_id: str, po_id: str, cantidades
         "content": "[RECEIVING_CONFIRMADO]" + json.dumps(res, ensure_ascii=False),
         "procesado": True, "metadata": {"receiving_confirmado": True},
     }).execute()
-    _log_stream(stream_id, f"Recepción confirmada — PO → {res.get('shipping_stage','')}" if res.get("ok") else "No se pudo confirmar",
+    estatus = res.get("estatus_receiving", "")
+    _log_stream(stream_id, f"Recepción confirmada — {estatus}" if res.get("ok") else "No se pudo confirmar",
                 "ok" if res.get("ok") else "error")
 
 
 def _deshacer_receiving(stream_id: str, po_id: str, cantidades: dict, estado_anterior: str) -> None:
-    """Deshace UNA entrega parcial específica (no todo el PO). `cantidades` debe venir con claves
-    YA compactadas — el widget de Deshacer reenvía tal cual el `cantidades` que emitió
-    [RECEIVING_CONFIRMADO] (ese sí quedó compactado por _procesar_confirmar_recepcion_parcial)."""
+    """Deshace UNA entrega específica (no todo el PO). `cantidades` viene con claves YA compactadas
+    (el widget reenvía el `cantidades` de [RECEIVING_CONFIRMADO])."""
     try:
         import compra_proveedor
     except Exception:
@@ -4086,17 +4253,22 @@ def procesar_mensaje(msg: dict) -> None:
         if _md0.get("pago_action") == "deshacer":
             _deshacer_pago(stream_id, _md0.get("payment_id", ""))
             return
-        # Receiving: paso 1 (elegir PO candidato) -> paso 2 (crear pendiente) -> paso 3 (confirmar
-        # cantidades de esta entrega, posiblemente parcial). Reemplaza el viejo recepcion_action de
-        # un solo paso — se deja el nombre anterior fuera de uso, sin borrar histórico.
-        if _md0.get("receiving_action") == "crear_pendiente":
-            _crear_receiving_pendiente(stream_id, _md0.get("po_id", ""), _md0.get("tracking", ""),
-                                       _md0.get("packing_list") or None)
+        # Receiving v2 — sub-proceso anidado con ciclo de vida (secuencia flexible):
+        # activar (order confirmation/packing list) -> tracking (en tránsito) -> iniciar_recepcion
+        # (foto del paquete -> checklist) -> confirmar_recepcion (suma stock, cierra si completo).
+        if _md0.get("receiving_action") == "activar":
+            _activar_receiving(stream_id, _md0.get("po_id", ""), _md0.get("candidato") or {},
+                               _md0.get("doc") or None, _md0.get("tracking", ""))
             return
-        if _md0.get("receiving_action") == "confirmar_final":
-            _procesar_confirmar_recepcion_parcial(stream_id, _md0.get("po_id", ""),
-                                                  _md0.get("cantidades") or {},
-                                                  _md0.get("estado_anterior", ""))
+        if _md0.get("receiving_action") == "tracking":
+            _marcar_en_transito(stream_id, _md0.get("po_id", ""), _md0.get("tracking", ""))
+            return
+        if _md0.get("receiving_action") == "iniciar_recepcion":
+            _iniciar_recepcion(stream_id, _md0.get("po_id", ""), _md0.get("guia", ""))
+            return
+        if _md0.get("receiving_action") == "confirmar_recepcion":
+            _confirmar_recepcion_checklist(stream_id, _md0.get("po_id", ""),
+                                           _md0.get("cantidades") or {}, _md0.get("estado_anterior", ""))
             return
         if _md0.get("receiving_action") == "deshacer":
             _deshacer_receiving(stream_id, _md0.get("po_id", ""), _md0.get("cantidades") or {},
@@ -4132,8 +4304,8 @@ def procesar_mensaje(msg: dict) -> None:
             _procesar_link_proveedor(stream_id, _urls)
         elif _file_url and _es_factura:
             _procesar_cierre_venta(stream_id)
-        elif _file_url and re.search(r'paquete|lleg|recib|contenido|packing', _low):
-            _procesar_evidencia_recepcion(stream_id, contenido, _file_url, _file_name, _file_mime)
+        elif _file_url and re.search(r'paquete|lleg|recib|contenido|packing|confirmation|confirmaci[oó]n|order\s*conf|gu[ií]a|tracking|env[ií]o|recepci[oó]n|receiving', _low + " " + (_file_name or "").lower()):
+            _procesar_evidencia_receiving(stream_id, contenido, _file_url, _file_name, _file_mime)
         elif _file_url:
             # Default para un archivo sin más contexto: comprobante de pago (el caso más común
             # del transcript — "pagué algo, saco una foto").
@@ -4143,7 +4315,7 @@ def procesar_mensaje(msg: dict) -> None:
         elif _es_factura:
             _procesar_cierre_venta(stream_id)
         elif _es_tracking_texto:
-            _procesar_evidencia_recepcion(stream_id, contenido)
+            _procesar_evidencia_receiving(stream_id, contenido)
         else:
             supabase.table("mensajes").insert({
                 "stream_id": stream_id, "role": "assistant",
