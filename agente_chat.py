@@ -4469,7 +4469,21 @@ def procesar_mensaje(msg: dict) -> None:
                              or re.search(r'\b[A-Z0-9]{8,30}\b', contenido or "")))
 
         if _file_url:
-            # Un archivo en ordenes = orden de compra del cliente (flujo existente).
+            # Una IMAGEN en ordenes puede ser la guía de envío (tracking saliente) o la orden de
+            # compra del cliente — se clasifica con visión. Un PDF/otro se asume orden del cliente.
+            _es_img = (_file_mime or "").startswith("image/") or re.search(r'\.(png|jpe?g|webp|gif|heic)$', (_file_name or "").lower())
+            if _es_img:
+                try:
+                    import sales_shipping
+                    _imgs = _bajar_imagenes(_file_url, _file_name, _file_mime)
+                    _ev = sales_shipping.leer_evidencia_envio(_imgs)
+                except Exception as e:
+                    log.warning(f"No se pudo clasificar la imagen de ventas: {e}")
+                    _ev = {"tipo": "orden_compra"}
+                if _ev.get("tipo") == "tracking":
+                    _procesar_tracking_envio(stream_id, _ev.get("tracking", "") or (contenido or "").strip())
+                    return
+            # orden de compra del cliente (flujo existente).
             _procesar_orden_compra(stream_id, _file_url, _file_name or "orden", _file_mime)
             return
         if _es_shipped:

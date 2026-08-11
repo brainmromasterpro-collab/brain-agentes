@@ -34,6 +34,27 @@ _SO_STAGE_FACTURADO = {
 }
 
 
+_INSTR_EVIDENCIA_ENVIO = (
+    "Esta imagen llegó en el flujo de VENTAS (Sales order). Decide qué es:\n"
+    "- 'tracking': una guía/etiqueta de envío o screenshot donde lo principal es un número de "
+    "rastreo (el envío que sale al cliente).\n"
+    "- 'orden_compra': una orden de compra del CLIENTE (documento con productos/cantidades que el "
+    "cliente nos pide, número de orden, etc.).\n"
+    "- 'otro': cualquier otra cosa.\n"
+    "Devuelve SOLO un JSON: {\"tipo\": \"tracking|orden_compra|otro\", \"tracking\": \"guía si se "
+    "ve, o \\\"\\\"\", \"notas\": \"\"}. NO inventes un número de guía que no esté legible."
+)
+
+
+def leer_evidencia_envio(imagenes: list[bytes], model_id: str = "") -> dict:
+    """Clasifica una imagen del stream de ventas: guía de envío (tracking, saliente) vs orden de
+    compra del cliente. Resuelve el ruteo del archivo en el stream 'ordenes'."""
+    datos = compra_proveedor._leer_con_vision(imagenes, _INSTR_EVIDENCIA_ENVIO, model_id)
+    datos.setdefault("tipo", "otro")
+    datos.setdefault("tracking", "")
+    return datos
+
+
 def sos_por_enviar(limite: int = 40) -> list[dict]:
     """Sales Orders con líneas pendientes de enviar (no cerradas). Trae cliente y líneas para el
     checklist de qué se envía."""
