@@ -4128,6 +4128,196 @@ def _confirmar_cierre_venta(stream_id: str, so_id: str, entregado: bool, factura
                 "ok" if res.get("ok") else "error")
 
 
+# ─────────────────────────────────────────────────────────────
+# SHIPPING (stream 'ordenes' / Sales order) — envío al cliente
+# tracking -> elegir SO -> checklist de líneas + peso/dims/costo -> In Preparation
+# "shipped" -> elegir envío en preparación -> Shipped (resta stock, recalcula so_stage)
+# ─────────────────────────────────────────────────────────────
+def _enviado_previo_so(stream_id: str, so_id: str) -> dict:
+    """Suma lo YA enviado de este SO en envíos previos, del historial de [SHIPPING_ENVIADO] (claves
+    = part number compactado). Misma filosofía que _recibido_previo_po."""
+    acumulado: dict = {}
+    try:
+        rows = (supabase.table("mensajes").select("content")
+                .eq("stream_id", stream_id).ilike("content", "%SHIPPING_ENVIADO%").execute())
+        for r in (rows.data or []):
+            content = r.get("content") or ""
+            if not content.startswith("[SHIPPING_ENVIADO]"):
+                continue
+            try:
+                p = json.loads(content[len("[SHIPPING_ENVIADO]"):])
+            except Exception:
+                continue
+            if p.get("so_id") != so_id or not p.get("ok"):
+                continue
+            for ln in (p.get("lineas") or []):
+                import compra_proveedor
+                pc = compra_proveedor.sales_order._compact(ln.get("mfr_part_no") or "")
+                if pc:
+                    acumulado[pc] = acumulado.get(pc, 0) + (ln.get("quantity") or 0)
+    except Exception as e:
+        log.warning(f"No se pudo leer envíos previos del SO {so_id}: {e}")
+    return acumulado
+
+
+def _shippings_en_preparacion(stream_id: str) -> list:
+    """Envíos creados ([SHIPPING_CREADO]) que aún no se marcaron como enviados ([SHIPPING_ENVIADO]
+    con el mismo shipping_id). Derivado del historial."""
+    creados: dict = {}
+    enviados: set = set()
+    try:
+        rows = (supabase.table("mensajes").select("content")
+                .eq("stream_id", stream_id).ilike("content", "%SHIPPING_%")
+                .order("created_at").execute())
+        for r in (rows.data or []):
+            content = r.get("content") or ""
+            if content.startswith("[SHIPPING_CREADO]"):
+                try:
+                    p = json.loads(content[len("[SHIPPING_CREADO]"):])
+                except Exception:
+                    continue
+                if p.get("shipping_id"):
+                    creados[p["shipping_id"]] = p
+            elif content.startswith("[SHIPPING_ENVIADO]"):
+                try:
+                    p = json.loads(content[len("[SHIPPING_ENVIADO]"):])
+                except Exception:
+                    continue
+                if p.get("shipping_id"):
+                    enviados.add(p["shipping_id"])
+    except Exception as e:
+        log.warning(f"No se pudieron leer los envíos en preparación de {stream_id}: {e}")
+    return [c for sid, c in creados.items() if sid not in enviados]
+
+
+def _procesar_tracking_envio(stream_id: str, tracking: str = "") -> None:
+    """Llegó un tracking de salida -> muestra los Sales Orders pendientes de enviar para elegir a
+    cuál corresponde. Emite [SHIPPING_COTEJO] modo elegir_so."""
+    try:
+        import sales_shipping
+    except Exception as e:
+        log.error(f"sales_shipping no disponible: {e}")
+        return
+    sos = sales_shipping.sos_por_enviar()
+    if not sos:
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": "No tengo Sales Orders pendientes de enviar ahorita.",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[SHIPPING_COTEJO]" + json.dumps({
+            "modo": "elegir_so", "tracking": tracking, "candidatos": sos, "sin_match": len(sos) > 1,
+        }, ensure_ascii=False),
+        "procesado": True, "metadata": {"shipping_cotejo": True},
+    }).execute()
+    _log_stream(stream_id, f"{len(sos)} Sales Order(s) pendiente(s) de enviar", "ok")
+
+
+def _preparar_envio(stream_id: str, so_id: str, tracking: str = "") -> None:
+    """El usuario eligió el SO -> arma el checklist de líneas por enviar (restante = pedido − ya
+    enviado) + campos de peso/dimensiones/costo. Emite [SHIPPING_FORM]."""
+    try:
+        import sales_shipping
+    except Exception as e:
+        log.error(f"sales_shipping no disponible: {e}")
+        return
+    ya_enviado = _enviado_previo_so(stream_id, so_id)
+    lineas = sales_shipping.cantidades_por_enviar(so_id, ya_enviado)
+    for l in lineas:
+        l["cantidad_sugerida"] = l["cantidad_restante"]
+        l["enviar"] = l["cantidad_restante"] > 0
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[SHIPPING_FORM]" + json.dumps({"so_id": so_id, "tracking": tracking, "lineas": lineas},
+                                                  ensure_ascii=False),
+        "procesado": True, "metadata": {"shipping_form": True},
+    }).execute()
+    _log_stream(stream_id, "Captura qué se envía y los datos del paquete", "ok")
+
+
+def _crear_shipping_confirmado(stream_id: str, so_id: str, lineas: list, datos: dict) -> None:
+    """Crea el Shipping en 'In Preparation' con las líneas y datos logísticos capturados. Emite
+    [SHIPPING_CREADO] (las líneas con su line_id viajan aquí para marcar_enviado/deshacer después)."""
+    try:
+        import sales_shipping
+    except Exception as e:
+        log.error(f"sales_shipping no disponible: {e}")
+        return
+    res = sales_shipping.crear_shipping(so_id, lineas, datos)
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[SHIPPING_CREADO]" + json.dumps(res, ensure_ascii=False),
+        "procesado": True, "metadata": {"shipping_creado": True},
+    }).execute()
+    _log_stream(stream_id, "Envío creado en preparación — teclea «shipped» cuando salga" if res.get("ok") else "No se pudo crear el envío",
+                "ok" if res.get("ok") else "error")
+
+
+def _cotejo_marcar_shipped(stream_id: str) -> None:
+    """El usuario tecleó «shipped» -> muestra los envíos en preparación para elegir cuál ya salió.
+    Emite [SHIPPING_COTEJO] modo marcar_shipped."""
+    prep = _shippings_en_preparacion(stream_id)
+    if not prep:
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": "No tengo envíos en preparación. Manda el tracking de un envío para crearlo primero.",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[SHIPPING_COTEJO]" + json.dumps({
+            "modo": "marcar_shipped", "candidatos": prep, "sin_match": len(prep) > 1,
+        }, ensure_ascii=False),
+        "procesado": True, "metadata": {"shipping_cotejo": True},
+    }).execute()
+    _log_stream(stream_id, f"{len(prep)} envío(s) en preparación", "ok")
+
+
+def _marcar_shipped_confirmado(stream_id: str, ship_id: str, lineas: list, so_id: str, tracking: str = "") -> None:
+    """Marca el envío como 'Shipped': resta stock, recalcula so_stage con lo enviado acumulado
+    (previo + este). Emite [SHIPPING_ENVIADO]."""
+    try:
+        import sales_shipping, compra_proveedor
+    except Exception as e:
+        log.error(f"sales_shipping no disponible: {e}")
+        return
+    enviado_total = dict(_enviado_previo_so(stream_id, so_id))
+    for ln in (lineas or []):
+        pc = compra_proveedor.sales_order._compact(ln.get("mfr_part_no") or "")
+        if pc:
+            enviado_total[pc] = enviado_total.get(pc, 0) + (compra_proveedor.sales_order._num(ln.get("quantity")) or 0)
+    res = sales_shipping.marcar_enviado(ship_id, lineas, so_id, tracking=tracking, enviado_total=enviado_total)
+    res["lineas"] = lineas  # para _enviado_previo_so y para deshacer
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[SHIPPING_ENVIADO]" + json.dumps(res, ensure_ascii=False),
+        "procesado": True, "metadata": {"shipping_enviado": True},
+    }).execute()
+    _log_stream(stream_id, f"Envío marcado como enviado — SO → {res.get('so_stage','')}" if res.get("ok") else "No se pudo marcar",
+                "ok" if res.get("ok") else "error")
+
+
+def _deshacer_shipping(stream_id: str, ship_id: str, lineas: list, so_id: str,
+                       estaba_enviado: bool, so_stage_anterior: str) -> None:
+    """Deshace un envío (regresa stock si estaba enviado, borra el Shipping, restaura so_stage)."""
+    try:
+        import sales_shipping
+    except Exception:
+        return
+    res = sales_shipping.deshacer_shipping(ship_id, lineas, so_id=so_id,
+                                           estaba_enviado=estaba_enviado, so_stage_anterior=so_stage_anterior)
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[ACCION_DESHECHA]" + json.dumps({**res, "que": "este envío"}, ensure_ascii=False),
+        "procesado": True, "metadata": {"accion_deshecha": True},
+    }).execute()
+    _log_stream(stream_id, "Envío deshecho ✓" if res.get("ok") else "No se pudo deshacer", "ok" if res.get("ok") else "error")
+
+
 def _procesar_estado_operativo(stream_id: str) -> None:
     """Rollup Vendido→Comprado→Pagado→Recibido→Facturado de las Sales Orders con actividad en
     este stream. Reconstruye qué PO/Bill le pertenece a cada SO desde el HISTORIAL de mensajes
@@ -4220,15 +4410,78 @@ def procesar_mensaje(msg: dict) -> None:
     # coteja contra las cotizaciones del cliente — sin pasar por el modelo. Emite el widget y termina.
     _md0 = msg.get("metadata") if isinstance(msg.get("metadata"), dict) else {}
     _po_url = _md0.get("file_url") or _md0.get("po_url")
-    if _tipo_stream in ("ordenes", "sales_order") and _po_url:
-        _procesar_orden_compra(stream_id, _po_url,
-                               (_md0.get("file_name") or "orden"), _md0.get("file_mime", ""))
-        return
+    if _tipo_stream in ("ordenes", "sales_order"):
+        _file_url  = _md0.get("file_url") or _md0.get("po_url")
+        _file_name = _md0.get("file_name", "")
+        _file_mime = _md0.get("file_mime", "")
 
-    # CREAR la Sales Order: el usuario confirmó desde el previo (metadata.so_action == "crear").
-    if _tipo_stream in ("ordenes", "sales_order") and _md0.get("so_action") == "crear":
-        _crear_so_confirmada(stream_id, _md0.get("draft") or {})
-        return
+        # Confirmaciones (botón ya apretado) — van primero.
+        if _md0.get("so_action") == "crear":
+            _crear_so_confirmada(stream_id, _md0.get("draft") or {})
+            return
+        # SHIPPING (envío al cliente): tracking -> elegir SO -> form -> In Preparation;
+        # "shipped" -> elegir envío -> Shipped.
+        if _md0.get("shipping_action") == "preparar":
+            _preparar_envio(stream_id, _md0.get("so_id", ""), _md0.get("tracking", ""))
+            return
+        if _md0.get("shipping_action") == "crear":
+            _crear_shipping_confirmado(stream_id, _md0.get("so_id", ""), _md0.get("lineas") or [],
+                                       _md0.get("datos") or {})
+            return
+        if _md0.get("shipping_action") == "marcar_shipped":
+            _marcar_shipped_confirmado(stream_id, _md0.get("shipping_id", ""), _md0.get("lineas") or [],
+                                       _md0.get("so_id", ""), _md0.get("tracking", ""))
+            return
+        if _md0.get("shipping_action") == "deshacer":
+            _deshacer_shipping(stream_id, _md0.get("shipping_id", ""), _md0.get("lineas") or [],
+                               _md0.get("so_id", ""), bool(_md0.get("estaba_enviado")),
+                               _md0.get("so_stage_anterior", ""))
+            return
+        # CIERRE / facturación (movido de compras a ordenes, donde corresponde).
+        if _md0.get("cierre_action") == "confirmar":
+            _confirmar_cierre_venta(stream_id, _md0.get("so_id", ""),
+                                    bool(_md0.get("entregado")), bool(_md0.get("facturado")),
+                                    _md0.get("estado_anterior", ""))
+            return
+        if _md0.get("cierre_action") == "deshacer":
+            _deshacer_cierre(stream_id, _md0.get("so_id", ""), _md0.get("estado_anterior", ""))
+            return
+        if _md0.get("cancelar_accion"):
+            supabase.table("mensajes").insert({
+                "stream_id": stream_id, "role": "assistant",
+                "content": "Entendido, no hice nada con eso. Mándame el dato correcto cuando quieras.",
+                "procesado": True, "metadata": {},
+            }).execute()
+            return
+
+        # Clasificación de evidencia/texto nuevo.
+        _urls = re.findall(r'https?://\S+', contenido or "")
+        _low = (contenido or "").lower()
+        _es_shipped = bool(re.search(r'\bshipped\b|marcar.*(enviad|shipped)|ya (se )?(envi[oó]|sali[oó])', _low))
+        _es_factura = bool(re.search(r'factura|firmad|facturad|facturar|cerrar\s+venta', _low))
+        _es_estado = (not _file_url and not _urls and
+                      bool(re.search(r'c[oó]mo va|estado (de la venta|operativo)|estatus de la venta|rollup|resumen de (la )?venta', _low)))
+        _es_tracking = (not _es_shipped and not _es_estado and
+                        bool(_urls or re.search(r'tracking|gu[ií]a|rastreo|n[uú]mero de env[ií]o|env[ií]o|shipping', _low)
+                             or re.search(r'\b[A-Z0-9]{8,30}\b', contenido or "")))
+
+        if _file_url:
+            # Un archivo en ordenes = orden de compra del cliente (flujo existente).
+            _procesar_orden_compra(stream_id, _file_url, _file_name or "orden", _file_mime)
+            return
+        if _es_shipped:
+            _cotejo_marcar_shipped(stream_id)
+            return
+        if _es_factura:
+            _procesar_cierre_venta(stream_id)
+            return
+        if _es_estado:
+            _procesar_estado_operativo(stream_id)
+            return
+        if _es_tracking:
+            _procesar_tracking_envio(stream_id, (contenido or "").strip())
+            return
+        # Si no matchea nada operativo, cae al chat normal (LLM) — no return.
 
     # PIPELINE DE COMPRAS: stream tipo 'compras'. Router determinista (sin LLM) que despacha a la
     # tarea correspondiente según la evidencia que llegue — el usuario no necesita saber a qué
@@ -4274,14 +4527,6 @@ def procesar_mensaje(msg: dict) -> None:
             _deshacer_receiving(stream_id, _md0.get("po_id", ""), _md0.get("cantidades") or {},
                                 _md0.get("estado_anterior", ""))
             return
-        if _md0.get("cierre_action") == "confirmar":
-            _confirmar_cierre_venta(stream_id, _md0.get("so_id", ""),
-                                    bool(_md0.get("entregado")), bool(_md0.get("facturado")),
-                                    _md0.get("estado_anterior", ""))
-            return
-        if _md0.get("cierre_action") == "deshacer":
-            _deshacer_cierre(stream_id, _md0.get("so_id", ""), _md0.get("estado_anterior", ""))
-            return
         if _md0.get("cancelar_accion"):
             supabase.table("mensajes").insert({
                 "stream_id": stream_id, "role": "assistant",
@@ -4290,10 +4535,10 @@ def procesar_mensaje(msg: dict) -> None:
             }).execute()
             return
 
-        # Clasificación de evidencia nueva (sin botón todavía).
+        # Clasificación de evidencia nueva (sin botón todavía). El cierre/facturación se movió al
+        # stream 'ordenes' (Sales order) — aquí solo compra, pago y recepción.
         _urls = re.findall(r'https?://\S+', contenido or "")
         _low = (contenido or "").lower()
-        _es_factura = bool(re.search(r'factura|firmad|entregu|entregad|cerrar\s+venta', _low))
         _es_estado = (not _file_url and not _urls and
                      bool(re.search(r'c[oó]mo va|estado (de la venta|operativo)|estatus de la venta|rollup|resumen de (la )?venta', _low)))
         _es_tracking_texto = (not _file_url and not _urls and not _es_estado and
@@ -4302,8 +4547,6 @@ def procesar_mensaje(msg: dict) -> None:
 
         if _urls:
             _procesar_link_proveedor(stream_id, _urls)
-        elif _file_url and _es_factura:
-            _procesar_cierre_venta(stream_id)
         elif _file_url and re.search(r'paquete|lleg|recib|contenido|packing|confirmation|confirmaci[oó]n|order\s*conf|gu[ií]a|tracking|env[ií]o|recepci[oó]n|receiving', _low + " " + (_file_name or "").lower()):
             _procesar_evidencia_receiving(stream_id, contenido, _file_url, _file_name, _file_mime)
         elif _file_url:
@@ -4312,16 +4555,14 @@ def procesar_mensaje(msg: dict) -> None:
             _procesar_comprobante_pago(stream_id, _file_url, _file_name, _file_mime)
         elif _es_estado:
             _procesar_estado_operativo(stream_id)
-        elif _es_factura:
-            _procesar_cierre_venta(stream_id)
         elif _es_tracking_texto:
             _procesar_evidencia_receiving(stream_id, contenido)
         else:
             supabase.table("mensajes").insert({
                 "stream_id": stream_id, "role": "assistant",
                 "content": "Mándame el link del producto que vas a comprar, una foto/PDF del "
-                           "comprobante de pago, el tracking de un envío, dime que subes la "
-                           "factura firmada, o pregúntame \"cómo va la venta\" — y sigo desde ahí.",
+                           "comprobante de pago, o el tracking/packing list de una recepción — "
+                           "y sigo desde ahí.",
                 "procesado": True, "metadata": {},
             }).execute()
         return
