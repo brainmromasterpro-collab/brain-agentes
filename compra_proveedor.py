@@ -843,24 +843,18 @@ def sos_pendientes_cierre(limite: int = 40) -> list[dict]:
 def cerrar_venta(so_id: str, entregado: bool, facturado: bool) -> dict:
     """Mueve so_stage según lo que el usuario confirma que ya pasó (entrega y/o firma de
     factura) — VERIFICADO en vivo. Si ninguno de los dos ocurrió, no hay nada que mover.
-    Al FACTURAR, RESTA del stock del catálogo (pedido de Gabriel) — la entrega sin factura no
-    toca el stock, solo el momento de facturar."""
+    NOTA (reconciliación con el módulo Shipping): el stock YA NO se toca aquí. El descuento de
+    stock se hace al ENVIAR (sales_shipping.marcar_enviado), no al facturar — la factura quedó
+    como movimiento puramente financiero (decisión de Gabriel). Esta función sobrevive para el
+    caso simple de "cerrar" el so_stage cuando no se usa el flujo de Shipping detallado."""
     nuevo_stage = _SO_STAGE_CIERRE.get((entregado, facturado))
     if not nuevo_stage:
         return {"error": "ni entregado ni facturado — no hay nada que actualizar"}
     r = sales_order._crm_patch("SalesOrder", so_id, {"so_stage": nuevo_stage})
     ok = "error" not in r
-    ajustes: list = []
-    if ok and facturado:
-        rec = sales_order._crm_get(f"data/SalesOrder/{so_id}").get("record", {})
-        for li in (rec.get("line_items") or []):
-            pn = li.get("mfr_part_no")
-            cantidad = sales_order._num(li.get("quantity")) or 0
-            if pn and cantidad:
-                ajustes.append(_ajustar_stock(pn, -cantidad))
     return {"ok": ok, "so_id": so_id, "so_stage": nuevo_stage,
             "so_url": f"{CRM_BASE}/index.php?module=SalesOrders&action=DetailView&record={so_id}",
-            "ajustes_stock": ajustes}
+            "ajustes_stock": []}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -930,22 +924,13 @@ def deshacer_recepcion_parcial(po_id: str, cantidades_a_revertir: dict[str, floa
 
 
 def deshacer_cierre(so_id: str, estado_anterior: str = "") -> dict:
-    """Revierte la Etapa 4: regresa so_stage al valor que tenía antes de confirmar. Si el estado
-    actual (antes de deshacer) tenía facturado=True, regresa el stock que se había restado —
-    si solo estaba "entregado" sin facturar, no toca el stock (nunca se le restó)."""
+    """Revierte la Etapa 4: regresa so_stage al valor que tenía antes de confirmar. Ya NO toca el
+    stock — el stock lo maneja el módulo Shipping (se resta al enviar, se regresa al deshacer el
+    envío), la factura quedó como movimiento puramente financiero (reconciliación con Shipping)."""
     if not so_id:
         return {"error": "falta so_id"}
-    rec = sales_order._crm_get(f"data/SalesOrder/{so_id}").get("record", {})
-    estaba_facturado = rec.get("so_stage") in ("Closed - Shipped and Invoiced", "Invoiced NOT SHIPPED")
-    ajustes: list = []
-    if estaba_facturado:
-        for li in (rec.get("line_items") or []):
-            pn = li.get("mfr_part_no")
-            cantidad = sales_order._num(li.get("quantity")) or 0
-            if pn and cantidad:
-                ajustes.append(_ajustar_stock(pn, cantidad))
     r = sales_order._crm_patch("SalesOrder", so_id, {"so_stage": estado_anterior or "Ordered"})
-    return {"ok": "error" not in r, "so_id": so_id, "ajustes_stock": ajustes}
+    return {"ok": "error" not in r, "so_id": so_id, "ajustes_stock": []}
 
 
 # ─────────────────────────────────────────────────────────────
