@@ -4290,8 +4290,11 @@ def _marcar_shipped_confirmado(stream_id: str, ship_id: str, lineas: list, so_id
         pc = compra_proveedor.sales_order._compact(ln.get("mfr_part_no") or "")
         if pc:
             enviado_total[pc] = enviado_total.get(pc, 0) + (compra_proveedor.sales_order._num(ln.get("quantity")) or 0)
+    # so_stage ANTES de este envío, para poder deshacer correctamente
+    so_stage_anterior = compra_proveedor.sales_order._crm_get(f"data/SalesOrder/{so_id}").get("record", {}).get("so_stage", "Ordered")
     res = sales_shipping.marcar_enviado(ship_id, lineas, so_id, tracking=tracking, enviado_total=enviado_total)
     res["lineas"] = lineas  # para _enviado_previo_so y para deshacer
+    res["so_stage_anterior"] = so_stage_anterior
     supabase.table("mensajes").insert({
         "stream_id": stream_id, "role": "assistant",
         "content": "[SHIPPING_ENVIADO]" + json.dumps(res, ensure_ascii=False),
