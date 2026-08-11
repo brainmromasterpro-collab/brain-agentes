@@ -4110,22 +4110,28 @@ def _procesar_cierre_venta(stream_id: str) -> None:
     }).execute()
 
 
-def _confirmar_cierre_venta(stream_id: str, so_id: str, entregado: bool, facturado: bool, estado_anterior: str = "") -> None:
-    """Mueve so_stage según lo que el usuario confirmó (entrega y/o factura firmada). Emite
-    [SO_CERRADA_ETAPA4] (incluye estado_anterior, para poder deshacer)."""
+def _confirmar_cierre_venta(stream_id: str, so_id: str, facturado: bool, estado_anterior: str = "") -> None:
+    """Marca la dimensión FACTURADO del SO (la factura puede estar o no). Lo ENVIADO NO se marca a
+    mano: se deriva del historial de envíos (shipping). El so_stage se recalcula combinando ambas
+    dimensiones — el SO solo llega a «Closed - Shipped and Invoiced» cuando está TODO enviado Y
+    facturado (regla de Gabriel). Emite [SO_CERRADA_ETAPA4] con la bandera facturado (fuente de
+    verdad de esa dimensión para _facturado_so)."""
     try:
-        import compra_proveedor
-    except Exception:
+        import sales_shipping
+    except Exception as e:
+        log.error(f"sales_shipping no disponible: {e}")
         return
-    res = compra_proveedor.cerrar_venta(so_id, entregado, facturado)
-    res["estado_anterior"] = estado_anterior
+    enviado_total = _enviado_previo_so(stream_id, so_id)
+    nuevo_stage = sales_shipping.recalcular_so_stage(so_id, enviado_total, facturado)
+    res = {"ok": True, "so_id": so_id, "so_stage": nuevo_stage, "facturado": facturado,
+           "estado_anterior": estado_anterior,
+           "so_url": f"{sales_shipping.CRM_BASE}/index.php?module=SalesOrders&action=DetailView&record={so_id}"}
     supabase.table("mensajes").insert({
         "stream_id": stream_id, "role": "assistant",
         "content": "[SO_CERRADA_ETAPA4]" + json.dumps(res, ensure_ascii=False),
         "procesado": True, "metadata": {"so_cerrada_etapa4": True},
     }).execute()
-    _log_stream(stream_id, f"Sales Order actualizada a «{res.get('so_stage','')}» ✓" if res.get("ok") else "No se pudo actualizar",
-                "ok" if res.get("ok") else "error")
+    _log_stream(stream_id, f"Sales Order actualizada a «{nuevo_stage}» ✓", "ok")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -4158,6 +4164,29 @@ def _enviado_previo_so(stream_id: str, so_id: str) -> dict:
     except Exception as e:
         log.warning(f"No se pudo leer envíos previos del SO {so_id}: {e}")
     return acumulado
+
+
+def _facturado_so(stream_id: str, so_id: str) -> bool:
+    """¿Este SO ya tiene factura? Se lee del último [SO_CERRADA_ETAPA4] del historial (dimensión
+    'facturado' independiente de lo enviado)."""
+    facturado = False
+    try:
+        rows = (supabase.table("mensajes").select("content")
+                .eq("stream_id", stream_id).ilike("content", "%SO_CERRADA_ETAPA4%")
+                .order("created_at").execute())
+        for r in (rows.data or []):
+            content = r.get("content") or ""
+            if not content.startswith("[SO_CERRADA_ETAPA4]"):
+                continue
+            try:
+                p = json.loads(content[len("[SO_CERRADA_ETAPA4]"):])
+            except Exception:
+                continue
+            if p.get("so_id") == so_id:
+                facturado = bool(p.get("facturado"))  # asc -> el último gana
+    except Exception as e:
+        log.warning(f"No se pudo leer facturado del SO {so_id}: {e}")
+    return facturado
 
 
 def _shippings_en_preparacion(stream_id: str) -> list:
@@ -4292,7 +4321,9 @@ def _marcar_shipped_confirmado(stream_id: str, ship_id: str, lineas: list, so_id
             enviado_total[pc] = enviado_total.get(pc, 0) + (compra_proveedor.sales_order._num(ln.get("quantity")) or 0)
     # so_stage ANTES de este envío, para poder deshacer correctamente
     so_stage_anterior = compra_proveedor.sales_order._crm_get(f"data/SalesOrder/{so_id}").get("record", {}).get("so_stage", "Ordered")
-    res = sales_shipping.marcar_enviado(ship_id, lineas, so_id, tracking=tracking, enviado_total=enviado_total)
+    facturado = _facturado_so(stream_id, so_id)  # dimensión factura, del historial
+    res = sales_shipping.marcar_enviado(ship_id, lineas, so_id, tracking=tracking,
+                                        enviado_total=enviado_total, facturado=facturado)
     res["lineas"] = lineas  # para _enviado_previo_so y para deshacer
     res["so_stage_anterior"] = so_stage_anterior
     supabase.table("mensajes").insert({
@@ -4443,8 +4474,7 @@ def procesar_mensaje(msg: dict) -> None:
         # CIERRE / facturación (movido de compras a ordenes, donde corresponde).
         if _md0.get("cierre_action") == "confirmar":
             _confirmar_cierre_venta(stream_id, _md0.get("so_id", ""),
-                                    bool(_md0.get("entregado")), bool(_md0.get("facturado")),
-                                    _md0.get("estado_anterior", ""))
+                                    bool(_md0.get("facturado")), _md0.get("estado_anterior", ""))
             return
         if _md0.get("cierre_action") == "deshacer":
             _deshacer_cierre(stream_id, _md0.get("so_id", ""), _md0.get("estado_anterior", ""))

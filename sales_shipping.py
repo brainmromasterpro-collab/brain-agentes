@@ -182,7 +182,8 @@ def _crear_lineas_shipping(ship_id: str, lineas: list[dict]) -> list[dict]:
 
 
 def marcar_enviado(ship_id: str, lineas_enviadas: list[dict], so_id: str,
-                   tracking: str = "", enviado_total: dict[str, float] | None = None) -> dict:
+                   tracking: str = "", enviado_total: dict[str, float] | None = None,
+                   facturado: bool | None = None) -> dict:
     """Pasa el Shipping a 'Shipped' (con date_shipped), RESTA del stock lo enviado en ESTE envío
     (`lineas_enviadas`, del marker — no se releen de 1CRM) y recalcula el so_stage combinando lo
     enviado acumulado (`enviado_total`, claves = part number compactado, lo arma el llamador desde
@@ -200,19 +201,22 @@ def marcar_enviado(ship_id: str, lineas_enviadas: list[dict], so_id: str,
         if pn and cantidad:
             ajustes.append(compra_proveedor._ajustar_stock(pn, -cantidad))
 
-    nuevo_stage = _recalcular_so_stage(so_id, enviado_total or {})
+    nuevo_stage = recalcular_so_stage(so_id, enviado_total or {}, facturado)
     return {"ok": ok, "shipping_id": ship_id, "so_id": so_id, "shipping_stage": "Shipped",
             "so_stage": nuevo_stage, "ajustes_stock": ajustes,
             "shipping_url": f"{CRM_BASE}/index.php?module=Shipping&action=DetailView&record={ship_id}",
             "so_url": f"{CRM_BASE}/index.php?module=SalesOrders&action=DetailView&record={so_id}"}
 
 
-def _recalcular_so_stage(so_id: str, enviado_total: dict[str, float]) -> str:
-    """Deriva y escribe so_stage de dos dimensiones: ENVIADO (`enviado_total`, acumulado por part
-    number compactado que arma el llamador desde el historial de envíos) vs lo pedido en el SO ×
-    FACTURADO (se conserva del estado actual, que lo maneja la factura)."""
+def recalcular_so_stage(so_id: str, enviado_total: dict[str, float], facturado: bool | None = None) -> str:
+    """Deriva y escribe so_stage de DOS dimensiones independientes: ENVIADO (`enviado_total`,
+    acumulado por part number compactado que arma el llamador desde el historial de envíos, vs lo
+    pedido en el SO) × FACTURADO (`facturado` explícito; si viene None se infiere del so_stage
+    actual). El SO solo llega a «Closed - Shipped and Invoiced» cuando está TODO enviado Y facturado
+    (regla de Gabriel)."""
     so_rec = sales_order._crm_get(f"data/SalesOrder/{so_id}").get("record", {})
-    facturado = so_rec.get("so_stage") in _SO_STAGE_FACTURADO
+    if facturado is None:
+        facturado = so_rec.get("so_stage") in _SO_STAGE_FACTURADO
 
     enviado_completo = True
     algo_enviado = False
