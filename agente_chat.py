@@ -747,10 +747,14 @@ def tool_crear_oportunidad_crm(
     etapa: str = "Prospecting",
     descripcion: str = "",
     stream_id: str = "",
+    permitir_parcial: bool = False,
 ) -> dict:
     """Crea una nueva oportunidad en 1CRM.
     etapa: Prospecting | Qualification | Proposal/Price Quote | Negotiation | Closed Won | Closed Lost
     fecha_cierre: formato YYYY-MM-DD
+    permitir_parcial: SOLO para el canal RFQ manual, y SOLO tras aprobación EXPLÍCITA del usuario de
+      "crear con lo que hay". Relaja el candado de RFQ+cantidad (la cuenta SIEMPRE es obligatoria —
+      1CRM la exige). En el flujo de correo NO se usa (queda la regla estricta).
     """
     if not ONECRM_BASE:
         return {"error": "1CRM no configurado"}
@@ -766,8 +770,9 @@ def tool_crear_oportunidad_crm(
     _tiene_qty = bool(descripcion) and _re.search(
         r'(?:(?:qty|cant)\w*\W*\d|\d\s*(?:unidad|pieza|\bpz|pcs|units?))',
         descripcion, _re.I)
-    if not _tiene_qty:
+    if not _tiene_qty and not permitir_parcial:
         faltantes.append("RFQ + cantidad (Qty)")
+    # La cuenta es obligatoria SIEMPRE (1CRM exige account_id) — ni el override parcial la salta.
     if faltantes:
         return {
             "error":     "INFO_INCOMPLETA",
@@ -2615,6 +2620,7 @@ TOOLS: list[dict] = [
                 "fecha_cierre":  {"type": "string",  "description": "Fecha estimada de cierre YYYY-MM-DD"},
                 "etapa":         {"type": "string",  "description": "Etapa inicial: Prospecting (default), Qualification, Proposal/Price Quote, etc."},
                 "descripcion":   {"type": "string",  "description": "Descripción o contexto de la oportunidad"},
+                "permitir_parcial": {"type": "boolean", "description": "SOLO en el canal RFQ manual y SOLO tras aprobación explícita del usuario de 'crear con lo que hay': relaja el candado de RFQ+cantidad (la cuenta sigue siendo obligatoria). En correo NO se usa."},
             },
             "required": ["nombre", "cuenta_id"],
         },
@@ -3046,6 +3052,34 @@ Cuando el usuario pida "lee los correos", "revisa el correo y detecta oportunida
    PROHIBIDO: hacer dos acciones (crear una y enviar correo de otra) con un solo "Sí". Cada visto bueno aplica a \
    UNA sola acción, la que se mostró justo antes.
 
+MODO 15 — RFQ MANUAL (canal RFQ, sin correo — directo con el usuario):
+
+Este es el stream 'rfq'. Aquí el RFQ NO viene de un correo: el USUARIO lo captura a mano — pega TEXTO, o sube \
+un SCREENSHOT / IMAGEN (foto de una solicitud, lista de partes, mensaje de WhatsApp, etc.). Tu trabajo es el mismo \
+que el MODO 10 (llevar la oportunidad hasta crearla en 1CRM), pero con DOS diferencias clave: \
+(A) el RFQ lo lees DIRECTO del mensaje/imagen del usuario (NO uses herramientas de Gmail); si es imagen, léela con \
+visión y extrae lo que se vea. \
+(B) cuando falten datos, se los pides AL USUARIO EN EL CHAT (no redactas correo al cliente).
+
+1. Lee el RFQ del texto o de la imagen que subió el usuario. Extrae lo que puedas de los 5 DATOS OBLIGATORIOS: \
+   Contacto (persona), Empresa/cuenta, RFQ + Qty (part-number/modelo Y cantidad), Correo de contacto, Dirección de envío.
+
+2. Cotejo con el CRM: busca la empresa/contacto con buscar_clientes_crm (por nombre de empresa, teléfono o correo si se ven). \
+   Si coincide, usa ese cuenta_id (es cliente conocido). Si NO existe la cuenta, se dará de alta (MODO 12) antes de crear.
+
+3. Si FALTAN datos, en UN solo turno haz las dos cosas: \
+   (a) dile al usuario EN EL CHAT qué falta (lista corta y clara de los bloques faltantes), y \
+   (b) ofrécele la opción con un [DECISION: Faltan <datos>. ¿Los completas, o creo la oportunidad con lo que hay?]. \
+   - Si el usuario elige COMPLETAR → sigue pidiendo (un dato/bloque a la vez si hace falta) hasta tener los 5, y entonces crea. \
+   - Si el usuario elige CREAR CON LO QUE HAY → crea la oportunidad con crear_oportunidad_crm y permitir_parcial=true \
+     (relaja el candado de RFQ+qty). OJO: la CUENTA es obligatoria SIEMPRE — si no existe, primero das de alta la \
+     cuenta (MODO 12, con los datos que haya) y luego creas la oportunidad ligada. \
+   - NUNCA uses permitir_parcial=true sin que el usuario lo haya aprobado explícitamente en este turno.
+
+4. Si el RFQ viene COMPLETO (los 5 datos), crea directo: da de alta la cuenta si hace falta y crea la oportunidad \
+   (con su [DECISION] de confirmación). Avisa con notificar_sistema en cada transición (igual que el MODO 10). \
+   La descripción de la oportunidad va en formato "RFQ: <part-numbers> | Qty: <cantidades>".
+
 MODO 12 — ALTA DE CLIENTE NUEVO (alta inicial, baja fricción):
 Se dispara cuando un prospecto con RFQ NO es cliente en el CRM (desde el MODO 10/11), o cuando el usuario \
 pide "da de alta a <cliente>". Objetivo: registrar la cuenta con lo MÍNIMO para poder cotizar. \
@@ -3227,6 +3261,7 @@ _PROMPT_INTRO, _PROMPT_MODOS = _partir_prompt(SYSTEM_PROMPT)
 # "generico" / "compras" / "general" / desconocido / None → prompt COMPLETO (todos los modos).
 TIPO_MODOS = {
     "correo":       [9, 10, 11, 12],              # correo: RFQ, oportunidades, alta cliente
+    "rfq":          [15, 12],                      # RFQ manual: usuario sube texto/screenshot, sin correo
     "whatsapp":     [9, 10, 11, 12],              # WhatsApp: mismos modos que correo, otro canal
     "busquedas":    [1, 2, 3, 4, 5, 6, 8, 14],     # búsqueda RFQ + selección proveedor + imagen + ficha técnica PDF
     "publicacion":  [13, 14],                      # publicar producto(s) desde link o ficha técnica PDF
