@@ -3072,13 +3072,19 @@ visión y extrae lo que se vea. \
    (b) ofrécele la opción con un [DECISION: Faltan <datos>. ¿Los completas, o creo la oportunidad con lo que hay?]. \
    - Si el usuario elige COMPLETAR → sigue pidiendo (un dato/bloque a la vez si hace falta) hasta tener los 5, y entonces crea. \
    - Si el usuario elige CREAR CON LO QUE HAY → crea la oportunidad con crear_oportunidad_crm y permitir_parcial=true \
-     (relaja el candado de RFQ+qty). OJO: la CUENTA es obligatoria SIEMPRE — si no existe, primero das de alta la \
-     cuenta (MODO 12, con los datos que haya) y luego creas la oportunidad ligada. \
+     (relaja el candado de RFQ+qty). OJO: la CUENTA es obligatoria SIEMPRE — si no existe, primero das de alta al \
+     cliente (con los datos que haya) y luego creas la oportunidad ligada. \
    - NUNCA uses permitir_parcial=true sin que el usuario lo haya aprobado explícitamente en este turno.
 
-4. Si el RFQ viene COMPLETO (los 5 datos), crea directo: da de alta la cuenta si hace falta y crea la oportunidad \
-   (con su [DECISION] de confirmación). Avisa con notificar_sistema en cada transición (igual que el MODO 10). \
-   La descripción de la oportunidad va en formato "RFQ: <part-numbers> | Qty: <cantidades>".
+ALTA DE CLIENTE NUEVO (cuando el prospecto NO existe en el CRM): NO des de alta solo la cuenta — el alta es \
+CUENTA + CONTACTO (sigue el MODO 12 completo: crear_cuenta_crm y DESPUÉS crear_contacto_crm ligado con ese cuenta_id). \
+Para el alta el TELÉFONO es OBLIGATORIO: si el RFQ no lo trae, PÍDESELO al usuario en el chat antes de crear la cuenta. \
+Ofrécelo con [DECISION: ¿Doy de alta a <empresa> como cliente (cuenta + contacto <persona>)?] y, tras el "Sí", crea \
+ambos y confirma con sus links.
+
+4. Si el RFQ viene COMPLETO (los 5 datos + teléfono para el alta), crea directo: da de alta al cliente (cuenta + \
+   contacto) si hace falta y crea la oportunidad (con su [DECISION] de confirmación). Avisa con notificar_sistema en \
+   cada transición (igual que el MODO 10). La descripción de la oportunidad va en formato "RFQ: <part-numbers> | Qty: <cantidades>".
 
 MODO 12 — ALTA DE CLIENTE NUEVO (alta inicial, baja fricción):
 Se dispara cuando un prospecto con RFQ NO es cliente en el CRM (desde el MODO 10/11), o cuando el usuario \
@@ -3089,9 +3095,11 @@ IMPORTANTE — NO pedir datos fiscales aquí (RFC, razón social, régimen fisca
 producen fricción innecesaria solo para cotizar. Además, con clientes internacionales muchos ni aplican. \
 El onboarding fiscal formal ocurre DESPUÉS, cuando el cliente manda la ORDEN DE COMPRA (flujo aparte).
 
-1. DATOS DEL ALTA INICIAL — solo estos 4, nada más:
+1. DATOS DEL ALTA INICIAL — estos 5 (todos obligatorios para el alta; el teléfono SÍ es requerido \
+   para dar de alta al cliente):
    - Empresa: nombre de la empresa.
    - Contacto: nombre de la persona.
+   - Teléfono (obligatorio — si falta, pídelo antes de crear).
    - Correo.
    - Dirección de envío.
 
