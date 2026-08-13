@@ -1038,6 +1038,34 @@ def tool_crear_contacto_crm(
                     }
         except Exception as e:
             log.warning(f"dedupe contacto falló: {e}")
+    # DEDUPE 2 — por NOMBRE + CUENTA: si ya hay un contacto con el mismo nombre en la MISMA cuenta,
+    # es la misma persona. Cubre el caso real que duplicaba: un contacto creado SIN email (donde la
+    # dedup por correo no aplica) o cuando el search por correo no lo alcanzó. El list de 1CRM viene
+    # "delgado" (primary_account_id no confiable) → se confirma con GET-por-id.
+    if cuenta_id and (nombre or apellido):
+        try:
+            full = f"{nombre} {apellido}".strip()
+            n = _norm_nombre(full)
+            if len(n) >= 4:
+                data = _onecrm_get("data/Contact", {"filter_text": full or nombre, "max_num": 20})
+                for r in (data.get("records", []) or []):
+                    rid = r.get("id")
+                    if not rid:
+                        continue
+                    d = _onecrm_get(f"data/Contact/{rid}").get("record", {})
+                    if d.get("primary_account_id") != cuenta_id:
+                        continue
+                    cn = _norm_nombre(f"{d.get('first_name','')} {d.get('last_name','')}")
+                    if cn and (cn == n or (len(min(cn, n, key=len)) >= 5 and (n in cn or cn in n))):
+                        return {
+                            "ok": True, "ya_existe": True, "id": rid,
+                            "nombre": f"{d.get('first_name','')} {d.get('last_name','')}".strip(),
+                            "cuenta_id": cuenta_id,
+                            "url_crm": f"{ONECRM_BASE}/index.php?module=Contacts&action=DetailView&record={rid}",
+                            "mensaje": "El contacto (mismo nombre en esta cuenta) YA EXISTE — no lo dupliqué. Usa este id.",
+                        }
+        except Exception as e:
+            log.warning(f"dedupe contacto por nombre+cuenta falló: {e}")
     payload: dict = {"first_name": nombre, "last_name": apellido or nombre}
     if cuenta_id:    payload["primary_account_id"] = cuenta_id
     if email:        payload["email1"] = email
