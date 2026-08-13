@@ -518,6 +518,93 @@ def _onecrm_post(endpoint: str, payload: dict) -> dict:
         return {"error": str(e)}
 
 
+def _onecrm_patch(endpoint: str, payload: dict) -> dict:
+    """Actualiza (PATCH) un registro existente: endpoint = data/<Modelo>/<id>."""
+    user = os.environ.get("ONECRM_USERNAME", "")
+    pwd  = os.environ.get("ONECRM_PASSWORD",  "")
+    try:
+        resp = httpx.patch(
+            f"{ONECRM_BASE}/api.php/{endpoint}",
+            auth=(user, pwd), json={"data": payload}, timeout=20,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def tool_actualizar_oportunidad_crm(oportunidad_id: str, nombre: str = "", descripcion: str = "",
+                                    monto: float = 0, stream_id: str = "") -> dict:
+    """Actualiza una oportunidad EXISTENTE en 1CRM (para integrar información nueva/adicional de un
+    RFQ ya registrado — ej. agregar part-numbers o corregir cantidades en la descripción). Solo
+    manda los campos que cambian. La descripción se REEMPLAZA por lo que mandes: si vas a AÑADIR,
+    incluye lo previo + lo nuevo."""
+    if not oportunidad_id:
+        return {"error": "falta oportunidad_id"}
+    payload: dict = {}
+    if nombre:      payload["name"] = nombre
+    if descripcion: payload["description"] = descripcion
+    if monto:       payload["amount"] = monto
+    if not payload:
+        return {"error": "nada que actualizar"}
+    r = _onecrm_patch(f"data/Opportunity/{oportunidad_id}", payload)
+    ok = "error" not in r
+    if ok:
+        _notif(stream_id, "🔄 Oportunidad actualizada", descripcion[:120])
+    return {"ok": ok, "id": oportunidad_id,
+            "url_crm": f"{ONECRM_BASE}/index.php?module=Opportunities&action=DetailView&record={oportunidad_id}",
+            "error": r.get("error", "")}
+
+
+def tool_actualizar_cuenta_crm(cuenta_id: str, telefono: str = "", email: str = "",
+                               envio_calle: str = "", envio_ciudad: str = "", envio_estado: str = "",
+                               envio_cp: str = "", envio_pais: str = "", stream_id: str = "") -> dict:
+    """Actualiza una cuenta EXISTENTE (para completar un dato que faltaba, ej. la dirección de
+    envío). Solo manda los campos que llegan. Recuerda: el correo/teléfono de la PERSONA van en el
+    contacto, no en la cuenta — aquí solo si es un dato corporativo de la empresa."""
+    if not cuenta_id:
+        return {"error": "falta cuenta_id"}
+    payload: dict = {}
+    if telefono:     payload["phone_office"] = telefono
+    if email:        payload["email1"] = email
+    if envio_calle:  payload["shipping_address_street"] = envio_calle
+    if envio_ciudad: payload["shipping_address_city"] = envio_ciudad
+    if envio_estado: payload["shipping_address_state"] = envio_estado
+    if envio_cp:     payload["shipping_address_postalcode"] = envio_cp
+    if envio_pais:   payload["shipping_address_country"] = envio_pais
+    if not payload:
+        return {"error": "nada que actualizar"}
+    r = _onecrm_patch(f"data/Account/{cuenta_id}", payload)
+    ok = "error" not in r
+    if ok:
+        _notif(stream_id, "🔄 Cuenta actualizada")
+    return {"ok": ok, "id": cuenta_id,
+            "url_crm": f"{ONECRM_BASE}/index.php?module=Accounts&action=DetailView&record={cuenta_id}",
+            "error": r.get("error", "")}
+
+
+def tool_actualizar_contacto_crm(contacto_id: str, email: str = "", telefono: str = "",
+                                 whatsapp: str = "", cargo: str = "", stream_id: str = "") -> dict:
+    """Actualiza un contacto EXISTENTE (para completar/corregir email, teléfono, whatsapp o cargo de
+    la persona). Solo manda los campos que llegan."""
+    if not contacto_id:
+        return {"error": "falta contacto_id"}
+    payload: dict = {}
+    if email:    payload["email1"] = email
+    if telefono: payload["phone_work"] = telefono
+    if whatsapp: payload["phone_mobile"] = whatsapp
+    if cargo:    payload["title"] = cargo
+    if not payload:
+        return {"error": "nada que actualizar"}
+    r = _onecrm_patch(f"data/Contact/{contacto_id}", payload)
+    ok = "error" not in r
+    if ok:
+        _notif(stream_id, "🔄 Contacto actualizado")
+    return {"ok": ok, "id": contacto_id,
+            "url_crm": f"{ONECRM_BASE}/index.php?module=Contacts&action=DetailView&record={contacto_id}",
+            "error": r.get("error", "")}
+
+
 def tool_buscar_productos_crm(query: str, limite: int = 10) -> dict:
     """Busca productos por modelo o marca en Supabase, luego verifica su existencia real en 1CRM
     usando el crm_product_id. Así confirma que el producto está tanto en Supabase como en el CRM."""
@@ -2630,6 +2717,53 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "actualizar_oportunidad_crm",
+        "description": "Actualiza una oportunidad EXISTENTE (para integrar info nueva de un RFQ ya registrado: agregar part-numbers, corregir cantidades). La descripción se REEMPLAZA — si añades, manda lo previo + lo nuevo.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "oportunidad_id": {"type": "string", "description": "ID de la oportunidad a actualizar"},
+                "nombre":         {"type": "string", "description": "Nuevo título (solo part-numbers/marca) si cambió"},
+                "descripcion":    {"type": "string", "description": "Descripción completa (formato 'RFQ: <parts> | Qty: <n>') — reemplaza la anterior"},
+                "monto":          {"type": "number"},
+            },
+            "required": ["oportunidad_id"],
+        },
+    },
+    {
+        "name": "actualizar_cuenta_crm",
+        "description": "Actualiza una cuenta EXISTENTE para completar un dato que faltaba (ej. dirección de envío). Correo/teléfono de la persona van en el contacto, no aquí.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "cuenta_id":    {"type": "string"},
+                "telefono":     {"type": "string", "description": "Solo si es teléfono corporativo de la empresa"},
+                "email":        {"type": "string", "description": "Solo si es correo corporativo de la empresa"},
+                "envio_calle":  {"type": "string"},
+                "envio_ciudad": {"type": "string"},
+                "envio_estado": {"type": "string"},
+                "envio_cp":     {"type": "string"},
+                "envio_pais":   {"type": "string"},
+            },
+            "required": ["cuenta_id"],
+        },
+    },
+    {
+        "name": "actualizar_contacto_crm",
+        "description": "Actualiza un contacto EXISTENTE para completar/corregir email, teléfono, whatsapp o cargo de la persona.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "contacto_id": {"type": "string"},
+                "email":       {"type": "string"},
+                "telefono":    {"type": "string"},
+                "whatsapp":    {"type": "string"},
+                "cargo":       {"type": "string"},
+            },
+            "required": ["contacto_id"],
+        },
+    },
+    {
         "name": "consultar_rfqs",
         "description": "Consulta RFQs activos. Estado puede ser: recibido, buscando, busqueda_completa, foto_lista, publicado, etc.",
         "input_schema": {
@@ -2789,6 +2923,9 @@ TOOL_FUNCTIONS = {
     "publicar_productos_desde_links": tool_publicar_productos_desde_links,
     "crear_cuenta_crm":          tool_crear_cuenta_crm,
     "crear_contacto_crm":        tool_crear_contacto_crm,
+    "actualizar_cuenta_crm":     tool_actualizar_cuenta_crm,
+    "actualizar_contacto_crm":   tool_actualizar_contacto_crm,
+    "actualizar_oportunidad_crm": tool_actualizar_oportunidad_crm,
     "listar_oportunidades_crm":  tool_listar_oportunidades_crm,
     "crear_oportunidad_crm":     tool_crear_oportunidad_crm,
     "ver_cliente_crm":           tool_ver_cliente_crm,
@@ -3253,6 +3390,16 @@ completo creas. Si la tool devuelve "INFO_INCOMPLETA", NO reintentes crear: pide
 prefijo "RFQ", ni cantidades, ni "x5/pzas", ni descripciones. Ej: nombre="ZK22, MGP806N" (no "RFQ ZK22, MGP806N \
 (5 pzas c/u)"); nombre="Square D Q0120" (no "RFQ Square D Q0120 x20"). Las cantidades y el detalle van en la \
 DESCRIPCIÓN ("RFQ: <parts> | Qty: <n>"), no en el nombre. Esto aplica también al campo "oportunidad" del marcador [OPORTUNIDAD_CREADA].
+- RFQ REPETIDO / ENRIQUECIMIENTO INCREMENTAL: cuando el usuario suba o dé info de un RFQ del MISMO cliente/RFQ que \
+YA está registrado (lo detectas por la cuenta/oportunidad existentes en el CRM o en el historial de este stream): \
+(1) AVÍSALE que ya está registrado (tarjeta [OPORTUNIDAD_CREADA] con "duplicado":true). \
+(2) Compara la info nueva contra lo ya registrado. Si hay algo NUEVO o distinto (part-numbers adicionales, cantidades \
+corregidas, o un dato que faltaba como dirección/teléfono/correo), INTÉGRALO con las tools de actualizar \
+(actualizar_oportunidad_crm — descripción = lo previo + lo nuevo; actualizar_cuenta_crm / actualizar_contacto_crm para \
+completar datos faltantes) y dile al usuario EXACTAMENTE qué integraste. \
+(3) Si todavía falta algún dato obligatorio (los 5, o el teléfono del alta), PÍDESELO en el chat para que te lo vaya \
+pasando — un bloque a la vez — y en cuanto te lo dé, intégralo con las tools de actualizar. \
+(4) Si no hay nada nuevo, solo confirma que es el mismo y que no cambió nada.
 - Para listas de productos, SIEMPRE usa crear_rfqs_desde_texto aunque sean 1 o 2 items
 - Los mensajes [SISTEMA:...] son triggers automáticos del sistema, no del usuario. Procésalos silenciosamente y responde al usuario con el resultado.
 - CONTACTOS CRM: Cuando el usuario pregunte por el contacto de un cliente, primero usa buscar_clientes_crm para obtener el cuenta_id, luego usa ver_contactos_cuenta_crm. La respuesta incluye "info_cuenta" con el email y teléfono registrados en la cuenta — SIEMPRE muestra esos datos aunque no haya Contact records separados. "info_cuenta" con email o teléfono ES información de contacto válida.
@@ -3441,6 +3588,7 @@ def run_chat(messages: list[dict], stream_id: str, system_prompt: str = SYSTEM_P
             # Si el agente escribió [DECISION] en esta misma respuesta, NO ejecutar
             # tools de escritura en el mismo turno — el [DECISION] debe esperar aprobación.
             _WRITE_TOOLS = {"crear_oportunidad_crm", "crear_cuenta_crm", "crear_contacto_crm",
+                            "actualizar_oportunidad_crm", "actualizar_cuenta_crm", "actualizar_contacto_crm",
                             "enviar_email_gmail", "crear_rfqs_desde_texto",
                             "publicar_producto_link", "publicar_productos_desde_links"}
             _response_text = " ".join(
