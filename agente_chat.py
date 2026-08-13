@@ -3015,7 +3015,10 @@ texto. Emite EXACTAMENTE este marcador, en UNA línea y con JSON válido (el fro
 las url_crm que devolvieron las tools: \
 [OPORTUNIDAD_CREADA]{"empresa":"Aceros del Norte SA","oportunidad":"Square D Q0120 x20","oportunidad_url":"https://...","cuenta_url":"https://...","contacto":"Juan Pérez","contacto_url":"https://..."} \
 Si era cliente existente (no creaste cuenta/contacto), omite cuenta_url/contacto/contacto_url (pon ""). No repitas \
-los datos en texto: la tarjeta los muestra.
+los datos en texto: la tarjeta los muestra. \
+DUPLICADO: si detectas que el RFQ/oportunidad YA existía (no creas nada), TAMBIÉN emite este mismo marcador con \
+"duplicado":true y los links de lo YA registrado (cuenta/contacto/oportunidad) — NO escribas los links en texto. \
+Puedes agregar UNA línea corta preguntando si es el mismo RFQ o hay algo nuevo, pero los datos van en la tarjeta.
 
 MODO 11 — REVISAR OPORTUNIDADES DEL CORREO (lote):
 Cuando el usuario pida "lee los correos", "revisa el correo y detecta oportunidades", \
@@ -3090,7 +3093,10 @@ ambos y confirma con sus links.
    texto plano. Emite EXACTAMENTE el marcador [OPORTUNIDAD_CREADA] en UNA línea con JSON válido (el frontend lo vuelve \
    una tarjeta con enlaces clickeables), usando las url_crm que devolvieron las tools — mismo formato que el MODO 10: \
    [OPORTUNIDAD_CREADA]{"empresa":"...","oportunidad":"...","oportunidad_url":"https://...","cuenta_url":"https://...","contacto":"...","contacto_url":"https://..."} \
-   Si era cliente existente (no creaste cuenta/contacto), pon "" en cuenta_url/contacto/contacto_url. No repitas los datos en texto.
+   Si era cliente existente (no creaste cuenta/contacto), pon "" en cuenta_url/contacto/contacto_url. No repitas los datos en texto. \
+   DUPLICADO: si el RFQ/oportunidad YA existía (no creas nada porque ya se registró antes), TAMBIÉN emite el mismo \
+   marcador con "duplicado":true y los links de lo YA registrado — nunca escribas los links en texto plano. Puedes \
+   añadir UNA línea corta preguntando si es el mismo RFQ o si hay algo nuevo/adicional en esta imagen.
 
 MODO 12 — ALTA DE CLIENTE NUEVO (alta inicial, baja fricción):
 Se dispara cuando un prospecto con RFQ NO es cliente en el CRM (desde el MODO 10/11), o cuando el usuario \
