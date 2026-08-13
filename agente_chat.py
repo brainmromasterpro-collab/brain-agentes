@@ -878,7 +878,11 @@ def tool_crear_cuenta_crm(
             "mensaje": f"La cuenta '{_ex['nombre']}' YA EXISTE en 1CRM (coincidencia por {_ex['por']}). "
                        f"No la dupliqué. Usa este cuenta_id para el contacto/oportunidad.",
         }
-    payload: dict = {"name": nombre, "account_type": tipo}
+    payload: dict = {"name": nombre, "account_type": tipo,
+                     # Defaults fijos (pedido de Gabriel): toda cuenta nueva nace en MXN y con el
+                     # tax code de IVA ("Impuesto al Valor Agregado").
+                     "currency_id": "16242fc8-aefa-63c3-1814-6489f1575687",   # Mexican Peso
+                     "tax_code_id": "b75e5df7-3a3e-4ed2-ff37-651e0a3c0e9b"}   # Impuesto al Valor Agregado
     if email:         payload["email1"] = email
     if telefono:      payload["phone_office"] = telefono
     if tel_alternativo: payload["phone_alternate"] = tel_alternativo
@@ -3245,6 +3249,10 @@ cualquiera de los 5 datos obligatorios (Contacto, Empresa, RFQ+Qty, Correo, Dire
 El WhatsApp NO es obligatorio y no bloquea la creación. \
 Si falta algo, PRIMERO pides la información al cliente (borrador de correo + [DECISION]); solo con todo \
 completo creas. Si la tool devuelve "INFO_INCOMPLETA", NO reintentes crear: pide lo faltante.
+- TÍTULO/NOMBRE DE LA OPORTUNIDAD: SOLO el/los número(s) de parte y/o marca — nada más. NO pongas el \
+prefijo "RFQ", ni cantidades, ni "x5/pzas", ni descripciones. Ej: nombre="ZK22, MGP806N" (no "RFQ ZK22, MGP806N \
+(5 pzas c/u)"); nombre="Square D Q0120" (no "RFQ Square D Q0120 x20"). Las cantidades y el detalle van en la \
+DESCRIPCIÓN ("RFQ: <parts> | Qty: <n>"), no en el nombre. Esto aplica también al campo "oportunidad" del marcador [OPORTUNIDAD_CREADA].
 - Para listas de productos, SIEMPRE usa crear_rfqs_desde_texto aunque sean 1 o 2 items
 - Los mensajes [SISTEMA:...] son triggers automáticos del sistema, no del usuario. Procésalos silenciosamente y responde al usuario con el resultado.
 - CONTACTOS CRM: Cuando el usuario pregunte por el contacto de un cliente, primero usa buscar_clientes_crm para obtener el cuenta_id, luego usa ver_contactos_cuenta_crm. La respuesta incluye "info_cuenta" con el email y teléfono registrados en la cuenta — SIEMPRE muestra esos datos aunque no haya Contact records separados. "info_cuenta" con email o teléfono ES información de contacto válida.
