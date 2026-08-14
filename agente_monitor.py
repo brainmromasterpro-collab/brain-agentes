@@ -59,6 +59,72 @@ MONITOR_INTERVAL = 3600   # 1 hora entre actualizaciones
 WARN_THRESHOLD   = 0.20   # warning cuando queda < 20% del límite
 CRIT_THRESHOLD   = 0.05   # critical cuando queda < 5%
 
+# Alerta de gasto mensual estimado de Anthropic (basado en tokens de jobs.output —
+# aproximado, ver docstring de check_anthropic). Configurable por env, default fijado
+# por Gabriel: avisar en 80% ($16) y en 100% ($20) de $20 USD/mes.
+PRESUPUESTO_MENSUAL_USD = float(os.environ.get("PRESUPUESTO_MENSUAL_USD", "20"))
+PRECIO_INPUT_USD_MTOK   = float(os.environ.get("PRECIO_INPUT_USD_MTOK", "3.0"))
+PRECIO_OUTPUT_USD_MTOK  = float(os.environ.get("PRECIO_OUTPUT_USD_MTOK", "15.0"))
+GASTO_WARN_RATIO        = 0.8
+ALERTA_EMAIL_DESTINO    = os.environ.get("ALERTA_EMAIL_DESTINO", "brain.mromasterpro@gmail.com")
+
+GOOGLE_CLIENT_ID     = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
+GMAIL_USER           = "brain.mromasterpro@gmail.com"
+
+_gmail_token_cache: dict = {"token": None, "exp": 0.0}
+
+
+def _gmail_access_token() -> str:
+    """Mismo mecanismo que agente_chat.py._gmail_access_token — cuenta personal,
+    cacheado en memoria hasta ~5 min antes de expirar."""
+    if _gmail_token_cache["token"] and time.time() < _gmail_token_cache["exp"]:
+        return _gmail_token_cache["token"]
+    resp = httpx.post("https://oauth2.googleapis.com/token", data={
+        "client_id":     GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "refresh_token": GOOGLE_REFRESH_TOKEN,
+        "grant_type":    "refresh_token",
+    }, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    if "access_token" not in data:
+        raise ValueError(f"Google OAuth error: {data}")
+    _gmail_token_cache["token"] = data["access_token"]
+    _gmail_token_cache["exp"]   = time.time() + data.get("expires_in", 3600) - 300
+    return data["access_token"]
+
+
+def _enviar_alerta_email(asunto: str, cuerpo: str) -> None:
+    """Correo de alerta interna (no requiere aprobación — es un aviso de sistema al
+    usuario master, no comunicación con un cliente)."""
+    if not GOOGLE_REFRESH_TOKEN:
+        log.warning("Alerta de gasto: GOOGLE_REFRESH_TOKEN no configurado, no se pudo enviar correo")
+        return
+    import base64
+    import json as _json
+    from email.mime.text import MIMEText
+    try:
+        token = _gmail_access_token()
+        msg = MIMEText(cuerpo, "plain", "utf-8")
+        msg["To"]      = ALERTA_EMAIL_DESTINO
+        msg["From"]    = GMAIL_USER
+        msg["Subject"] = asunto
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        resp = httpx.post(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            content=_json.dumps({"raw": raw}).encode(),
+            timeout=15,
+        )
+        if not resp.is_success:
+            log.warning(f"Alerta de gasto: Gmail API {resp.status_code} — {resp.text[:300]}")
+        else:
+            log.info(f"Alerta de gasto: correo enviado a {ALERTA_EMAIL_DESTINO}")
+    except Exception as e:
+        log.warning(f"Alerta de gasto: falló envío de correo: {e}")
+
 
 # ─────────────────────────────────────────────────────────────
 # HELPERS
@@ -238,6 +304,86 @@ def check_anthropic() -> None:
                  f"(in={tokens_input:,}, out={tokens_output:,}) | {jobs_hoy} jobs")
     except Exception as e:
         log.error(f"Anthropic check falló: {e}")
+
+
+def check_anthropic_gasto_mensual() -> None:
+    """
+    Estima el gasto USD del mes en curso a partir de jobs.output.tokens_input/output
+    (mismo dato que check_anthropic, pero ventana mensual). Es una APROXIMACIÓN — no
+    todos los agentes guardan tokens todavía (ver docstring de check_anthropic), así
+    que el gasto real puede ser mayor al estimado.
+    Si cruza PRESUPUESTO_MENSUAL_USD (80% = warning, 100% = critical), dispara una
+    notificación (🔔) + correo — una sola vez por nivel por mes, no cada hora.
+    """
+    try:
+        ahora = datetime.now(timezone.utc)
+        inicio_mes = ahora.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+        resp = supabase.table("jobs") \
+            .select("output") \
+            .gte("created_at", inicio_mes) \
+            .eq("estado", "completado") \
+            .execute()
+
+        tokens_input = tokens_output = 0
+        for job in (resp.data or []):
+            out = job.get("output") or {}
+            tokens_input  += int(out.get("tokens_input", 0))
+            tokens_output += int(out.get("tokens_output", 0))
+
+        gasto_usd = (tokens_input / 1_000_000) * PRECIO_INPUT_USD_MTOK \
+                  + (tokens_output / 1_000_000) * PRECIO_OUTPUT_USD_MTOK
+
+        ratio = gasto_usd / PRESUPUESTO_MENSUAL_USD if PRESUPUESTO_MENSUAL_USD else 0
+        estado = "critical" if ratio >= 1.0 else "warning" if ratio >= GASTO_WARN_RATIO else "ok"
+
+        upsert("anthropic", "gasto_estimado_mes_usd",
+               valor=round(gasto_usd, 2), unidad="usd",
+               limite=PRESUPUESTO_MENSUAL_USD, estado=estado)
+
+        log.info(f"Anthropic: gasto estimado del mes ${gasto_usd:,.2f} de "
+                 f"${PRESUPUESTO_MENSUAL_USD:,.2f} ({estado})")
+
+        if estado in ("warning", "critical"):
+            _avisar_gasto_si_corresponde(ahora, estado, gasto_usd)
+    except Exception as e:
+        log.error(f"Gasto mensual Anthropic check falló: {e}")
+
+
+def _avisar_gasto_si_corresponde(ahora: datetime, estado: str, gasto_usd: float) -> None:
+    """Idempotencia: guarda una marca 'AAAA-MM:estado' en resource_status para no
+    reenviar la misma alerta cada hora dentro del mismo mes/nivel."""
+    marca_actual = f"{ahora.year}-{ahora.month:02d}:{estado}"
+    try:
+        prev = supabase.table("resource_status") \
+            .select("valor_texto") \
+            .eq("servicio", "anthropic").eq("metrica", "gasto_alerta_marca") \
+            .maybe_single().execute()
+        marca_previa = (prev.data or {}).get("valor_texto") if prev and prev.data else None
+    except Exception:
+        marca_previa = None
+
+    if marca_previa == marca_actual:
+        return  # ya se avisó este nivel este mes
+
+    upsert("anthropic", "gasto_alerta_marca", valor_texto=marca_actual)
+
+    pct = int(gasto_usd / PRESUPUESTO_MENSUAL_USD * 100) if PRESUPUESTO_MENSUAL_USD else 0
+    titulo = ("🚨 Se alcanzó el presupuesto mensual de Anthropic"
+              if estado == "critical" else
+              "⚠️ Cerca del presupuesto mensual de Anthropic")
+    mensaje = (f"Gasto estimado del mes: ${gasto_usd:,.2f} de ${PRESUPUESTO_MENSUAL_USD:,.2f} "
+               f"({pct}%). Estimado a partir de tokens registrados en jobs — puede no "
+               f"incluir todos los agentes, así que el gasto real puede ser mayor.")
+
+    try:
+        supabase.table("notificaciones").insert({
+            "tipo": "error" if estado == "critical" else "warning",
+            "titulo": titulo, "mensaje": mensaje, "leida": False,
+        }).execute()
+    except Exception as e:
+        log.warning(f"notif gasto mensual falló: {e}")
+
+    _enviar_alerta_email(titulo, mensaje)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -524,6 +670,7 @@ def run_all_checks() -> None:
     check_serpapi()
     check_removebg()
     check_anthropic()
+    check_anthropic_gasto_mensual()
     check_google_cse()
     check_supabase()
     check_railway()
