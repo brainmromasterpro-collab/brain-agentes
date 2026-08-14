@@ -4950,8 +4950,9 @@ def procesar_mensaje(msg: dict) -> None:
         _log_stream(stream_id, f"Error procesando el mensaje: {_err_str[:150]}", "error")
         if _sin_saldo:
             respuesta = (
-                "Estamos teniendo un problema temporal de servicio y ya se avisó al equipo. "
-                "En cuanto se resuelva seguimos con tu solicitud."
+                "⚠️ Sin saldo en la API de Anthropic — no se puede procesar mensajes ahorita. "
+                "Hay que recargar créditos en console.anthropic.com → Plans & Billing. "
+                "En cuanto se recargue, vuelve a mandar tu mensaje."
             )
             _notif(
                 stream_id,
