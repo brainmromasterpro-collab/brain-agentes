@@ -54,6 +54,18 @@ supabase: Client = create_client(
 )
 claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
+# Acumulador de tokens por job (visibilidad del gasto). 1 job a la vez → seguro.
+_tok = {"in": 0, "out": 0}
+def _add_usage(resp) -> None:
+    try:
+        u = resp.usage
+        _tok["in"]  += getattr(u, "input_tokens", 0) or 0
+        _tok["out"] += getattr(u, "output_tokens", 0) or 0
+    except Exception:
+        pass
+def _job_tokens() -> dict:
+    return {"tokens_input": _tok["in"], "tokens_output": _tok["out"], "tokens_total": _tok["in"] + _tok["out"]}
+
 POLL_INTERVAL = 10  # segundos
 
 
@@ -121,6 +133,7 @@ def extraer_productos_con_claude(imagen_bytes: bytes, media_type: str) -> list[d
         ],
         **extra,
     )
+    _add_usage(resp)
 
     raw = resp.content[0].text.strip()
 
@@ -179,6 +192,7 @@ def procesar_job_extractor(job: dict) -> None:
     inp      = job.get("input") or {}
     imagen_url = inp.get("imagen_url", "")
     stream_id  = inp.get("stream_id", "")
+    _tok["in"] = 0; _tok["out"] = 0  # reset del acumulador de tokens de este job
 
     log.info(f"Extractor job {job_id} | stream={stream_id} | imagen={imagen_url[:70]}...")
 
@@ -246,6 +260,7 @@ def procesar_job_extractor(job: dict) -> None:
                 "productos_extraidos": len(productos),
                 "rfq_ids":           rfq_ids,
                 "productos":         productos,
+                **_job_tokens(),
             },
         }).eq("id", job_id).execute()
 
@@ -258,6 +273,7 @@ def procesar_job_extractor(job: dict) -> None:
             "estado":      "fallido",
             "finished_at": datetime.utcnow().isoformat(),
             "error":       str(e),
+            "output":      _job_tokens(),
         }).eq("id", job_id).execute()
 
         # Notificación de error

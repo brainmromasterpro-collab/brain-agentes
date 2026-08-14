@@ -46,6 +46,18 @@ supabase: Client = create_client(
 )
 claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
+# Acumulador de tokens por job (visibilidad del gasto). 1 job a la vez → seguro.
+_tok = {"in": 0, "out": 0}
+def _add_usage(resp) -> None:
+    try:
+        u = resp.usage
+        _tok["in"]  += getattr(u, "input_tokens", 0) or 0
+        _tok["out"] += getattr(u, "output_tokens", 0) or 0
+    except Exception:
+        pass
+def _job_tokens() -> dict:
+    return {"tokens_input": _tok["in"], "tokens_output": _tok["out"], "tokens_total": _tok["in"] + _tok["out"]}
+
 ONECRM_BASE = os.environ["ONECRM_URL"].rstrip("/")
 POLL_INTERVAL = 10
 
@@ -310,6 +322,7 @@ Return ONLY this JSON (no extra text):
             messages=[{"role": "user", "content": prompt}],
             **extra,
         )
+        _add_usage(response)
         text = response.content[0].text.strip().replace("```json", "").replace("```", "").strip()
         ficha = json.loads(text)
         log.info(f"Ficha generada: {ficha.get('nombre', '')[:60]}")
@@ -722,6 +735,7 @@ def subir_imagen_a_crm(product_id: str, foto_url: str) -> bool:
 def procesar_job_publicador(job: dict) -> None:
     job_id   = job["id"]
     rfq_uuid = job["rfq_id"]
+    _tok["in"] = 0; _tok["out"] = 0  # reset del acumulador de tokens de este job
     log.info(f"=== Job publicador {job_id} | rfq {rfq_uuid} ===")
 
     supabase.table("jobs").update({
@@ -848,6 +862,7 @@ def procesar_job_publicador(job: dict) -> None:
                 "imagen_subida":  imagen_subida,
                 "nombre":         ficha["nombre"],
                 "sin_imagen":     not imagen_subida and not bool(foto_url),
+                **_job_tokens(),
             },
         }).eq("id", job_id).execute()
 
@@ -859,6 +874,7 @@ def procesar_job_publicador(job: dict) -> None:
             "estado":      "fallido",
             "finished_at": datetime.utcnow().isoformat(),
             "error":       str(e),
+            "output":      _job_tokens(),
         }).eq("id", job_id).execute()
 
         # Marcar como fallido con mensaje — NO volver a foto_lista (causa loop infinito)
