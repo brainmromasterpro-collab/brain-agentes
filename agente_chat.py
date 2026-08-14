@@ -4945,8 +4945,22 @@ def procesar_mensaje(msg: dict) -> None:
         print(f"[BRAIN ERROR] {e}", flush=True)
         _tb.print_exc()
         log.error(f"Error en Claude (completo): {e}")
-        _log_stream(stream_id, f"Error procesando el mensaje: {str(e)[:150]}", "error")
-        respuesta    = f"Error procesando tu mensaje. Intenta de nuevo. ({str(e)[:400]})"
+        _err_str = str(e)
+        _sin_saldo = "credit balance is too low" in _err_str.lower() or "plans & billing" in _err_str.lower()
+        _log_stream(stream_id, f"Error procesando el mensaje: {_err_str[:150]}", "error")
+        if _sin_saldo:
+            respuesta = (
+                "Estamos teniendo un problema temporal de servicio y ya se avisó al equipo. "
+                "En cuanto se resuelva seguimos con tu solicitud."
+            )
+            _notif(
+                stream_id,
+                "⚠️ Sin saldo en Anthropic API — el chat dejó de procesar mensajes",
+                "Recarga créditos en console.anthropic.com → Plans & Billing. Todos los streams (RFQ, correo, whatsapp, compras) están bloqueados hasta que se resuelva.",
+                tipo="error",
+            )
+        else:
+            respuesta = f"Error procesando tu mensaje. Intenta de nuevo. ({_err_str[:400]})"
         tools_used   = []
         rfqs_created = False
     # Tiempo de cola: desde que el usuario mandó el mensaje hasta que empezó a procesarse.
