@@ -3281,13 +3281,17 @@ Cuando el usuario pida "lee los correos", "revisa el correo y detecta oportunida
 MODO 15 — RFQ MANUAL (canal RFQ, sin correo — directo con el usuario):
 
 Este es el stream 'rfq'. Aquí el RFQ NO viene de un correo: el USUARIO lo captura a mano — pega TEXTO, o sube \
-un SCREENSHOT / IMAGEN (foto de una solicitud, lista de partes, mensaje de WhatsApp, etc.). Tu trabajo es el mismo \
-que el MODO 10 (llevar la oportunidad hasta crearla en 1CRM), pero con DOS diferencias clave: \
-(A) el RFQ lo lees DIRECTO del mensaje/imagen del usuario (NO uses herramientas de Gmail); si es imagen, léela con \
-visión y extrae lo que se vea. \
+uno o VARIOS SCREENSHOTS / IMÁGENES / PDFs A LA VEZ (foto de una solicitud, lista de partes, mensajes de WhatsApp, \
+correo reenviado como captura, PDF de la solicitud, etc.). Tu trabajo es el mismo que el MODO 10 (llevar la \
+oportunidad hasta crearla en 1CRM), pero con DOS diferencias clave: \
+(A) el RFQ lo lees DIRECTO del mensaje/imagen(es)/PDF(s) del usuario (NO uses herramientas de Gmail); si son \
+imágenes o PDFs, léelos TODOS con visión — cuando llegan varios adjuntos en el MISMO mensaje son parte del MISMO \
+RFQ (ej. 3 capturas de un mismo hilo de WhatsApp): combina la información de todos antes de decidir qué falta, no \
+los trates como RFQs separados. \
 (B) cuando falten datos, se los pides AL USUARIO EN EL CHAT (no redactas correo al cliente).
 
-1. Lee el RFQ del texto o de la imagen que subió el usuario. Extrae lo que puedas de los 5 DATOS OBLIGATORIOS: \
+1. Lee el RFQ del texto o de la(s) imagen(es)/PDF(s) que subió el usuario (pueden venir varias en un mismo \
+   mensaje). Extrae lo que puedas de los 5 DATOS OBLIGATORIOS, combinando lo que aporte cada adjunto: \
    Contacto (persona), Empresa/cuenta, RFQ + Qty (part-number/modelo Y cantidad), Correo de contacto, Dirección de envío.
 
 2. Cotejo con el CRM: busca la empresa/contacto con buscar_clientes_crm (por nombre de empresa, teléfono o correo si se ven). \
@@ -3779,6 +3783,42 @@ def _build_image_block(url: str):
     except Exception as e:
         log.warning(f"No se pudo construir bloque de imagen: {e}")
         return None
+
+
+def _build_document_block(url: str):
+    """Descarga un PDF y lo devuelve como bloque de documento (base64) para la API de Claude —
+    mismo mecanismo que _build_image_block pero para PDFs, que Claude lee nativamente (texto+visión,
+    sin OCR aparte). Word/Excel NO están soportados por este bloque — la API de Claude solo acepta
+    PDF como 'document'."""
+    try:
+        r = httpx.get(url, timeout=25, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200 or "pdf" not in r.headers.get("content-type", "").lower():
+            log.warning(f"PDF para visión no accesible: {r.status_code}")
+            return None
+        import base64 as _b64
+        return {"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
+                                                "data": _b64.standard_b64encode(r.content).decode()}}
+    except Exception as e:
+        log.warning(f"No se pudo construir bloque de documento: {e}")
+        return None
+
+
+def _build_attachment_blocks(attachments: list) -> list:
+    """Convierte metadata.attachments (RFQ con varios screenshots/PDFs en un mensaje) en bloques
+    de visión/documento para Claude, en el mismo orden. Ignora adjuntos que no sean imagen/PDF
+    (ej. Word/Excel, que no tienen bloque soportado) y los que fallen al descargar."""
+    bloques = []
+    for a in attachments or []:
+        if not isinstance(a, dict):
+            continue
+        url = a.get("url")
+        tipo = a.get("tipo")
+        if not url:
+            continue
+        blk = _build_image_block(url) if tipo == "image" else _build_document_block(url) if tipo == "document" else None
+        if blk:
+            bloques.append(blk)
+    return bloques
 
 
 # ─────────────────────────────────────────────────────────────
@@ -4975,15 +5015,25 @@ def procesar_mensaje(msg: dict) -> None:
     if not historial or historial[-1].get("content") != contenido:
         historial.append({"role": "user", "content": contenido})
 
-    # Visión: si el mensaje trae una imagen (screenshot), se adjunta al último turno del usuario
-    # como bloque de imagen para que el modelo lea los links/datos visibles y corra el flujo de
-    # publicar. El resto del pipeline (texto) queda igual.
+    # Visión: si el mensaje trae imagen(es)/PDF(s), se adjuntan al último turno del usuario como
+    # bloques de visión/documento para que el modelo los lea TODOS en el mismo contexto y corra el
+    # flujo de publicar/RFQ. El resto del pipeline (texto) queda igual.
+    # - metadata.attachments: RFQ con varios screenshots/PDFs subidos juntos en un mensaje.
+    # - metadata.image_url: compat con el flujo viejo de una sola imagen (sigue vigente en otros streams).
     try:
         _md = msg.get("metadata") or {}
+        _attachments = _md.get("attachments") if isinstance(_md, dict) else None
         _img_url = _md.get("image_url") if isinstance(_md, dict) else None
     except Exception:
-        _img_url = None
-    if _img_url and historial and historial[-1]["role"] == "user":
+        _attachments, _img_url = None, None
+    if _attachments and historial and historial[-1]["role"] == "user":
+        _bloques = _build_attachment_blocks(_attachments)
+        if _bloques:
+            historial[-1]["content"] = [
+                {"type": "text", "text": contenido or "Archivos adjuntos."}, *_bloques,
+            ]
+            log.info(f"Mensaje con {len(_bloques)} adjunto(s) → visión activada")
+    elif _img_url and historial and historial[-1]["role"] == "user":
         _blk = _build_image_block(_img_url)
         if _blk:
             historial[-1]["content"] = [
