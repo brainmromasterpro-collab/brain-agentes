@@ -3124,6 +3124,13 @@ Cuando el usuario pida "genera la oportunidad del correo", "arma la oportunidad 
    - Para COMPLETAR los 5 datos obligatorios: la empresa, el nombre del contacto, la dirección de envío y el \
      teléfono a menudo están EN LA FIRMA. Toma esos datos como válidos y complétalos con ellos antes de pedir nada.
 
+2.6. CRM COMO FUENTE PARA COMPLETAR DATOS (crítico, no te lo saltes): si el cotejo del paso 2.5 encontró una \
+   cuenta existente, SIEMPRE llama también ver_contactos_cuenta_crm con ese cuenta_id ANTES de declarar cualquier \
+   dato como faltante. Si el contacto del correo (mismo nombre) YA está registrado en esa cuenta, usa el correo/ \
+   teléfono que YA tiene el CRM para completar lo que no venga en el cuerpo ni en la firma — es una fuente tan \
+   válida como el cuerpo del correo o la firma, NO se lo vuelvas a pedir al prospecto. Solo pide el dato si de \
+   verdad no está ni en el correo NI en el contacto/cuenta del CRM.
+
 3. SI FALTA CUALQUIER BLOQUE (tras revisar cuerpo + firma + cotejo CRM) → NO crees nada. Haz estas 3 cosas, en orden:
 
    (a) AVISA al usuario del chat que la oportunidad está INCOMPLETA y enumera exactamente qué bloque(s) faltan. \
@@ -3284,7 +3291,13 @@ visión y extrae lo que se vea. \
    Contacto (persona), Empresa/cuenta, RFQ + Qty (part-number/modelo Y cantidad), Correo de contacto, Dirección de envío.
 
 2. Cotejo con el CRM: busca la empresa/contacto con buscar_clientes_crm (por nombre de empresa, teléfono o correo si se ven). \
-   Si coincide, usa ese cuenta_id (es cliente conocido). Si NO existe la cuenta, se dará de alta (MODO 12) antes de crear.
+   Si coincide, usa ese cuenta_id (es cliente conocido). Si NO existe la cuenta, se dará de alta (MODO 12) antes de crear. \
+   CRM COMO FUENTE PARA COMPLETAR DATOS (crítico, no te lo saltes): si la cuenta existe, SIEMPRE llama también \
+   ver_contactos_cuenta_crm con ese cuenta_id ANTES de declarar cualquier dato como faltante — no asumas que "no \
+   está en el screenshot" significa "falta". Si el contacto de la imagen (mismo nombre) YA está registrado ahí, \
+   usa el correo/teléfono que YA tiene el CRM para completar lo que no venga en el screenshot — es una fuente \
+   tan válida como la imagen o el chat, NO se lo vuelvas a pedir al usuario. Solo pide el dato si de verdad no \
+   está ni en la imagen NI en el contacto/cuenta del CRM.
 
 3. Si FALTAN datos, en UN solo turno haz las dos cosas: \
    (a) dile al usuario EN EL CHAT qué falta (lista corta y clara de los bloques faltantes), y \
