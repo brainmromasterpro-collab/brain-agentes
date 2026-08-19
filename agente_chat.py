@@ -39,6 +39,7 @@ import os
 import re
 import json
 import time
+import unicodedata
 import uuid
 import logging
 from datetime import datetime, timezone, timedelta
@@ -1109,41 +1110,88 @@ def tool_buscar_proveedores_crm(nombre: str = "", categoria: str = "") -> dict:
     }
 
 
+_CONTACT_FIELDS = [
+    ("fields[]", "id"), ("fields[]", "first_name"), ("fields[]", "last_name"),
+    ("fields[]", "email1"), ("fields[]", "email2"), ("fields[]", "phone_work"),
+    ("fields[]", "phone_mobile"), ("fields[]", "title"),
+    ("fields[]", "primary_account_id"), ("fields[]", "primary_address_city"),
+]
+
+
+def _mapear_contacto(r: dict) -> dict:
+    return {
+        "id":        r["id"],
+        "nombre":    f"{r.get('first_name', '')} {r.get('last_name', '')}".strip() or r.get("name", ""),
+        "email":     r.get("email1", "") or r.get("email2", ""),
+        "telefono":  r.get("phone_work", "") or r.get("phone_mobile", ""),
+        "cargo":     r.get("title", ""),
+        "ciudad":    r.get("primary_address_city", ""),
+        "cuenta_id": r.get("primary_account_id", ""),
+        "url_crm":   f"{ONECRM_BASE}/index.php?module=Contacts&action=DetailView&record={r['id']}",
+    }
+
+
 def _get_all_contacts_with_detail() -> list:
-    """Obtiene todos los contactos en UNA sola llamada usando fields[] para evitar N+1 queries."""
-    params = [
-        ("max_num", 200),
-        ("fields[]", "id"), ("fields[]", "first_name"), ("fields[]", "last_name"),
-        ("fields[]", "email1"), ("fields[]", "email2"), ("fields[]", "phone_work"),
-        ("fields[]", "phone_mobile"), ("fields[]", "title"),
-        ("fields[]", "primary_account_id"), ("fields[]", "primary_address_city"),
-    ]
-    records = _onecrm_get("data/Contact", dict(params)).get("records", [])
-    return [
-        {
-            "id":        r["id"],
-            "nombre":    f"{r.get('first_name', '')} {r.get('last_name', '')}".strip() or r.get("name", ""),
-            "email":     r.get("email1", "") or r.get("email2", ""),
-            "telefono":  r.get("phone_work", "") or r.get("phone_mobile", ""),
-            "cargo":     r.get("title", ""),
-            "ciudad":    r.get("primary_address_city", ""),
-            "cuenta_id": r.get("primary_account_id", ""),
-            "url_crm":   f"{ONECRM_BASE}/index.php?module=Contacts&action=DetailView&record={r['id']}",
-        }
-        for r in records
-    ]
+    """Obtiene contactos SIN filtro de cuenta. OJO: el endpoint de lista de 1CRM ignora
+    max_num y devuelve solo ~20 registros (de posiblemente cientos) sin avisar — NO usar esto
+    para buscar un contacto específico por cuenta, usa _contactos_por_cuenta (sí filtra server-side,
+    confirmado en vivo con filters[primary_account_id])."""
+    records = _onecrm_get("data/Contact", dict([("max_num", 200), *_CONTACT_FIELDS])).get("records", [])
+    return [_mapear_contacto(r) for r in records]
+
+
+def _contactos_por_cuenta(cuenta_id: str) -> list:
+    """Contactos de UNA cuenta específica — filtra server-side (confirmado en vivo que
+    filters[primary_account_id] sí funciona en Contact, a diferencia de otros módulos/campos).
+    Evita el bug de _get_all_contacts_with_detail: con cientos de contactos en el CRM, uno de una
+    cuenta vieja podía no estar entre los primeros ~20 que el endpoint de lista alcanza a devolver.
+    OJO 2: filters[] SÍ filtra bien (trae los contactos correctos) pero rompe la proyección de
+    fields[] — email1/email2/primary_account_id vuelven vacíos en la lista filtrada aunque el
+    contacto sí tenga correo (confirmado en vivo). Por eso cada contacto se refuerza con GET por id
+    — el número de contactos por cuenta es chico, no cientos, así que no es costoso."""
+    ids = [r["id"] for r in _onecrm_get("data/Contact", {
+        "filters[primary_account_id]": cuenta_id, "max_num": 100,
+    }).get("records", []) if r.get("id")]
+    contactos = []
+    for cid in ids:
+        d = _onecrm_get(f"data/Contact/{cid}").get("record", {})
+        if d:
+            contactos.append(_mapear_contacto(d))
+    return contactos
+
+
+def _sin_acentos(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKD", s or "") if not unicodedata.combining(c))
 
 
 def tool_buscar_contactos_crm(nombre: str = "", cuenta_id: str = "") -> dict:
     """Busca contactos en 1CRM por nombre o por cuenta."""
     if not ONECRM_BASE:
         return {"error": "1CRM no configurado"}
-    todos = _get_all_contacts_with_detail()
     if cuenta_id:
-        todos = [c for c in todos if c["cuenta_id"] == cuenta_id]
-    if nombre:
-        q = nombre.lower()
-        todos = [c for c in todos if q in c["nombre"].lower() or q in c["email"].lower()]
+        # filter_text no combina con filters[cuenta] de forma confiable — se filtra por cuenta
+        # server-side y, si además hay nombre, se acota client-side (set chico, no cientos).
+        # Insensible a acentos: el nombre del CRM puede traer acento y lo que escribe el
+        # usuario no siempre (p.ej. "Vazquez" no matcheaba "Vázquez").
+        todos = _contactos_por_cuenta(cuenta_id)
+        if nombre:
+            q = _sin_acentos(nombre).lower()
+            todos = [c for c in todos
+                     if q in _sin_acentos(c["nombre"]).lower() or q in c["email"].lower()]
+    elif nombre:
+        # filter_text SÍ busca bien por nombre en el servidor (confirmado en vivo) — no hace
+        # falta (ni conviene) re-filtrar client-side encima, sería el mismo bug de acentos.
+        # Igual que _contactos_por_cuenta: el resultado de filter_text también viene sin
+        # email1/email2 poblados, hay que reforzar con GET por id (búsqueda por nombre da
+        # pocos resultados, es barato).
+        records = _onecrm_get("data/Contact", {"filter_text": nombre, "max_num": 50}).get("records", [])
+        todos = []
+        for r in records:
+            rid = r.get("id")
+            d = _onecrm_get(f"data/Contact/{rid}").get("record", {}) if rid else {}
+            todos.append(_mapear_contacto(d or r))
+    else:
+        todos = _get_all_contacts_with_detail()
     return {"total": len(todos), "contactos": todos}
 
 
@@ -1153,8 +1201,7 @@ def tool_ver_contactos_cuenta_crm(cuenta_id: str) -> dict:
         return {"error": "1CRM no configurado"}
     cuenta = _onecrm_get(f"data/Account/{cuenta_id}").get("record", {})
     nombre_cuenta = cuenta.get("name", cuenta_id)
-    todos = _get_all_contacts_with_detail()
-    contactos = [c for c in todos if c["cuenta_id"] == cuenta_id]
+    contactos = _contactos_por_cuenta(cuenta_id)
     # Incluir email/teléfono del Account si no hay Contact records separados
     info_cuenta: dict = {}
     acct_email = cuenta.get("email1", "") or cuenta.get("email2", "")
