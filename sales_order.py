@@ -504,7 +504,7 @@ def crear_sales_order(draft: dict) -> dict:
     payload = {
         "billing_account_id": cuenta_id,
         "related_quote_id":   quote_id,
-        "so_stage":           "Ordered",
+        "so_stage":           "In Manufacturing",   # al crear la SO entra en preparación/fabricación
         "purchase_order_num": draft.get("po_number", "") or "",
     }
     if draft.get("currency_id"):

@@ -237,8 +237,10 @@ def recalcular_so_stage(so_id: str, enviado_total: dict[str, float], facturado: 
         stage = "Partially Shipped and Invoiced"
     elif algo_enviado:
         stage = "Partially Shipped and not Invoiced"
+    elif facturado:
+        stage = "Invoiced NOT SHIPPED"        # facturado sin nada enviado (facturar antes de enviar)
     else:
-        stage = so_rec.get("so_stage") or "Ordered"
+        stage = so_rec.get("so_stage") or "In Manufacturing"
 
     sales_order._crm_patch("SalesOrder", so_id, {"so_stage": stage})
     return stage
