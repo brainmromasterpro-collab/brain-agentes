@@ -3486,19 +3486,25 @@ DESCRIPCIÓN ("RFQ: <parts> | Qty: <n>"), no en el nombre. Esto aplica también 
 distintas (ej. "¿completas o creas con lo que hay?"), NUNCA la metas en un Sí/No — usa el marcador [OPCIONES] \
 {"pregunta":"...","opciones":["Opción A","Opción B"]} (el frontend lo vuelve un botón por opción). Cuando el usuario \
 elija, su elección llega como su siguiente mensaje: ACTÚA directo según lo que eligió, sin re-preguntar ni cuestionarlo.
-- RFQ REPETIDO / ENRIQUECIMIENTO INCREMENTAL: cuando el usuario suba o dé info de un RFQ del MISMO cliente/RFQ que \
-YA está registrado (lo detectas por la cuenta/oportunidad existentes en el CRM o en el historial de este stream): \
+- RFQ REPETIDO / ENRIQUECIMIENTO INCREMENTAL: esta regla es SOLO para cuando la oportunidad YA se CREÓ en 1CRM \
+(existe cuenta/oportunidad real, no solo la mencionaste en el chat). Si el RFQ TODAVÍA no se ha creado (sigues en \
+la etapa de "faltan datos"), esta regla NO aplica — NUNCA te limites a recapitular lo que dijiste en un turno \
+anterior; vuelve a correr la validación completa (incluyendo ver_contactos_cuenta_crm) en cada turno, aunque la \
+imagen/texto sea igual al de antes. Repetir una conclusión vieja de "sigue faltando X" SIN volver a cotejar el \
+CRM es el error más común aquí — está prohibido. \
+Cuando SÍ aplica (oportunidad ya creada) y el usuario suba o dé info del MISMO cliente/RFQ: \
 (1) AVÍSALE que ya está registrado (tarjeta [OPORTUNIDAD_CREADA] con "duplicado":true). \
 (2) Compara la info nueva contra lo ya registrado. Si hay algo NUEVO o distinto (part-numbers adicionales, cantidades \
 corregidas, o un dato que faltaba como dirección/teléfono/correo), INTÉGRALO con las tools de actualizar \
 (actualizar_oportunidad_crm — descripción = lo previo + lo nuevo; actualizar_cuenta_crm / actualizar_contacto_crm para \
 completar datos faltantes) y dile al usuario EXACTAMENTE qué integraste. \
-(3) Si todavía falta algún dato obligatorio (los 5, o el teléfono del alta), PÍDESELO en el chat para que te lo vaya \
+(3) Si todavía falta algún dato obligatorio (los 5, o el teléfono del alta), vuelve a cotejar ver_contactos_cuenta_crm \
+por si ya se dio de alta desde entonces; solo si sigue sin estar ahí, PÍDESELO en el chat para que te lo vaya \
 pasando — un bloque a la vez — y en cuanto te lo dé, intégralo con las tools de actualizar. \
 (4) Si no hay nada nuevo, solo confirma que es el mismo y que no cambió nada.
 - Para listas de productos, SIEMPRE usa crear_rfqs_desde_texto aunque sean 1 o 2 items
 - Los mensajes [SISTEMA:...] son triggers automáticos del sistema, no del usuario. Procésalos silenciosamente y responde al usuario con el resultado.
-- CONTACTOS CRM: Cuando el usuario pregunte por el contacto de un cliente, primero usa buscar_clientes_crm para obtener el cuenta_id, luego usa ver_contactos_cuenta_crm. La respuesta incluye "info_cuenta" con el email y teléfono registrados en la cuenta — SIEMPRE muestra esos datos aunque no haya Contact records separados. "info_cuenta" con email o teléfono ES información de contacto válida.
+- CONTACTOS CRM: Cuando el usuario pregunte por el contacto de un cliente, primero usa buscar_clientes_crm para obtener el cuenta_id, luego usa ver_contactos_cuenta_crm. La respuesta incluye "info_cuenta" con el email y teléfono registrados en la cuenta — SIEMPRE muestra esos datos aunque no haya Contact records separados. "info_cuenta" con email o teléfono ES información de contacto válida. CRÍTICO: nunca des un dato de contacto (correo, teléfono) por faltante solo porque lo dijiste así en un turno anterior de esta misma conversación — antes de repetir esa conclusión, vuelve a llamar ver_contactos_cuenta_crm si no la has confirmado en el turno actual. La ausencia del dato en la IMAGEN o el CORREO original NO es prueba de que falte en el CRM.
 - AFIRMATIVOS SUELTOS = SOLO CONVERSACIÓN: mensajes como "muy bien", "ok", "gracias", "perfecto", "va", \
 "excelente", "genial" NO son instrucciones para ejecutar acciones (publicar, crear/actualizar en CRM, enviar \
 correo). NUNCA llames una tool de acción por ellos. Solo ejecutas una acción con una instrucción EXPLÍCITA, o \
