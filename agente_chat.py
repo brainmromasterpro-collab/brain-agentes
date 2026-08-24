@@ -3553,6 +3553,7 @@ TIPO_MODOS = {
     "cotizacion":   [],                            # (módulo de cotización se agrega después)
     "ordenes":      [],
     "compras":      [],                            # compras a proveedor: pipeline 100% determinista
+    "pagos":        [],                            # pagos (Bill+Invoice): pipeline 100% determinista
     # aliases de compatibilidad
     "mensajeria":   [9, 10, 11, 12],
     "catalogo":     [1, 2, 3, 4, 5, 6, 8, 13, 14],
@@ -4004,14 +4005,49 @@ def _bajar_imagenes(file_url: str, nombre: str = "", mime: str = "") -> list:
     return [data]
 
 
-def _procesar_comprobante_pago(stream_id: str, file_url: str, nombre: str = "", mime: str = "") -> None:
-    """ETAPA 2 (pagos): lee el comprobante subido y lo coteja contra las Bills abiertas por
-    monto. Emite [COTEJO_PAGO]. NO escribe al CRM."""
+def _pagado_previo_map() -> dict:
+    """Suma lo YA pagado de cada Bill/Invoice según el historial de [PAGO_REGISTRADO] de
+    CUALQUIER stream — a diferencia de PO/SO (que siempre viven en un solo stream), un Bill/
+    Invoice es alcanzable tanto desde 'compras' como desde 'pagos', así que hay que escanear
+    globalmente, no solo este stream_id. Resta lo que se haya deshecho después ([ACCION_DESHECHA]
+    con el mismo payment_id). Devuelve {registro_id: monto_acumulado}."""
+    acumulado: dict = {}
     try:
-        import compra_proveedor
+        deshechos: set = set()
+        rows_d = supabase.table("mensajes").select("content").ilike("content", "%ACCION_DESHECHA%").execute()
+        for r in (rows_d.data or []):
+            content = r.get("content") or ""
+            if not content.startswith("[ACCION_DESHECHA]"):
+                continue
+            try:
+                p = json.loads(content[len("[ACCION_DESHECHA]"):])
+            except Exception:
+                continue
+            if p.get("que") == "el pago registrado" and p.get("payment_id"):
+                deshechos.add(p["payment_id"])
+
+        rows = supabase.table("mensajes").select("content").ilike("content", "%PAGO_REGISTRADO%").execute()
+        for r in (rows.data or []):
+            content = r.get("content") or ""
+            if not content.startswith("[PAGO_REGISTRADO]"):
+                continue
+            try:
+                p = json.loads(content[len("[PAGO_REGISTRADO]"):])
+            except Exception:
+                continue
+            if not p.get("ok") or not p.get("registro_id") or p.get("payment_id") in deshechos:
+                continue
+            acumulado[p["registro_id"]] = acumulado.get(p["registro_id"], 0) + float(p.get("monto") or 0)
     except Exception as e:
-        log.error(f"compra_proveedor no disponible: {e}")
-        return
+        log.warning(f"No se pudo leer historial global de pagos: {e}")
+    return acumulado
+
+
+def _procesar_comprobante_pago(stream_id: str, file_url: str, nombre: str = "", mime: str = "") -> None:
+    """Lee el comprobante subido y lo coteja contra las Bills/Invoices abiertas por monto (saldo
+    ya ajustado por pagos previos registrados en cualquier stream). Emite [COTEJO_PAGO]. NO
+    escribe al CRM."""
+    import pagos
     _log_stream(stream_id, "Leyendo comprobante de pago…", "info")
     try:
         imgs = _bajar_imagenes(file_url, nombre, mime)
@@ -4022,7 +4058,7 @@ def _procesar_comprobante_pago(stream_id: str, file_url: str, nombre: str = "", 
             "procesado": True, "metadata": {},
         }).execute()
         return
-    comprobante = compra_proveedor.leer_comprobante(imgs)
+    comprobante = pagos.leer_comprobante(imgs)
     if comprobante.get("error"):
         _log_stream(stream_id, f"No pude leer el comprobante: {comprobante['error']}", "error")
         supabase.table("mensajes").insert({
@@ -4031,7 +4067,8 @@ def _procesar_comprobante_pago(stream_id: str, file_url: str, nombre: str = "", 
             "procesado": True, "metadata": {},
         }).execute()
         return
-    cotejo = compra_proveedor.buscar_bill_candidata(comprobante)
+    cuentas = pagos.cuentas_abiertas(_pagado_previo_map())
+    cotejo = pagos.buscar_candidata(comprobante, cuentas)
     supabase.table("mensajes").insert({
         "stream_id": stream_id, "role": "assistant",
         "content": "[COTEJO_PAGO]" + json.dumps({"comprobante": comprobante, "cotejo": cotejo}, ensure_ascii=False),
@@ -4040,14 +4077,11 @@ def _procesar_comprobante_pago(stream_id: str, file_url: str, nombre: str = "", 
     _log_stream(stream_id, f"Comprobante leído — {len(cotejo.get('candidatas', []))} cuenta(s) candidata(s)", "ok")
 
 
-def _confirmar_pago(stream_id: str, bill_id: str, monto: float, datos_comprobante: dict) -> None:
-    """Crea el Payment ligado a la Bill tras aprobación del usuario. Emite [PAGO_REGISTRADO]."""
-    try:
-        import compra_proveedor
-    except Exception as e:
-        return
+def _confirmar_pago(stream_id: str, tipo: str, registro_id: str, monto: float, datos_comprobante: dict) -> None:
+    """Crea el Payment ligado al Bill/Invoice tras aprobación del usuario. Emite [PAGO_REGISTRADO]."""
+    import pagos
     _log_stream(stream_id, "Registrando pago…", "info")
-    res = compra_proveedor.registrar_pago(bill_id, monto, datos_comprobante)
+    res = pagos.registrar_pago(tipo, registro_id, monto, datos_comprobante)
     supabase.table("mensajes").insert({
         "stream_id": stream_id, "role": "assistant",
         "content": "[PAGO_REGISTRADO]" + json.dumps(res, ensure_ascii=False),
@@ -4055,6 +4089,37 @@ def _confirmar_pago(stream_id: str, bill_id: str, monto: float, datos_comprobant
     }).execute()
     _log_stream(stream_id, "Pago registrado ✓" if res.get("ok") else f"No se pudo registrar: {res.get('error','')}",
                 "ok" if res.get("ok") else "error")
+
+
+def _iniciar_registro_desde_pago(stream_id: str, direccion: str, monto: float, datos_comprobante: dict) -> None:
+    """AGENTE 2: el comprobante no matcheó ninguna Bill/Invoice abierta. Un comprobante de pago NO
+    trae número de parte ni producto — no se puede inventar una línea para crear el PurchaseOrder/
+    Bill (o Sales Order/Invoice) de un clic sin fabricar datos. En vez de eso, guía al usuario a
+    dar de alta la compra/venta correcta con lo que YA sabemos (monto/fecha/referencia), y el
+    flujo normal (pegar el link del producto, o dar de alta al cliente) sigue desde ahí — cuando
+    exista el Bill/Invoice recién creado, el mismo comprobante se puede volver a subir para
+    registrarlo con [COTEJO_PAGO]."""
+    comp = datos_comprobante or {}
+    detalle = f"${monto:,.2f}" + (f" · ref: {comp.get('referencia')}" if comp.get("referencia") else "")
+    if direccion == "outgoing":
+        texto = (
+            f"No encontré ninguna cuenta por pagar abierta que corresponda a este pago ({detalle}). "
+            "Si es una compra nueva a proveedor, pásame el link del producto (o dime a quién le "
+            "pagaste y qué compraste) y armo el Purchase Order + cuenta por pagar — en cuanto "
+            "exista, vuelve a mandarme este mismo comprobante y lo cotejo."
+        )
+    else:
+        texto = (
+            f"No encontré ninguna cuenta por cobrar abierta que corresponda a este cobro ({detalle}). "
+            "Si es de un cliente/venta que aún no está en el CRM, dime de quién es y qué Sales "
+            "Order corresponde y te ayudo a darla de alta — en cuanto exista, vuelve a mandarme "
+            "este mismo comprobante y lo cotejo."
+        )
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant", "content": texto,
+        "procesado": True, "metadata": {},
+    }).execute()
+    _log_stream(stream_id, "Sin match — pidiendo datos para dar de alta la compra/venta", "info")
 
 
 def _recibido_previo_po(stream_id: str, po_id: str) -> dict:
@@ -4407,15 +4472,14 @@ def _deshacer_po(stream_id: str, po_id: str, bill_id: str) -> None:
 
 
 def _deshacer_pago(stream_id: str, payment_id: str) -> None:
-    """Deshace la Etapa 2 (borra el Payment)."""
-    try:
-        import compra_proveedor
-    except Exception:
-        return
-    res = compra_proveedor.deshacer_pago(payment_id)
+    """Deshace un pago (borra el Payment). payment_id viaja en el marcador de deshecho para que
+    _pagado_previo_map lo reste del acumulado — sin esto, un pago deshecho seguiría contando
+    contra el saldo restante para siempre."""
+    import pagos
+    res = pagos.deshacer_pago(payment_id)
     supabase.table("mensajes").insert({
         "stream_id": stream_id, "role": "assistant",
-        "content": "[ACCION_DESHECHA]" + json.dumps({**res, "que": "el pago registrado"}, ensure_ascii=False),
+        "content": "[ACCION_DESHECHA]" + json.dumps({**res, "que": "el pago registrado", "payment_id": payment_id}, ensure_ascii=False),
         "procesado": True, "metadata": {"accion_deshecha": True},
     }).execute()
     _log_stream(stream_id, "Pago deshecho ✓" if res.get("ok") else "No se pudo deshacer", "ok" if res.get("ok") else "error")
@@ -4904,11 +4968,15 @@ def procesar_mensaje(msg: dict) -> None:
             _deshacer_po(stream_id, _md0.get("po_id", ""), _md0.get("bill_id", ""))
             return
         if _md0.get("pago_action") == "confirmar":
-            _confirmar_pago(stream_id, _md0.get("bill_id", ""), _md0.get("monto", 0),
-                            _md0.get("datos_comprobante") or {})
+            _confirmar_pago(stream_id, _md0.get("tipo", "bill"), _md0.get("registro_id", ""),
+                            _md0.get("monto", 0), _md0.get("datos_comprobante") or {})
             return
         if _md0.get("pago_action") == "deshacer":
             _deshacer_pago(stream_id, _md0.get("payment_id", ""))
+            return
+        if _md0.get("pago_action") == "iniciar_registro":
+            _iniciar_registro_desde_pago(stream_id, _md0.get("direccion", "outgoing"),
+                                         _md0.get("monto", 0), _md0.get("datos_comprobante") or {})
             return
         # Receiving v2 — sub-proceso anidado con ciclo de vida (secuencia flexible):
         # activar (order confirmation/packing list) -> tracking (en tránsito) -> iniciar_recepcion
@@ -4967,6 +5035,44 @@ def procesar_mensaje(msg: dict) -> None:
                 "content": "Mándame el link del producto que vas a comprar, una foto/PDF del "
                            "comprobante de pago, o el tracking/packing list de una recepción — "
                            "y sigo desde ahí.",
+                "procesado": True, "metadata": {},
+            }).execute()
+        return
+
+    # PIPELINE DE PAGOS: stream tipo 'pagos'. Mismo backend que la Etapa 2 dentro de 'compras'
+    # (pagos.py) — aquí NO hace falta clasificar tipo de evidencia primero: cualquier archivo
+    # subido en este stream se asume comprobante de pago directo.
+    if _tipo_stream == "pagos":
+        _file_url  = _md0.get("file_url", "")
+        _file_name = _md0.get("file_name", "")
+        _file_mime = _md0.get("file_mime", "")
+
+        if _md0.get("pago_action") == "confirmar":
+            _confirmar_pago(stream_id, _md0.get("tipo", "bill"), _md0.get("registro_id", ""),
+                            _md0.get("monto", 0), _md0.get("datos_comprobante") or {})
+            return
+        if _md0.get("pago_action") == "deshacer":
+            _deshacer_pago(stream_id, _md0.get("payment_id", ""))
+            return
+        if _md0.get("pago_action") == "iniciar_registro":
+            _iniciar_registro_desde_pago(stream_id, _md0.get("direccion", "outgoing"),
+                                         _md0.get("monto", 0), _md0.get("datos_comprobante") or {})
+            return
+        if _md0.get("cancelar_accion"):
+            supabase.table("mensajes").insert({
+                "stream_id": stream_id, "role": "assistant",
+                "content": "Entendido, no hice nada con eso. Mándame el comprobante correcto cuando quieras.",
+                "procesado": True, "metadata": {},
+            }).execute()
+            return
+
+        if _file_url:
+            _procesar_comprobante_pago(stream_id, _file_url, _file_name, _file_mime)
+        else:
+            supabase.table("mensajes").insert({
+                "stream_id": stream_id, "role": "assistant",
+                "content": "Mándame una foto, captura o PDF del comprobante de pago (a proveedor "
+                           "o de un cliente) y lo cotejo contra lo que tengas abierto en 1CRM.",
                 "procesado": True, "metadata": {},
             }).execute()
         return

@@ -466,113 +466,10 @@ def _leer_con_vision(imagenes: list[bytes], instruccion: str, model_id: str = ""
 
 
 # ─────────────────────────────────────────────────────────────
-# 4. PAGOS (Etapa 2) — conciliar comprobante de pago contra Bills abiertas
+# 4. PAGOS (Etapa 2) — MOVIDO a pagos.py (generalizado a Bill+Invoice, con saldo ajustado por
+# pagos previos del historial). Se deja aquí solo _leer_con_vision (helper compartido con
+# receiving) — pagos.py lo importa de este módulo.
 # ─────────────────────────────────────────────────────────────
-# HALLAZGO VERIFICADO (create+delete controlado): Payment.related_invoice_id SÍ acepta el id de
-# un Bill y se guarda (pese a que su bean_name diga "Invoice" en la metadata — mismo patrón de
-# "editable:false no bloquea la API" ya visto), PERO Bill.amount_due NO se recalcula solo, y
-# TAMPOCO es editable por PATCH directo (campo protegido/calculado por la lógica interna de
-# 1CRM, fuera de alcance de la API cruda). Por eso: el pago SÍ queda creado y trazable (Payment
-# ligado al Bill), pero el estatus "pagada" que reporta ESTE sistema se basa en la EXISTENCIA de
-# ese Payment — igual criterio que "ya comprado" en el PO (relación como fuente de verdad, no un
-# campo). Si se necesita que 1CRM también lo muestre saldado en su propia UI, hay que aplicarlo
-# ahí manualmente — no es alcanzable desde aquí.
-def bills_abiertas(limite: int = 40) -> list[dict]:
-    """Bills (cuentas por pagar) recientes con saldo pendiente (amount_due > 0), con el nombre
-    del proveedor resuelto. La lista de 1CRM viene delgada (sin amount_due/supplier_id) — se pide
-    detalle de las últimas `limite`, mismo patrón que sales_orders_abiertas/pos_esperando_recepcion."""
-    data = sales_order._crm_get("data/Bill", {"order_by": "date_modified desc", "limit": limite})
-    out: list[dict] = []
-    for b in data.get("records", []):
-        bid = b.get("id")
-        if not bid:
-            continue
-        d = sales_order._crm_get(f"data/Bill/{bid}")
-        rec = d.get("record", d)
-        due = sales_order._num(rec.get("amount_due"))
-        if not due or due <= 0:
-            continue
-        cuenta = sales_order.cuenta_por_id(rec.get("supplier_id", ""))
-        out.append({
-            "id": bid, "nombre": rec.get("name", ""),
-            "amount_due": due, "currency_id": rec.get("currency_id", ""),
-            "proveedor": (cuenta or {}).get("nombre", ""),
-            "proveedor_id": rec.get("supplier_id", ""),
-            "related_purchase_order_id": rec.get("related_purchase_order_id", ""),
-            "url": f"{CRM_BASE}/index.php?module=Bills&action=DetailView&record={bid}",
-        })
-    return out
-
-
-_INSTR_COMPROBANTE = (
-    "Esta imagen es un COMPROBANTE DE PAGO/TRANSFERENCIA a un proveedor. Devuelve SOLO un JSON "
-    "(sin ``` ni explicaciones) con el esquema exacto:\n"
-    '{"monto": number o null, "moneda": "MXN"|"USD"|"", "fecha": "YYYY-MM-DD" o "", '
-    '"referencia": "folio/referencia/beneficiario tal cual aparece, o \\"\\"", '
-    '"notas": "cualquier dato dudoso"}\n'
-    "NO inventes cifras: si el monto no es legible con claridad, usa null."
-)
-
-
-def leer_comprobante(imagenes: list[bytes], model_id: str = "") -> dict:
-    """Lee un comprobante de pago (foto/captura/PDF ya rasterizado a imágenes) con visión de
-    Claude. Extrae SOLO lo que esté claramente legible — NO inventa cifras."""
-    datos = _leer_con_vision(imagenes, _INSTR_COMPROBANTE, model_id)
-    datos.setdefault("monto", None)
-    datos.setdefault("moneda", "")
-    datos.setdefault("referencia", "")
-    return datos
-
-
-def buscar_bill_candidata(comprobante: dict, bills: list[dict] | None = None) -> dict:
-    """Cruza el comprobante leído contra las Bills abiertas por MONTO (tolerancia 1% o 1 unidad,
-    lo mayor) — el monto es el dato más confiable de un comprobante. Devuelve
-    {candidatas, multiples, por_monto}. NO asume un match único en silencio si hay ambigüedad: el
-    usuario confirma cuál es en el widget."""
-    todas = bills if bills is not None else bills_abiertas()
-    monto = sales_order._num(comprobante.get("monto"))
-    if monto is None:
-        return {"candidatas": todas, "multiples": len(todas) > 1, "por_monto": False}
-    cands = [b for b in todas if abs(b["amount_due"] - monto) <= max(1.0, 0.01 * b["amount_due"])]
-    return {"candidatas": cands or todas, "multiples": len(cands) > 1, "por_monto": bool(cands)}
-
-
-def registrar_pago(bill_id: str, monto: float, datos_comprobante: dict | None = None) -> dict:
-    """Crea el Payment ligado al Bill (registrado y trazable). OJO: no cierra el Bill en la UI
-    nativa de 1CRM (amount_due no se recalcula vía API, verificado) — el estatus 'pagada' que
-    reporta este sistema se basa en la EXISTENCIA de este Payment, no en el campo de 1CRM."""
-    if not CRM_BASE:
-        return {"error": "1CRM no configurado"}
-    d = sales_order._crm_get(f"data/Bill/{bill_id}")
-    bill = d.get("record", d)
-    if not bill.get("id"):
-        return {"error": f"no encontré la Bill {bill_id}"}
-    extra = datos_comprobante or {}
-    payload = {
-        "amount": monto,
-        "currency_id": bill.get("currency_id") or "",
-        "payment_date": extra.get("fecha") or datetime.date.today().isoformat(),
-        "direction": "outgoing",
-        "payment_type": extra.get("payment_type") or "Wire Transfer",
-        "account_id": bill.get("supplier_id"),
-        "related_invoice_id": bill_id,
-        "customer_reference": extra.get("referencia") or "",
-    }
-    r = sales_order._crm_post("Payment", payload)
-    pay_id = r.get("id")
-    if not pay_id:
-        return {"error": f"no se pudo crear el Payment: {r}"}
-    return {
-        "ok": True,
-        "payment_id": pay_id,
-        "payment_url": f"{CRM_BASE}/index.php?module=Payments&action=DetailView&record={pay_id}",
-        "bill_id": bill_id,
-        "bill_url": f"{CRM_BASE}/index.php?module=Bills&action=DetailView&record={bill_id}",
-        "monto": monto,
-        "aviso": "Pago registrado y ligado al Bill. El saldo (amount_due) de 1CRM no se actualiza "
-                 "solo — si necesitas que se vea saldada también en la UI nativa de 1CRM, aplícalo "
-                 "ahí manualmente.",
-    }
 
 
 # ─────────────────────────────────────────────────────────────
@@ -878,14 +775,6 @@ def deshacer_po_y_ap(po_id: str, bill_id: str = "") -> dict:
     if po_id:
         sales_order._crm_delete("PurchaseOrder", po_id)
     return {"ok": True}
-
-
-def deshacer_pago(payment_id: str) -> dict:
-    """Revierte la Etapa 2: borra el Payment registrado."""
-    if not payment_id:
-        return {"error": "falta payment_id"}
-    r = sales_order._crm_delete("Payment", payment_id)
-    return {"ok": "error" not in r}
 
 
 def deshacer_recepcion(po_id: str, estado_anterior: str = "") -> dict:
