@@ -966,7 +966,7 @@ def tool_crear_cuenta_crm(
             "mensaje": f"La cuenta '{_ex['nombre']}' YA EXISTE en 1CRM (coincidencia por {_ex['por']}). "
                        f"No la dupliqué. Usa este cuenta_id para el contacto/oportunidad.",
         }
-    payload: dict = {"name": nombre, "account_type": tipo,
+    payload: dict = {"name": nombre, "account_type": tipo or "Customer",
                      # Defaults fijos (pedido de Gabriel): toda cuenta nueva nace en MXN y con el
                      # tax code de IVA ("Impuesto al Valor Agregado").
                      "currency_id": "16242fc8-aefa-63c3-1814-6489f1575687",   # Mexican Peso
@@ -3318,6 +3318,8 @@ los trates como RFQs separados. \
 
 ALTA DE CLIENTE NUEVO (cuando el prospecto NO existe en el CRM): NO des de alta solo la cuenta — el alta es \
 CUENTA + CONTACTO (sigue el MODO 12 completo: crear_cuenta_crm y DESPUÉS crear_contacto_crm ligado con ese cuenta_id). \
+RECORDATORIO (regla completa en MODO 12): crear_cuenta_crm SIEMPRE con tipo="Customer" explícito, y el correo/ \
+teléfono del prospecto van en crear_contacto_crm (la persona), NUNCA en crear_cuenta_crm (la empresa). \
 Para el alta el TELÉFONO es OBLIGATORIO: si el RFQ no lo trae, PÍDESELO al usuario en el chat antes de crear la cuenta. \
 Ofrécelo con [DECISION: ¿Doy de alta a <empresa> como cliente (cuenta + contacto <persona>)?] y, tras el "Sí", crea \
 ambos y confirma con sus links.
@@ -3357,10 +3359,13 @@ El onboarding fiscal formal ocurre DESPUÉS, cuando el cliente manda la ORDEN DE
    del MODO 10 paso 3), o (2) que el usuario del chat te lo dé directamente. Avisa en el chat qué falta.
 
 3. CREAR (solo con [DECISION] aprobado): [DECISION: ¿Doy de alta a <empresa> como cliente (cuenta + contacto <persona>)?]. Tras el "Sí":
-   (i)  crear_cuenta_crm con tipo="Customer": SOLO datos de la EMPRESA — nombre (empresa) y envio_* (dirección de \
-        envío). SIN datos fiscales. El CORREO y el TELÉFONO **NO van en la cuenta**: son de la PERSONA (contacto), \
-        no de la empresa. (Solo pon email/teléfono en la cuenta si el prospecto aclara que es un correo/conmutador \
-        CORPORATIVO general de la empresa.)
+   (i)  crear_cuenta_crm — CRÍTICO, siempre con tipo="Customer" EXPLÍCITO (nunca lo omitas ni mandes otro valor: \
+        esta cuenta es un CLIENTE, no proveedor/socio/otro, aunque la tool acepte otros tipos para otros casos): \
+        SOLO datos de la EMPRESA — nombre (empresa) y envio_* (dirección de envío). SIN datos fiscales. \
+        CRÍTICO — el CORREO y el TELÉFONO del PROSPECTO **NUNCA van en la cuenta** (son de la PERSONA/contacto, \
+        no de la empresa) — NI SIQUIERA si es un número de WhatsApp/celular personal que el prospecto usó para \
+        escribir. Solo pon email/teléfono en la cuenta si el prospecto ACLARA EXPLÍCITAMENTE que es un correo/ \
+        conmutador CORPORATIVO general de la empresa (no el de la persona con la que hablas).
    (ii) crear_contacto_crm ligado con cuenta_id (el id de i): nombre, apellido, y el EMAIL y TELÉFONO de la persona \
         (el correo/tel que dio el prospecto van AQUÍ, en el contacto), whatsapp si hay.
    Al terminar NO escribas los links en texto: emite el marcador [OPORTUNIDAD_CREADA] (ver MODO 10) con los links.
