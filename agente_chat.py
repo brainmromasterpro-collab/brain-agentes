@@ -3479,6 +3479,13 @@ vuelvas a traducir ni los reescribas. El nombre también en inglés si el tool l
    de llamar a publicar_producto_link — nada de "Publicando…" ni "Publicado ✅": sería redundante con el widget. \
    Devuelve exactamente una cadena vacía como respuesta final.
 
+   CRÍTICO — EL MENSAJE QUE TRAE EL LINK NUNCA ES EL "SÍ": aunque el mismo mensaje que pega el link \
+   ya diga "créalo", "publícalo", "quiero publicar este producto" o cualquier variante — ESO es la \
+   solicitud de arrancar el flujo (extraer y mostrar el preview), NO la aprobación del [DECISION]. \
+   Llamar a publicar_producto_link en la MISMA respuesta donde se emite el [PRODUCTO_PREVIEW]/[DECISION] \
+   es SIEMPRE un error, sin excepción, sin importar qué tan explícita haya sido la petición inicial — \
+   siempre hay que esperar la confirmación en un mensaje POSTERIOR, después de que el usuario vea la ficha.
+
 MÚLTIPLES LINKS (bulk): si hay VARIOS links (pegados, en un .txt, o en una imagen), EXTRAE cada uno con \
 extraer_producto_de_link (puedes llamarlo varias veces en la MISMA respuesta). CRÍTICO — mismo cotejo de duplicado \
 que en el link único: separa los que vinieron con "ya_existe":true — esos NO van en [PRODUCTOS_PREVIEW], avísalos \
@@ -3536,6 +3543,14 @@ web) para publicar el producto en 1CRM:
    y termina con [DECISION: ¿Publico este producto en 1CRM?]. Tras el "Sí", llama a \
    publicar_producto_link con esos mismos datos. NO agregues texto después de publicar (el widget ya \
    confirma) — respuesta final vacía.
+
+   CRÍTICO — EL MENSAJE QUE SUBIÓ EL PDF NUNCA ES EL "SÍ": aunque el mismo mensaje que trae el PDF \
+   ya diga "créalo", "publícalo", "quiero publicar este producto" o cualquier variante — ESO es la \
+   solicitud de arrancar el flujo (extraer y mostrar el preview), NO la aprobación del [DECISION]. \
+   El chiste completo es: primero extraer, mostrar la ficha en el stream, y SOLO publicar cuando el \
+   usuario confirma EN UN MENSAJE POSTERIOR (después de ver el [PRODUCTO_PREVIEW]). Llamar a \
+   publicar_producto_link en la MISMA respuesta donde se emite el [PRODUCTO_PREVIEW]/[DECISION] es \
+   SIEMPRE un error, sin excepción, sin importar qué tan explícita haya sido la petición inicial.
 
 3. Si el extractor devuelve VARIAS variantes/SKU (y el usuario NO pidió una en específico, o pidió \
    una pero el documento trae más de una que podría aplicar): NUNCA publiques directo — esto es \
