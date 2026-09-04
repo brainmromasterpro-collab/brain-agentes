@@ -1894,7 +1894,17 @@ def _tiene_marca_de_agua(imagen_bytes: bytes) -> bool:
     ESTAMPADO ENCIMA de la foto (nombre de sitio, dominio, banda diagonal semi-transparente, etc.)?
     NO cuenta un logo grabado en la pieza física ni texto de un empaque — eso es normal. Ante la
     duda, se asume que NO tiene (mejor usar la foto que gastar en una búsqueda que quizá tampoco
-    encuentre nada mejor)."""
+    encuentre nada mejor).
+
+    BUG REAL confirmado con una foto real de reseller (BD Engineering: logo propio en esquina +
+    badge "1 YEAR" + franja inferior con teléfono/sitio web, todo integrado como si fuera parte
+    del diseño de la imagen sobre fondo gris): el prompt original ("nombre de sitio, dominio,
+    'sample', franja diagonal semi-transparente") devolvía NO — el modelo lo interpretaba como
+    parte legítima del diseño en vez de overlay de vendedor, porque no venía en forma de sello
+    diagonal clásico. Prompt reescrito para nombrar explícitamente el patrón real (logo/badge de
+    garantía/franja de contacto de un DISTRIBUIDOR, aunque se vea "integrado" al diseño) — probado
+    en vivo: detecta el caso reseller (antes NO, ahora SI) y sigue sin falsos positivos en una foto
+    limpia sin overlay."""
     try:
         from PIL import Image
         import io as _io
@@ -1909,10 +1919,20 @@ def _tiene_marca_de_agua(imagen_bytes: bytes) -> bool:
                 "content": [
                     {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
                     {"type": "text", "text": (
-                        "¿Esta imagen tiene una marca de agua, texto superpuesto (nombre de sitio, "
-                        "dominio, 'sample', franja diagonal semi-transparente) puesto ENCIMA de la "
-                        "foto? NO cuenta un logo grabado en la pieza física ni texto de un empaque/"
-                        "etiqueta del producto. Responde SOLO 'SI' o 'NO'."
+                        "Esta imagen es una foto de producto industrial que un DISTRIBUIDOR/RESELLER "
+                        "publicó en su página o catálogo. Los distribuidores frecuentemente le pegan "
+                        "ENCIMA de la foto original su propia publicidad: logo de su empresa (esquina), "
+                        "sello/badge de garantía ('1 YEAR', 'GENUINE', 'AUTHENTIC'), y una franja con su "
+                        "nombre comercial, teléfono/'Hotline' y sitio web. TODO eso cuenta como marca de "
+                        "agua/overlay que hay que detectar, AUNQUE se vea integrado como parte del diseño "
+                        "de la imagen (fondo de color, franjas, badges) — el criterio es: ¿esa info "
+                        "identifica al DISTRIBUIDOR/vendedor (no al fabricante del producto)? Si sí, es "
+                        "overlay.\n\n"
+                        "NO cuenta: texto/logo que está IMPRESO FÍSICAMENTE en la pieza o su etiqueta/"
+                        "nameplate original del FABRICANTE (grabado, moldeado, o en la etiqueta del "
+                        "producto tal cual sale de fábrica).\n\n"
+                        "¿Esta imagen tiene overlay de distribuidor/reseller (logo propio, badge de "
+                        "garantía, franja con teléfono o sitio web del vendedor)? Responde SOLO 'SI' o 'NO'."
                     )},
                 ],
             }],
