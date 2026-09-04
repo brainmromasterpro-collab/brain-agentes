@@ -344,9 +344,14 @@ Return ONLY this JSON (no extra text):
 def buscar_producto_por_codigo(modelo: str) -> tuple[str | None, list[str]]:
     """
     Busca un producto existente en 1CRM por manufacturers_part_no.
-    Nota: el API REST de esta instancia NO filtra correctamente por search[]
-    (ignora los parámetros y devuelve todos los productos paginados).
-    Por eso buscamos por nombre que sí incluye el número de parte.
+
+    HALLAZGO EN VIVO (2026-08-19): `search[manufacturers_part_no]`/`search[name]` NO filtran de
+    verdad — devuelven una página fija sin importar el parámetro (mismo síntoma que otros campos
+    `search[x]`/`filters[x]` ya documentados en el proyecto). Con un catálogo de 3000+ productos y
+    `max_num` topado en ~20 registros por esta API sin importar lo que se pida, ese método solo
+    veía una rebanada arbitraria del catálogo — confirmado que NO encontraba un producto real de
+    una página lejana (offset=1500) que sí existía. `filter_text` SÍ filtra de verdad (confirmado
+    con el mismo producto real) — es el único parámetro confiable para esto en este módulo.
 
     Devuelve (id_o_None, lista_de_diagnósticos).
     """
@@ -355,45 +360,20 @@ def buscar_producto_por_codigo(modelo: str) -> tuple[str | None, list[str]]:
     ep = f"data/{mod}"
     target = modelo.strip().upper()
 
-    # Intento A: buscar por nombre que contenga el número de parte
-    # (1CRM no filtra por product_code pero sí puede encontrar por nombre parcial)
     try:
-        result = onecrm_get(ep, {
-            "search[manufacturers_part_no]": modelo,
-            "max_num": 20,
-        })
+        result = onecrm_get(ep, {"filter_text": modelo, "max_num": 20})
         records = result.get("records") or []
-        diags.append(f"GET {ep} search manufacturers_part_no → {len(records)} registros")
+        diags.append(f"GET {ep} filter_text → {len(records)} registros")
         for rec in records:
             stored = (rec.get("manufacturers_part_no") or "").strip().upper()
-            # También revisar si el nombre contiene el número de parte
             name_has = target in (rec.get("name") or "").upper()
             if stored == target or name_has:
                 pid = rec.get("id")
                 if pid:
-                    log.info(f"Producto encontrado por manufacturers_part_no: id={pid}")
+                    log.info(f"Producto encontrado por filter_text: id={pid}")
                     return pid, diags
     except Exception as e:
-        diags.append(f"GET {ep} search ERR: {str(e)[:100]}")
-
-    # Intento B: buscar por nombre
-    try:
-        result = onecrm_get(ep, {
-            "search[name]": modelo,
-            "max_num": 20,
-        })
-        records = result.get("records") or []
-        diags.append(f"GET {ep} search name → {len(records)} registros")
-        for rec in records:
-            name_has = target in (rec.get("name") or "").upper()
-            mfr      = (rec.get("manufacturers_part_no") or "").strip().upper()
-            if name_has or mfr == target:
-                pid = rec.get("id")
-                if pid:
-                    log.info(f"Producto encontrado por nombre: id={pid}")
-                    return pid, diags
-    except Exception as e:
-        diags.append(f"GET {ep} search name ERR: {str(e)[:100]}")
+        diags.append(f"GET {ep} filter_text ERR: {str(e)[:100]}")
 
     log.warning(f"Producto '{modelo}' no encontrado en 1CRM. Diags: {diags}")
     return None, diags

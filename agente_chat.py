@@ -1399,7 +1399,11 @@ def tool_publicar_sin_imagen_rfq(rfq_id: str) -> dict:
 _CARAC_NO_TECNICA = re.compile(
     r'\b(stock|disponibilidad|availability|available|inventory|inventario|backorder|'
     r'lead\s*time|eta|env[íi]o|shipping|delivery|ship\s*date|fecha\s*de\s*env[íi]o|'
-    r'cantidad\s*disponible|quantity\s*available|units?\s*in\s*stock)\b',
+    r'cantidad\s*disponible|quantity\s*available|units?\s*in\s*stock|'
+    r'condici[oó]n|condition|item\s*condition|local\s*pickup|pickup|'
+    r'item\s*location|ubicaci[oó]n\s*del\s*(art[íi]culo|item)|seller\s*notes|'
+    r'notas?\s*del\s*vendedor|listing\s*type|tipo\s*de\s*(anuncio|publicaci[oó]n)|'
+    r'returns?\s*accepted|devoluci[oó]n(es)?\s*aceptad[oa]s?|return\s*policy)\b',
     re.IGNORECASE,
 )
 
@@ -1407,8 +1411,10 @@ _CARAC_NO_TECNICA = re.compile(
 def _filtrar_caracteristicas_no_tecnicas(caracteristicas: list | None) -> list:
     """Quita de la ficha técnica cualquier dato que NO sea especificación del producto en sí sino
     inventario/logística del proveedor en el momento de la extracción (stock disponible, fecha de
-    envío estimada, lead time, etc.) — eso cambia todo el tiempo y no debe quedar grabado en el
-    catálogo de 1CRM ni mostrarse como si fuera una spec técnica."""
+    envío estimada, lead time, etc.) o metadata propia del ANUNCIO/marketplace (condición del
+    artículo nuevo/usado, local pickup, ubicación del vendedor, política de devoluciones) — nada
+    de eso es una especificación técnica del producto y no debe quedar grabado en el catálogo de
+    1CRM ni mostrarse como si lo fuera."""
     out = []
     for c in (caracteristicas or []):
         etiqueta = str(c).split(":", 1)[0]
@@ -1830,8 +1836,24 @@ def _extraer_producto_link(url: str, diag: list | None = None) -> dict:
 
 def tool_extraer_producto_de_link(url: str) -> dict:
     """Extrae nombre, marca, part number, precio del proveedor, descripción e imagen de la
-    página de un producto (para publicarlo en 1CRM desde un link)."""
-    return _extraer_producto_link(url)
+    página de un producto (para publicarlo en 1CRM desde un link). SIEMPRE coteja el part_number
+    contra el catálogo real de 1CRM antes de devolver — si "ya_existe" viene true, NO ofrezcas
+    crear un producto nuevo: avisa que ya está publicado y da el link ("producto_existente_url")."""
+    r = _extraer_producto_link(url)
+    pn = (r or {}).get("part_number") or ""
+    if pn and not r.get("error"):
+        try:
+            import agente_publicador
+            pid, _diags = agente_publicador.buscar_producto_por_codigo(pn)
+            if pid:
+                r["ya_existe"] = True
+                r["producto_existente_id"] = pid
+                r["producto_existente_url"] = f"{ONECRM_BASE}/index.php?module=AOS_Products&action=DetailView&record={pid}"
+            else:
+                r["ya_existe"] = False
+        except Exception as e:
+            log.warning(f"Cotejo de duplicado en extraer_producto_de_link falló: {e}")
+    return r
 
 
 def _ajustar_imagen_500(content: bytes) -> bytes:
@@ -2646,7 +2668,7 @@ TOOLS: list[dict] = [
     },
     {
         "name": "extraer_producto_de_link",
-        "description": "Extrae los datos de un producto (nombre, marca, part number, precio del proveedor, descripción, imagen) desde la URL de una página de producto. Usar cuando el usuario pega un link de producto para publicarlo.",
+        "description": "Extrae los datos de un producto (nombre, marca, part number, precio del proveedor, descripción, imagen) desde la URL de una página de producto. Usar cuando el usuario pega un link de producto para publicarlo. YA COTEJA el part_number contra el catálogo real de 1CRM — revisa \"ya_existe\" en el resultado: si es true, el producto YA está publicado (link en \"producto_existente_url\") — avisa eso, NO ofrezcas crearlo de nuevo.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -3389,7 +3411,11 @@ vuelvas a traducir ni los reescribas. El nombre también en inglés si el tool l
    para decidir con la información a la vista. \
    - Si devuelve "error" (sitio protegido / sin datos): dilo claramente y ofrece que el usuario pegue los datos \
      manualmente (nombre, part number, marca, precio, imagen). NO publiques con datos inventados. \
-   - Si extrae bien: NO listes los datos como texto. En su lugar, emite EXACTAMENTE este marcador (el frontend lo \
+   - CRÍTICO — COTEJO DE DUPLICADO: extraer_producto_de_link YA cotejó el part_number contra el catálogo real de \
+     1CRM. Si "ya_existe" viene true, el producto YA ESTÁ PUBLICADO — NO muestres [PRODUCTO_PREVIEW] ni ofrezcas \
+     crearlo: avisa en una línea que ya existe, con el link de "producto_existente_url". Si el usuario pide \
+     explícitamente republicarlo/actualizarlo de todos modos, entonces sí sigue con la tarjeta normal. \
+   - Si extrae bien y NO existe: NO listes los datos como texto. En su lugar, emite EXACTAMENTE este marcador (el frontend lo \
      convierte en una tarjeta visual del producto), en una sola línea y con JSON válido: \
      [PRODUCTO_PREVIEW]{"nombre":"...","marca":"...","part_number":"...","precio_costo":"...","moneda":"...","descripcion":"...","caracteristicas":["...","..."],"imagen_url":"..."} \
      usando los valores tal cual los devolvió extraer_producto_de_link (copia el arreglo "caracteristicas" \
@@ -3405,8 +3431,10 @@ vuelvas a traducir ni los reescribas. El nombre también en inglés si el tool l
    Devuelve exactamente una cadena vacía como respuesta final.
 
 MÚLTIPLES LINKS (bulk): si hay VARIOS links (pegados, en un .txt, o en una imagen), EXTRAE cada uno con \
-extraer_producto_de_link (puedes llamarlo varias veces en la MISMA respuesta). Luego emite UN SOLO marcador, \
-en UNA sola línea y con JSON válido, con TODOS los productos: \
+extraer_producto_de_link (puedes llamarlo varias veces en la MISMA respuesta). CRÍTICO — mismo cotejo de duplicado \
+que en el link único: separa los que vinieron con "ya_existe":true — esos NO van en [PRODUCTOS_PREVIEW], avísalos \
+aparte en una línea con su link ("ya publicados: X, Y — <links>"). Con el resto (los que SÍ son nuevos) emite UN \
+SOLO marcador, en UNA sola línea y con JSON válido, con TODOS los productos: \
 [PRODUCTOS_PREVIEW]{"productos":[{"nombre":"...","marca":"...","part_number":"...","precio_costo":"...","moneda":"...","descripcion":"...","caracteristicas":["..."],"imagen_url":"...","url_origen":"..."}, {"...otro producto..."}]} \
 usando los valores tal cual los devolvió el extractor (copia caracteristicas completas; campo vacío = "" o []). \
 Para VARIOS NO uses [PRODUCTO_PREVIEW] singular ni [DECISION]: el widget de [PRODUCTOS_PREVIEW] ya muestra cada \
