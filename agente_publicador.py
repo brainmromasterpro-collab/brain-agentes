@@ -179,33 +179,77 @@ def get_crm_currency_id() -> str:
     return "-99"
 
 
-_crm_category_id: str | None = None  # module-level cache
+_crm_categorias_cache: list[dict] | None = None  # module-level cache — solo la LISTA, no la elección
 _crm_product_type_id: str | None = None  # module-level cache
 
 
-def get_crm_category_id() -> str | None:
+def _listar_categorias_crm() -> list[dict]:
     """
-    Fetch the first available product category UUID from 1CRM.
-    Required: this 1CRM instance has product_category_id NOT NULL with no default.
-    Caches the result for the process lifetime.
+    Fetch todas las categorías de producto disponibles en 1CRM ({id, name}).
+    Cachea la LISTA para la vida del proceso (el catálogo de categorías no cambia en caliente) —
+    a diferencia de la categoría ELEGIDA por producto, que nunca se cachea.
     """
-    global _crm_category_id
-    if _crm_category_id is not None:
-        return _crm_category_id
+    global _crm_categorias_cache
+    if _crm_categorias_cache is not None:
+        return _crm_categorias_cache
     for ep in ("data/ProductCategory", "data/ProductCategories", "data/AOS_Product_Categories"):
         try:
-            result = onecrm_get(ep, {"max_num": 5})
+            result = onecrm_get(ep, {"max_num": 50})
             records = result.get("records") or []
-            for rec in records:
-                cid = rec.get("id")
-                if cid:
-                    log.info(f"Category ID obtenido de {ep}: {cid} ({rec.get('name', '?')})")
-                    _crm_category_id = cid
-                    return cid
+            cats = [{"id": rec.get("id"), "name": rec.get("name", "")} for rec in records if rec.get("id")]
+            if cats:
+                log.info(f"Categorías obtenidas de {ep}: {len(cats)}")
+                _crm_categorias_cache = cats
+                return cats
         except Exception as e:
-            log.warning(f"No se pudo obtener category de {ep}: {e}")
-    log.error("product_category_id no disponible — el POST fallará (MySQL 1364)")
-    return None
+            log.warning(f"No se pudo obtener categorías de {ep}: {e}")
+    log.error("Sin categorías disponibles — el POST fallará (MySQL 1364)")
+    _crm_categorias_cache = []
+    return []
+
+
+def get_crm_category_id(ficha: dict | None = None) -> str | None:
+    """
+    Devuelve el ID de la categoría más apropiada para el producto en `ficha` (nombre/descripcion).
+    Clasifica con Claude entre las categorías reales de 1CRM (nunca inventa una nueva).
+    Sin `ficha` (ej. precarga de arranque), devuelve simplemente la primera categoría disponible.
+    """
+    categorias = _listar_categorias_crm()
+    if not categorias:
+        return None
+    if not ficha:
+        return categorias[0]["id"]
+
+    nombres = [c["name"] for c in categorias]
+    prompt = f"""Classify this industrial/MRO product into EXACTLY ONE of the following categories
+(reply with the category name EXACTLY as written, nothing else):
+
+{chr(10).join(f"- {n}" for n in nombres)}
+
+Product name: {ficha.get('nombre', '')}
+Description: {ficha.get('descripcion', '')}
+
+Reply with ONLY the category name from the list above that best fits this product."""
+
+    try:
+        cfg = get_config("publicador")
+        response = claude.messages.create(
+            model=cfg["model_id"],
+            max_tokens=50,
+            temperature=0,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        _add_usage(response)
+        elegida = response.content[0].text.strip()
+        for c in categorias:
+            if c["name"].strip().lower() == elegida.lower():
+                log.info(f"Categoría clasificada: {c['name']} ({c['id']}) para '{ficha.get('nombre', '')[:50]}'")
+                return c["id"]
+        log.warning(f"Clasificación '{elegida}' no coincide con ninguna categoría real — usando primera")
+    except Exception as e:
+        log.warning(f"No se pudo clasificar categoría con Claude: {e} — usando primera")
+
+    return categorias[0]["id"]
 
 
 def get_crm_product_type_id() -> str | None:
@@ -507,8 +551,8 @@ def crear_producto_en_crm(ficha: dict, modelo: str) -> str:
     else:
         log.error("⚠ Sin product_type_id — el producto podría ir a tabla incorrecta")
 
-    # product_category_id: NOT NULL sin default en esta instancia
-    category_id = get_crm_category_id()
+    # product_category_id: NOT NULL sin default en esta instancia — clasificado por producto, no cacheado
+    category_id = get_crm_category_id(ficha)
     if category_id:
         payload["product_category_id"] = category_id
         log.info(f"product_category_id={category_id}")

@@ -1543,9 +1543,60 @@ def _extraer_producto_ebay_serpapi(url: str, item_id: str, dominio: str = "ebay.
         "precio_costo": precio_costo,
         "moneda": moneda_ebay or "USD",
         "descripcion": (prod.get("short_description") or "")[:600],
-        "caracteristicas": _filtrar_caracteristicas_no_tecnicas(caracteristicas)[:14],
+        "caracteristicas": _filtrar_caracteristicas_no_tecnicas(caracteristicas),
         "imagen_url": imagenes[0] if imagenes else "",
     }
+
+
+def _traducir(prod: dict) -> dict:
+    """Traduce nombre + descripción + características al INGLÉS con Haiku (rápido), para NO cargar
+    la llamada principal del chat (que tiene el system prompt gigante). Fallback: datos originales.
+    A NIVEL DE MÓDULO (no anidada) — antes vivía anidada dentro de _extraer_producto_link y el
+    camino de eBay (con su propio return temprano) se la saltaba por completo, dejando fichas con
+    el idioma original del listing mezclado con el resto del flujo en inglés (bug real, confirmado)."""
+    if not prod or not prod.get("ok"):
+        return prod
+    prod["caracteristicas"] = prod.get("caracteristicas") or []
+    nombre = prod.get("nombre") or ""
+    desc = prod.get("descripcion") or ""
+    carac = prod.get("caracteristicas") or []
+    if not nombre and not desc and not carac:
+        return prod
+    try:
+        payload = json.dumps({"nombre": nombre, "descripcion": desc, "caracteristicas": carac}, ensure_ascii=False)
+        resp = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=4000,
+            timeout=40,
+            system=(
+                "Recibes un JSON de producto (nombre, descripcion, caracteristicas). Haz DOS cosas:\n"
+                "1) Traduce TODO al INGLÉS. Conserva intactos part numbers, códigos, números y unidades "
+                "(420 bar, 18.58 kg, R900938249, ISO 7368, NBR, M12×1, IP67, PNP).\n"
+                "2) Si la 'descripcion' trae specs técnicas embebidas como pares 'Etiqueta: valor' "
+                "(p.ej. 'Dimension: 32 x 20 x 8 mm, Range: 5 mm, Switching output: PNP NO, "
+                "Housing material: Stainless steel, Connection: Cable with connector, M12×1-Male, 4-pin'), "
+                "SEPÁRALAS: mételas en 'caracteristicas' como arreglo de strings 'Label: value' (una por spec, "
+                "respetando valores que llevan comas), y deja en 'descripcion' SOLO la descripción general del "
+                "producto (la parte introductoria), SIN la lista de specs y SIN líneas de precio/'list price'.\n"
+                "Combina con las caracteristicas que ya existan, sin duplicar.\n"
+                "CRÍTICO: SIEMPRE incluye las TRES claves en tu respuesta, incluso 'nombre' si ya estaba en "
+                "inglés o no cambió — nunca la omitas ni la dejes vacía, o el nombre se queda en el idioma "
+                "original mezclado con el resto ya traducido.\n"
+                "Responde SOLO JSON válido con las claves: nombre (string), descripcion (string), "
+                "caracteristicas (array de strings)."),
+            messages=[{"role": "user", "content": payload}],
+        )
+        txt = resp.content[0].text if resp.content else ""
+        m = re.search(r'\{[\s\S]*\}', txt)
+        if m:
+            data = json.loads(m.group(0))
+            if data.get("nombre"):         prod["nombre"] = data["nombre"]
+            if data.get("descripcion"):    prod["descripcion"] = data["descripcion"]
+            if isinstance(data.get("caracteristicas"), list) and data["caracteristicas"]:
+                prod["caracteristicas"] = [str(c) for c in data["caracteristicas"]]
+    except Exception as e:
+        log.warning(f"Traducción de producto falló, se usa original: {e}")
+    return prod
 
 
 def _extraer_producto_link(url: str, diag: list | None = None) -> dict:
@@ -1561,7 +1612,10 @@ def _extraer_producto_link(url: str, diag: list | None = None) -> dict:
     if m_ebay:
         r_ebay = _extraer_producto_ebay_serpapi(url, m_ebay.group(2), m_ebay.group(1), diag)
         if r_ebay:
-            return r_ebay
+            # BUG REAL (confirmado): este return se saltaba _traducir por completo — un eBay.mx
+            # o cualquier TLD no-US quedaba con título/specs en el idioma original del listing,
+            # mezclado con el resto del flujo que sí espera todo en inglés.
+            return _traducir(r_ebay)
         # SerpAPI no disponible o sin resultado → sigue el intento genérico de abajo (poco
         # probable que funcione en eBay, pero no cuesta nada intentarlo).
     hdrs = {
@@ -1636,7 +1690,7 @@ def _extraer_producto_link(url: str, diag: list | None = None) -> dict:
             "precio_costo": meta("product:price:amount") or offers.get("price") or "",
             "moneda":       meta("product:price:currency") or offers.get("priceCurrency") or "",
             "descripcion":  (ld.get("description") or meta("og:description") or "")[:600],
-            "caracteristicas": _filtrar_caracteristicas_no_tecnicas(caracteristicas)[:14],
+            "caracteristicas": _filtrar_caracteristicas_no_tecnicas(caracteristicas),
             "imagen_url":   img or meta("og:image") or "",
         }
 
@@ -1651,50 +1705,6 @@ def _extraer_producto_link(url: str, diag: list | None = None) -> dict:
     # (browser=true / render_js=true) es LENTO (~35-56s); por eso se intenta PRIMERO sin render
     # (rápido, ~4s, sirve para la mayoría) y solo se cae al render si no trae datos (sitios JS
     # como Festo). Sin la env var → fetch directo (sitios abiertos).
-    def _traducir(prod):
-        """Traduce descripción + características al INGLÉS con Haiku (rápido), para NO cargar la
-        llamada principal del chat (que tiene el system prompt gigante). Fallback: datos originales."""
-        if not prod or not prod.get("ok"):
-            return prod
-        prod["caracteristicas"] = (prod.get("caracteristicas") or [])[:8]  # menos specs = más rápido
-        nombre = prod.get("nombre") or ""
-        desc = prod.get("descripcion") or ""
-        carac = prod.get("caracteristicas") or []
-        if not nombre and not desc and not carac:
-            return prod
-        try:
-            payload = json.dumps({"nombre": nombre, "descripcion": desc, "caracteristicas": carac}, ensure_ascii=False)
-            resp = claude.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=1600,
-                timeout=25,
-                system=(
-                    "Recibes un JSON de producto (nombre, descripcion, caracteristicas). Haz DOS cosas:\n"
-                    "1) Traduce TODO al INGLÉS. Conserva intactos part numbers, códigos, números y unidades "
-                    "(420 bar, 18.58 kg, R900938249, ISO 7368, NBR, M12×1, IP67, PNP).\n"
-                    "2) Si la 'descripcion' trae specs técnicas embebidas como pares 'Etiqueta: valor' "
-                    "(p.ej. 'Dimension: 32 x 20 x 8 mm, Range: 5 mm, Switching output: PNP NO, "
-                    "Housing material: Stainless steel, Connection: Cable with connector, M12×1-Male, 4-pin'), "
-                    "SEPÁRALAS: mételas en 'caracteristicas' como arreglo de strings 'Label: value' (una por spec, "
-                    "respetando valores que llevan comas), y deja en 'descripcion' SOLO la descripción general del "
-                    "producto (la parte introductoria), SIN la lista de specs y SIN líneas de precio/'list price'.\n"
-                    "Combina con las caracteristicas que ya existan, sin duplicar.\n"
-                    "Responde SOLO JSON válido con las claves: nombre (string), descripcion (string), "
-                    "caracteristicas (array de strings)."),
-                messages=[{"role": "user", "content": payload}],
-            )
-            txt = resp.content[0].text if resp.content else ""
-            m = _re.search(r'\{[\s\S]*\}', txt)
-            if m:
-                data = json.loads(m.group(0))
-                if data.get("nombre"):         prod["nombre"] = data["nombre"]
-                if data.get("descripcion"):    prod["descripcion"] = data["descripcion"]
-                if isinstance(data.get("caracteristicas"), list) and data["caracteristicas"]:
-                    prod["caracteristicas"] = [str(c) for c in data["caracteristicas"]][:14]
-        except Exception as e:
-            log.warning(f"Traducción de producto falló, se usa original: {e}")
-        return prod
-
     def _parse_llm(html: str):
         """Fallback cuando el sitio NO expone datos estructurados (JSON-LD/og), como Futek: extrae
         los campos del producto con Haiku a partir del título, h1, meta description, texto visible y
@@ -1723,7 +1733,7 @@ def _extraer_producto_link(url: str, diag: list | None = None) -> dict:
             payload = json.dumps({"url": url, "title": title, "h1": h1, "meta_description": mdesc,
                                   "image_candidates": cands, "page_text": visible}, ensure_ascii=False)
             resp = claude.messages.create(
-                model="claude-haiku-4-5-20251001", max_tokens=1500, timeout=30,
+                model="claude-haiku-4-5-20251001", max_tokens=3000, timeout=35,
                 system=(
                     "Extrae los datos de UN producto industrial de la página. Responde SOLO JSON con las claves: "
                     "nombre, part_number, marca, precio_costo (''si no hay precio visible), moneda, descripcion "
@@ -1731,7 +1741,9 @@ def _extraer_producto_link(url: str, diag: list | None = None) -> dict:
                     "título o de la URL; marca = fabricante (p.ej. Futek); NO inventes precio si la página no lo "
                     "muestra (deja ''); imagen_url = la FOTO principal del producto elegida de image_candidates "
                     "(NUNCA iconos ni logos); si ninguna candidata es la foto del producto, deja imagen_url ''. "
-                    "Conserva part numbers, códigos, números y unidades intactos."),
+                    "Conserva part numbers, códigos, números y unidades intactos. En 'caracteristicas' incluye "
+                    "TODAS las especificaciones técnicas que encuentres en el texto (dimensiones, materiales, "
+                    "rangos, tolerancias, certificaciones, etc.) — no te limites a unas pocas."),
                 messages=[{"role": "user", "content": payload}],
             )
             m = _re.search(r'\{[\s\S]*\}', resp.content[0].text if resp.content else "")
@@ -1745,7 +1757,7 @@ def _extraer_producto_link(url: str, diag: list | None = None) -> dict:
                 "ok": True, "url": url, "nombre": d.get("nombre", ""), "marca": d.get("marca", ""),
                 "part_number": d.get("part_number", ""), "precio_costo": d.get("precio_costo", "") or "",
                 "moneda": d.get("moneda", "") or "", "descripcion": (d.get("descripcion", "") or "")[:600],
-                "caracteristicas": _filtrar_caracteristicas_no_tecnicas([str(c) for c in (d.get("caracteristicas") or [])])[:14],
+                "caracteristicas": _filtrar_caracteristicas_no_tecnicas([str(c) for c in (d.get("caracteristicas") or [])]),
                 "imagen_url": d.get("imagen_url", "") or "",
             }
         except Exception as e:
@@ -2010,7 +2022,22 @@ def _subir_logo_fallback(part_number: str, marca: str) -> str | None:
         return None
 
 
-def _procesar_imagen_producto(content: bytes | None, marca: str = "", modelo: str = "") -> bytes | None:
+def _remover_fondo_producto(content: bytes, imagen_url: str = "") -> bytes:
+    """Quita el fondo de la foto (Remove.bg) antes de ajustarla a 500x500 — BUG REAL confirmado:
+    el camino normal (foto sin marca de agua, el caso más común) nunca pasaba por Remove.bg, así
+    que el fondo original de la foto scrapeada quedaba visible dentro del padding blanco de
+    _ajustar_imagen_500 (efecto "marco"). Fallback silencioso al content original si no hay
+    REMOVEBG_API_KEY o la llamada falla — nunca bloquea la publicación por esto."""
+    try:
+        import agente_imagen
+        sin_fondo = agente_imagen.remover_fondo(content, imagen_url)
+        return sin_fondo or content
+    except Exception as e:
+        log.warning(f"Remove.bg falló, se usa la foto con su fondo original: {e}")
+        return content
+
+
+def _procesar_imagen_producto(content: bytes | None, marca: str = "", modelo: str = "", imagen_url: str = "") -> bytes | None:
     """Punto único de calidad de imagen para productos publicados desde link o ficha técnica PDF:
     1) si la foto trae marca de agua → busca reemplazo limpio en internet (Vision + Remove.bg).
     2) si no hay NINGUNA foto (ni la original ni un reemplazo) → logo del fabricante.
@@ -2028,6 +2055,7 @@ def _procesar_imagen_producto(content: bytes | None, marca: str = "", modelo: st
             log.warning(f"Chequeo/reemplazo de marca de agua falló, se usa la foto original: {e}")
 
     if content:
+        content = _remover_fondo_producto(content, imagen_url)
         return _ajustar_imagen_500(content)
 
     logo_marca = _buscar_logo_marca(marca)
@@ -2110,9 +2138,9 @@ def _rehost_imagen(imagen_url: str, part_number: str = "", marca: str = "") -> s
             return imagen_url
         content_type = r.headers.get("content-type", "image/jpeg").lower()
         try:
-            # Chequeo de calidad (marca de agua → reemplazo o logo) + ajuste a 500x500 (tamaño
-            # estándar) + normaliza a PNG de paso (1CRM no acepta WebP/AVIF/etc).
-            content = _procesar_imagen_producto(r.content, marca, part_number)
+            # Chequeo de calidad (marca de agua → reemplazo o logo) + quitar fondo (Remove.bg) +
+            # ajuste a 500x500 (tamaño estándar) + normaliza a PNG de paso (1CRM no acepta WebP/AVIF/etc).
+            content = _procesar_imagen_producto(r.content, marca, part_number, imagen_url)
             if not content:
                 # Ni la foto original servía (marca de agua) ni se encontró reemplazo/logo —
                 # mejor sin imagen que con una marcada.
@@ -2244,10 +2272,11 @@ def _publicar_producto_uno(
             _partes.append(_p)
     nombre_crm = " / ".join(_partes) if _partes else (nombre or part_number or "Producto")
 
-    # Descripción completa para 1CRM = descripción + ficha técnica (características)
+    # Descripción completa para 1CRM = descripción + ficha técnica (características).
+    # Sin bullets: una característica por línea, separadas solo por salto de línea.
     desc_full = descripcion or nombre
     if caracteristicas:
-        desc_full += "\n\nFicha técnica:\n" + "\n".join(f"• {c}" for c in caracteristicas)
+        desc_full += "\n\nFicha técnica:\n" + "\n".join(str(c) for c in caracteristicas)
     now = datetime.now(timezone.utc)
     rfq_id_str = f"LINK-{now.year}-{now.month:02d}{now.day:02d}-{str(uuid.uuid4())[:6].upper()}"
     # Re-hospedar la imagen en Supabase (sitios como Festo bloquean la descarga directa del
