@@ -1846,12 +1846,60 @@ def _extraer_producto_link(url: str, diag: list | None = None) -> dict:
     return _traducir(parsed) if parsed else {"error": "No encontré datos de producto en el link (¿es una página de producto?)."}
 
 
+def _rehost_imagen_preview(imagen_url: str) -> str:
+    """Descarga la imagen del sitio de origen y la re-hospeda en Supabase Storage TAL CUAL (sin
+    Remove.bg ni resize — eso solo corre una vez, al publicar de verdad, para no gastar la API de
+    Remove.bg en previews que el usuario puede rechazar). BUG REAL confirmado: el [PRODUCTO_PREVIEW]
+    mostraba el ícono de imagen rota porque el navegador intentaba cargar DIRECTO la URL del sitio
+    de origen (ej. pepperl-fuchs.com) — muchos fabricantes bloquean el hotlink desde un dominio
+    ajeno (nuestra propia página), aunque el backend SÍ puede descargarla server-side sin ese
+    bloqueo. Mismo patrón de descarga con fallback a proxy que ya usa _rehost_imagen (Festo y
+    similares bloquean IPs de datacenter). Si todo falla, devuelve la URL original (mejor intentar
+    mostrar algo que dejar el campo vacío)."""
+    if not imagen_url:
+        return imagen_url
+    from urllib.parse import quote_plus
+
+    def _dl(via_scraper: bool):
+        try:
+            if via_scraper:
+                sc = os.environ.get("SCRAPER_API_URL", "").strip()
+                if not sc:
+                    return None
+                fetch = sc.replace("browser=true", "browser=false").replace("render_js=true", "render_js=false")
+                return httpx.get(fetch.replace("{url}", quote_plus(imagen_url)), timeout=40)
+            return httpx.get(imagen_url, timeout=15, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"})
+        except Exception:
+            return None
+
+    try:
+        r = _dl(False)
+        if not (r is not None and r.status_code == 200 and "image" in r.headers.get("content-type", "").lower()):
+            r = _dl(True)
+        if not (r is not None and r.status_code == 200 and "image" in r.headers.get("content-type", "").lower()):
+            return imagen_url
+        from PIL import Image
+        import io as _io
+        im = Image.open(_io.BytesIO(r.content))
+        im = im.convert("RGBA" if "A" in im.mode else "RGB")
+        buf = _io.BytesIO()
+        im.save(buf, format="PNG")
+        return _subir_imagen_bytes(buf.getvalue(), "preview", "producto")
+    except Exception as e:
+        log.warning(f"No se pudo rehost la imagen para preview ({imagen_url[:60]}): {e}")
+        return imagen_url
+
+
 def tool_extraer_producto_de_link(url: str) -> dict:
     """Extrae nombre, marca, part number, precio del proveedor, descripción e imagen de la
     página de un producto (para publicarlo en 1CRM desde un link). SIEMPRE coteja el part_number
     contra el catálogo real de 1CRM antes de devolver — si "ya_existe" viene true, NO ofrezcas
     crear un producto nuevo: avisa que ya está publicado y da el link ("producto_existente_url")."""
     r = _extraer_producto_link(url)
+    if r and not r.get("error") and r.get("imagen_url"):
+        # Re-hospeda para que el [PRODUCTO_PREVIEW] pueda cargar la imagen en el navegador del
+        # usuario (ver _rehost_imagen_preview) — la URL original del sitio suele bloquear el hotlink.
+        r["imagen_url"] = _rehost_imagen_preview(r["imagen_url"])
     pn = (r or {}).get("part_number") or ""
     if pn and not r.get("error"):
         try:
