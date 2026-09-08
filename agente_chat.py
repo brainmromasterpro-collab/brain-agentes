@@ -1846,16 +1846,23 @@ def _extraer_producto_link(url: str, diag: list | None = None) -> dict:
     return _traducir(parsed) if parsed else {"error": "No encontré datos de producto en el link (¿es una página de producto?)."}
 
 
-def _rehost_imagen_preview(imagen_url: str) -> str:
-    """Descarga la imagen del sitio de origen y la re-hospeda en Supabase Storage TAL CUAL (sin
-    Remove.bg ni resize — eso solo corre una vez, al publicar de verdad, para no gastar la API de
-    Remove.bg en previews que el usuario puede rechazar). BUG REAL confirmado: el [PRODUCTO_PREVIEW]
-    mostraba el ícono de imagen rota porque el navegador intentaba cargar DIRECTO la URL del sitio
-    de origen (ej. pepperl-fuchs.com) — muchos fabricantes bloquean el hotlink desde un dominio
-    ajeno (nuestra propia página), aunque el backend SÍ puede descargarla server-side sin ese
-    bloqueo. Mismo patrón de descarga con fallback a proxy que ya usa _rehost_imagen (Festo y
-    similares bloquean IPs de datacenter). Si todo falla, devuelve la URL original (mejor intentar
-    mostrar algo que dejar el campo vacío)."""
+def _rehost_imagen_preview(imagen_url: str, marca: str = "", part_number: str = "") -> str:
+    """Descarga la imagen del sitio de origen, le corre el MISMO chequeo de calidad que la
+    publicación real (marca de agua → reemplazo, Remove.bg, resize a 500x500 — ver
+    _procesar_imagen_producto) y la sube a Supabase Storage bajo el prefijo 'link-preview/'.
+
+    BUG REAL #1 (ya arreglado antes): el [PRODUCTO_PREVIEW] mostraba el ícono de imagen rota porque
+    el navegador intentaba cargar DIRECTO la URL del sitio de origen — muchos fabricantes bloquean
+    el hotlink desde un dominio ajeno. Se arregló re-hosteando a Supabase, pero solo con una copia
+    TAL CUAL (sin procesar), así que el preview mostraba el fondo/marca de agua sin recortar aunque
+    la imagen sí cargara — Gabriel lo reportó de nuevo con la misma captura. Ahora corre el
+    procesamiento COMPLETO aquí mismo, así el preview es EXACTAMENTE la imagen final (WYSIWYG) en
+    vez de la foto cruda. El prefijo 'link-preview/' es la marca que _rehost_imagen (al publicar)
+    usa para NO volver a correr Remove.bg/Vision sobre una imagen que ya se procesó aquí — evita
+    pagar esa API dos veces por el mismo producto.
+
+    Mismo patrón de descarga con fallback a proxy que ya usa _rehost_imagen (Festo y similares
+    bloquean IPs de datacenter). Si todo falla, devuelve la URL original."""
     if not imagen_url:
         return imagen_url
     from urllib.parse import quote_plus
@@ -1872,21 +1879,28 @@ def _rehost_imagen_preview(imagen_url: str) -> str:
         except Exception:
             return None
 
+    def _ok(r):
+        return r is not None and r.status_code == 200 and "image" in r.headers.get("content-type", "").lower()
+
     try:
         r = _dl(False)
-        if not (r is not None and r.status_code == 200 and "image" in r.headers.get("content-type", "").lower()):
+        if not _ok(r):
             r = _dl(True)
-        if not (r is not None and r.status_code == 200 and "image" in r.headers.get("content-type", "").lower()):
+        if not _ok(r):
             return imagen_url
-        from PIL import Image
-        import io as _io
-        im = Image.open(_io.BytesIO(r.content))
-        im = im.convert("RGBA" if "A" in im.mode else "RGB")
-        buf = _io.BytesIO()
-        im.save(buf, format="PNG")
-        return _subir_imagen_bytes(buf.getvalue(), "preview", "producto")
+        content = _procesar_imagen_producto(r.content, marca, part_number, imagen_url)
+        if not content:
+            # Ni la foto original servía (marca de agua sin reemplazo) ni hay logo — sin imagen
+            # es mejor que mostrar una marcada en el preview.
+            return ""
+        safe = (part_number or "producto").replace("/", "-").replace(" ", "_")
+        path = f"link-preview/{safe}_{str(uuid.uuid4())[:6]}.png"
+        supabase.storage.from_("product-images").upload(
+            path=path, file=content, file_options={"content-type": "image/png", "upsert": "true"},
+        )
+        return supabase.storage.from_("product-images").get_public_url(path)
     except Exception as e:
-        log.warning(f"No se pudo rehost la imagen para preview ({imagen_url[:60]}): {e}")
+        log.warning(f"No se pudo rehost/procesar la imagen para preview ({imagen_url[:60]}): {e}")
         return imagen_url
 
 
@@ -1897,9 +1911,9 @@ def tool_extraer_producto_de_link(url: str) -> dict:
     crear un producto nuevo: avisa que ya está publicado y da el link ("producto_existente_url")."""
     r = _extraer_producto_link(url)
     if r and not r.get("error") and r.get("imagen_url"):
-        # Re-hospeda para que el [PRODUCTO_PREVIEW] pueda cargar la imagen en el navegador del
-        # usuario (ver _rehost_imagen_preview) — la URL original del sitio suele bloquear el hotlink.
-        r["imagen_url"] = _rehost_imagen_preview(r["imagen_url"])
+        # Procesa (marca de agua/Remove.bg/resize) y re-hospeda para que el [PRODUCTO_PREVIEW]
+        # muestre la imagen FINAL — ver _rehost_imagen_preview.
+        r["imagen_url"] = _rehost_imagen_preview(r["imagen_url"], r.get("marca", ""), r.get("part_number", ""))
     pn = (r or {}).get("part_number") or ""
     if pn and not r.get("error"):
         try:
@@ -2180,6 +2194,10 @@ def _rehost_imagen(imagen_url: str, part_number: str = "", marca: str = "") -> s
     falla, se reintenta vía ScrapingAnt (proxy residencial). Si todo falla, devuelve la URL
     original (el publicador hará su propio fallback)."""
     if not imagen_url:
+        return imagen_url
+    if "/product-images/" in imagen_url and "/link-preview/" in imagen_url:
+        # Ya se procesó (marca de agua/Remove.bg/resize) en _rehost_imagen_preview al mostrar el
+        # [PRODUCTO_PREVIEW] — no volver a pagar Remove.bg/Vision por el mismo producto.
         return imagen_url
     from urllib.parse import quote_plus
 
