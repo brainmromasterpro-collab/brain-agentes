@@ -1922,6 +1922,12 @@ def tool_extraer_producto_de_link(url: str) -> dict:
         # Procesa (marca de agua/Remove.bg/resize) y re-hospeda para que el [PRODUCTO_PREVIEW]
         # muestre la imagen FINAL — ver _rehost_imagen_preview.
         r["imagen_url"] = _rehost_imagen_preview(r["imagen_url"], r.get("marca", ""), r.get("part_number", ""))
+    if r and not r.get("error"):
+        # Título FINAL (modelo/marca/descripción corta) ya aquí, no solo al publicar — así el
+        # [PRODUCTO_PREVIEW] que ve el usuario muestra EXACTAMENTE el título que va a quedar en
+        # 1CRM (antes el preview mostraba el 'nombre' crudo del sitio de origen, distinto del que
+        # de verdad se guardaba al aprobar). Ver _construir_titulo_producto.
+        r["nombre"] = _construir_titulo_producto(r.get("part_number", ""), r.get("marca", ""), r.get("descripcion", ""), r.get("nombre", ""))
     pn = (r or {}).get("part_number") or ""
     if pn and not r.get("error"):
         try:
@@ -2192,6 +2198,14 @@ def tool_extraer_ficha_pdf(url: str) -> dict:
             log.info(f"Imagen de ficha técnica lista (500x500) y re-hospedada: {img_url[:70]}")
     except Exception as e:
         log.warning(f"No se pudo procesar/subir la imagen de la ficha técnica: {e}")
+
+    # Mismas reglas de título y de contenido que el flujo de link (MODO 13): este extractor de PDF
+    # se usa TANTO en 'publicacion' como en 'busquedas' (stream de búsqueda de partes) — el usuario
+    # pidió que la información mostrada siga las mismas reglas sin importar de dónde salió.
+    for p in productos:
+        p["nombre"] = _construir_titulo_producto(p.get("part_number", ""), p.get("marca", ""), p.get("descripcion", ""), p.get("nombre", ""))
+        if p.get("caracteristicas"):
+            p["caracteristicas"] = _filtrar_caracteristicas_no_tecnicas(p["caracteristicas"])
     return datos
 
 
@@ -2346,18 +2360,16 @@ def _resumen_corto(texto: str, max_len: int = 100) -> str:
     return texto[:max_len].rsplit(" ", 1)[0].rstrip(".,;:") + "…"
 
 
-def _publicar_producto_uno(
-    bulk_id: str, clean_stream, nombre: str, part_number: str, marca: str = "",
-    descripcion: str = "", caracteristicas: list | None = None, precio_costo: float = 0,
-    imagen_url: str = "", url_origen: str = "",
-) -> dict:
-    """Crea el rfq + job del publicador para UN producto extraído de link, bajo el bulk_id dado.
-    Lo comparten el flujo de 1 link y el de N links (bulk). Devuelve {rfq_id, job_id, nombre_crm}."""
-    # Título para 1CRM en el ORDEN pedido por Gabriel: modelo (part number) / marca / descripción
-    # CORTA — SIN el 'nombre' que trae el extractor (se descarta a propósito: mezclar el nombre del
-    # sitio de origen con la descripción corta duplicaba información y alargaba el título). La
-    # descripción corta sale de 'descripcion', no de 'nombre'.
-    # (se omiten partes vacías o repetidas — p.ej. si la descripción corta == part number).
+def _construir_titulo_producto(part_number: str, marca: str = "", descripcion: str = "", nombre_fallback: str = "") -> str:
+    """Título para 1CRM en el ORDEN pedido por Gabriel: modelo (part number) / marca / descripción
+    CORTA — SIN el 'nombre' que trae el extractor (se descarta a propósito: mezclar el nombre del
+    sitio de origen con la descripción corta duplicaba información y alargaba el título). La
+    descripción corta sale de 'descripcion', no de 'nombre'.
+    (se omiten partes vacías o repetidas — p.ej. si la descripción corta == part number).
+
+    Un solo punto de verdad para el título: se llama tanto al EXTRAER (para que el [PRODUCTO_PREVIEW]
+    que ve el usuario ya muestre el título final, no uno distinto del que termina en 1CRM) como al
+    PUBLICAR — así preview y resultado real siempre coinciden."""
     _seen: set = set()
     _partes: list = []
     for _p in (part_number, marca, _resumen_corto(descripcion)):
@@ -2365,7 +2377,17 @@ def _publicar_producto_uno(
         if _p and _p.lower() not in _seen:
             _seen.add(_p.lower())
             _partes.append(_p)
-    nombre_crm = " / ".join(_partes) if _partes else (nombre or part_number or "Producto")
+    return " / ".join(_partes) if _partes else (nombre_fallback or part_number or "Producto")
+
+
+def _publicar_producto_uno(
+    bulk_id: str, clean_stream, nombre: str, part_number: str, marca: str = "",
+    descripcion: str = "", caracteristicas: list | None = None, precio_costo: float = 0,
+    imagen_url: str = "", url_origen: str = "",
+) -> dict:
+    """Crea el rfq + job del publicador para UN producto extraído de link, bajo el bulk_id dado.
+    Lo comparten el flujo de 1 link y el de N links (bulk). Devuelve {rfq_id, job_id, nombre_crm}."""
+    nombre_crm = _construir_titulo_producto(part_number, marca, descripcion, nombre)
 
     # Descripción completa para 1CRM = descripción + ficha técnica (características).
     # Sin bullets: una característica por línea, separadas solo por salto de línea.

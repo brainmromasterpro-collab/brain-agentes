@@ -57,6 +57,10 @@ _NORM_SYS = (
     "- Copia part numbers, códigos y unidades EXACTAMENTE como aparecen (mayúsculas, guiones, decimales).\n"
     "- precio_costo NO suele aparecer en un datasheet: déjalo \"\" salvo que el documento SÍ muestre un "
     "precio explícito.\n"
+    "- 'descripcion' y 'caracteristicas' son SOLO especificaciones/características técnicas del "
+    "producto. NUNCA incluyas condición del artículo (nuevo/usado), garantía, tiempo de entrega/lead "
+    "time, stock/disponibilidad, ni ubicación del vendedor/almacén — si el documento trae algo de eso, "
+    "simplemente omítelo, no es una especificación del producto.\n"
     "- Si el texto NO parece una ficha técnica de producto, devuelve productos:[] y explica en notas."
 )
 
