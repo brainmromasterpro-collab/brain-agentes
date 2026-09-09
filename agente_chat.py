@@ -1399,11 +1399,14 @@ def tool_publicar_sin_imagen_rfq(rfq_id: str) -> dict:
 _CARAC_NO_TECNICA = re.compile(
     r'\b(stock|disponibilidad|availability|available|inventory|inventario|backorder|'
     r'lead\s*time|eta|env[íi]o|shipping|delivery|ship\s*date|fecha\s*de\s*env[íi]o|'
-    r'cantidad\s*disponible|quantity\s*available|units?\s*in\s*stock|'
+    r'tiempo\s*de\s*entrega|cantidad\s*disponible|quantity\s*available|units?\s*in\s*stock|'
     r'condici[oó]n|condition|item\s*condition|local\s*pickup|pickup|'
-    r'item\s*location|ubicaci[oó]n\s*del\s*(art[íi]culo|item)|seller\s*notes|'
+    r'item\s*location|ubicaci[oó]n(\s*del\s*(art[íi]culo|item|vendedor))?|seller\s*notes|'
     r'notas?\s*del\s*vendedor|listing\s*type|tipo\s*de\s*(anuncio|publicaci[oó]n)|'
-    r'returns?\s*accepted|devoluci[oó]n(es)?\s*aceptad[oa]s?|return\s*policy)\b',
+    r'returns?\s*accepted|devoluci[oó]n(es)?\s*aceptad[oa]s?|return\s*policy|'
+    r'garant[íi]a|warranty|'
+    r'(item\s*|product\s*|part\s*|listing\s*|stock\s*)?estatus|'
+    r'(item\s*|product\s*|part\s*|listing\s*|stock\s*)status)\b',
     re.IGNORECASE,
 )
 
@@ -1578,6 +1581,11 @@ def _traducir(prod: dict) -> dict:
                 "SEPÁRALAS: mételas en 'caracteristicas' como arreglo de strings 'Label: value' (una por spec, "
                 "respetando valores que llevan comas), y deja en 'descripcion' SOLO la descripción general del "
                 "producto (la parte introductoria), SIN la lista de specs y SIN líneas de precio/'list price'.\n"
+                "3) La 'descripcion' final SOLO debe hablar de especificaciones/características técnicas del "
+                "producto — BORRA por completo (no las muevas a 'caracteristicas', simplemente elimínalas) "
+                "cualquier mención de: condición del artículo (nuevo/usado/reacondicionado), garantía/warranty, "
+                "tiempo de entrega/lead time/fecha de envío, stock/disponibilidad/inventario, y ubicación del "
+                "vendedor/almacén. Nada de eso es información técnica del producto.\n"
                 "Combina con las caracteristicas que ya existan, sin duplicar.\n"
                 "CRÍTICO: SIEMPRE incluye las TRES claves en tu respuesta, incluso 'nombre' si ya estaba en "
                 "inglés o no cambió — nunca la omitas ni la dejes vacía, o el nombre se queda en el idioma "
@@ -2345,13 +2353,14 @@ def _publicar_producto_uno(
 ) -> dict:
     """Crea el rfq + job del publicador para UN producto extraído de link, bajo el bulk_id dado.
     Lo comparten el flujo de 1 link y el de N links (bulk). Devuelve {rfq_id, job_id, nombre_crm}."""
-    # Nombre para 1CRM en el ORDEN: modelo (part number) / marca / nombre / descripción CORTA
-    # (último parámetro). La descripción corta se saca de 'descripcion' (no de 'nombre') para que
-    # el título quede parejo sin depender de qué tan descriptivo venga el nombre de cada extractor.
-    # (se omiten partes vacías o repetidas — p.ej. si el nombre extraído == part number).
+    # Título para 1CRM en el ORDEN pedido por Gabriel: modelo (part number) / marca / descripción
+    # CORTA — SIN el 'nombre' que trae el extractor (se descarta a propósito: mezclar el nombre del
+    # sitio de origen con la descripción corta duplicaba información y alargaba el título). La
+    # descripción corta sale de 'descripcion', no de 'nombre'.
+    # (se omiten partes vacías o repetidas — p.ej. si la descripción corta == part number).
     _seen: set = set()
     _partes: list = []
-    for _p in (part_number, marca, nombre, _resumen_corto(descripcion)):
+    for _p in (part_number, marca, _resumen_corto(descripcion)):
         _p = (_p or "").strip()
         if _p and _p.lower() not in _seen:
             _seen.add(_p.lower())
