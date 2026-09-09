@@ -2320,7 +2320,14 @@ def _estado_publicacion_reciente(part_number: str, clean_stream, minutos: int = 
       'en_curso'  → se está publicando AHORITA (job vivo, < _EN_CURSO_MIN) (bloquea).
       ''          → libre. Incluye el caso de un rfq ATORADO en 'publicando' (el worker nunca
                     tomó el job): eso NO se reporta como publicado y SÍ se deja reintentar.
-    """
+
+    BUG REAL confirmado por Gabriel: este guardia solo mira el historial de Supabase (rfqs), NO el
+    catálogo real de 1CRM. Si el usuario borra el producto directamente en 1CRM (a propósito o sin
+    querer) y luego pide recrearlo dentro de los `minutos` siguientes, este guardia seguía diciendo
+    'publicado' con el registro viejo — bloqueando una recreación legítima porque el HISTORIAL decía
+    que ya existía, aunque el CRM real ya NO lo tuviera. Antes de bloquear por 'publicado', se
+    verifica en vivo contra 1CRM (buscar_producto_por_codigo): si YA NO está ahí, el registro de
+    Supabase quedó obsoleto (se borró después) — no bloquea, deja reintentar."""
     if not part_number or not clean_stream:
         return ""
     try:
@@ -2333,6 +2340,14 @@ def _estado_publicacion_reciente(part_number: str, clean_stream, minutos: int = 
             return ""
         row = r.data[0]
         if (row.get("estado") or "") == "publicado":
+            try:
+                import agente_publicador
+                pid, _diags = agente_publicador.buscar_producto_por_codigo(part_number)
+                if not pid:
+                    log.info(f"'{part_number}' figura publicado en Supabase pero YA NO está en 1CRM — se permite recrear")
+                    return ""
+            except Exception as e:
+                log.warning(f"No se pudo verificar '{part_number}' contra 1CRM, se confía en Supabase: {e}")
             return "publicado"
         # 'publicando': solo cuenta si es reciente; si lleva rato, el job se atoró → permitir reintento.
         try:
@@ -3648,6 +3663,18 @@ Un producto ya aprobado/publicado NO se vuelve a publicar. Si el usuario dice al
 afirmativo suelto ("muy bien", "ok", "gracias", "perfecto", "excelente", "va") y NO hay un preview NUEVO \
 esperando su aprobación, es SOLO conversación: responde breve y NO llames a ninguna tool de publicar. Nunca \
 uses los datos de un [PRODUCTO_PREVIEW] anterior del historial para publicar de nuevo.
+
+EXCEPCIÓN — el usuario dice que YA NO ESTÁ en el CRM y pide recrearlo: la regla de arriba existe para \
+evitar duplicar por accidente (un "ok" suelto), NO para bloquear una recreación LEGÍTIMA cuando el \
+producto se borró de verdad (a propósito o sin querer) del catálogo. El HISTORIAL DEL CHAT NO ES LA \
+FUENTE DE VERDAD — el catálogo real de 1CRM sí. Si el usuario dice explícitamente que lo borró, que \
+"ya no está", o pide "vuelve a crearlo"/"publícalo otra vez" aunque el historial muestre que ya se \
+había publicado: verifica el estado REAL antes de decidir. Si tienes el link, vuelve a llamar \
+extraer_producto_de_link (ya trae el chequeo de "ya_existe" contra el catálogo ACTUAL, no contra el \
+historial) y confía en ESE resultado, no en lo que dice el chat. Si no tienes el link, usa \
+verificar_lista_productos con el part_number para confirmar. Si el CRM confirma que de verdad NO \
+está, procede normal: [PRODUCTO_PREVIEW] (con los mismos datos del historial si no hay link nuevo) + \
+[DECISION], como si fuera la primera vez.
 
 CRÍTICO: nunca publiques sin el [DECISION] aprobado. El precio del proveedor es interno (cost), no público.
 
