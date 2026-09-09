@@ -2380,6 +2380,41 @@ def _construir_titulo_producto(part_number: str, marca: str = "", descripcion: s
     return " / ".join(_partes) if _partes else (nombre_fallback or part_number or "Producto")
 
 
+def _construir_descripcion_html(descripcion: str, nombre: str, caracteristicas: list | None) -> str:
+    """Descripción para 1CRM en HTML — CRÍTICO: Product.description es tipo 'html' en 1CRM
+    (confirmado en vivo vía meta/fields/Product: {"type": "html", "dbType": "text", ...}). Antes se
+    armaba como texto plano con '\\n' entre líneas — 1CRM lo renderiza como HTML, así que los saltos
+    de línea de texto plano se COLAPSAN y toda la ficha técnica queda pegada en un solo bloque
+    corrido (bug real reportado por Gabriel, verificado con un producto de prueba creado y
+    borrado). Ahora arma <p> para la descripción general y una <table> de 2 columnas para la ficha
+    técnica — mismo layout de 2 columnas que ya se ve en el widget del [PRODUCTO_PREVIEW] del stream
+    (StreamArea.tsx, grid-cols-2), para que 1CRM se vea igual de organizado que el preview."""
+    import html as _html
+
+    def _fmt_carac(c) -> str:
+        s = str(c)
+        idx = s.find(":")
+        if idx > -1:
+            label, val = s[:idx], s[idx + 1:].strip()
+            return f"<b>{_html.escape(label)}:</b> {_html.escape(val)}"
+        return _html.escape(s)
+
+    texto = (descripcion or nombre or "").strip()
+    partes = [f"<p>{_html.escape(texto)}</p>"] if texto else []
+    if caracteristicas:
+        filas = []
+        for i in range(0, len(caracteristicas), 2):
+            izq = _fmt_carac(caracteristicas[i])
+            der = _fmt_carac(caracteristicas[i + 1]) if i + 1 < len(caracteristicas) else ""
+            filas.append(
+                f'<tr><td width="50%" style="padding:2px 12px 2px 0; vertical-align:top;">{izq}</td>'
+                f'<td width="50%" style="padding:2px 0; vertical-align:top;">{der}</td></tr>'
+            )
+        partes.append("<p><b>Ficha técnica</b></p>")
+        partes.append('<table border="0" cellpadding="0" cellspacing="0" width="100%">' + "".join(filas) + "</table>")
+    return "".join(partes) if partes else _html.escape(nombre or "")
+
+
 def _publicar_producto_uno(
     bulk_id: str, clean_stream, nombre: str, part_number: str, marca: str = "",
     descripcion: str = "", caracteristicas: list | None = None, precio_costo: float = 0,
@@ -2388,12 +2423,7 @@ def _publicar_producto_uno(
     """Crea el rfq + job del publicador para UN producto extraído de link, bajo el bulk_id dado.
     Lo comparten el flujo de 1 link y el de N links (bulk). Devuelve {rfq_id, job_id, nombre_crm}."""
     nombre_crm = _construir_titulo_producto(part_number, marca, descripcion, nombre)
-
-    # Descripción completa para 1CRM = descripción + ficha técnica (características).
-    # Sin bullets: una característica por línea, separadas solo por salto de línea.
-    desc_full = descripcion or nombre
-    if caracteristicas:
-        desc_full += "\n\nFicha técnica:\n" + "\n".join(str(c) for c in caracteristicas)
+    desc_full = _construir_descripcion_html(descripcion, nombre, caracteristicas)
     now = datetime.now(timezone.utc)
     rfq_id_str = f"LINK-{now.year}-{now.month:02d}{now.day:02d}-{str(uuid.uuid4())[:6].upper()}"
     # Re-hospedar la imagen en Supabase (sitios como Festo bloquean la descarga directa del
