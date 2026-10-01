@@ -99,22 +99,53 @@ def _num(v) -> float | None:
 # 1. CUENTA
 # ─────────────────────────────────────────────────────────────
 def buscar_cuenta(nombre: str) -> dict | None:
-    """Encuentra la cuenta del cliente por nombre. Devuelve {id, nombre, url} o None."""
+    """Encuentra la cuenta del cliente por nombre. Devuelve {id, nombre, url} o None.
+
+    BUG REAL confirmado en vivo (PO de Weidmann): el PO llega con la razón social LOCAL de la
+    subsidiaria ("WEIDMANN TECNOLOGIA ELECTRICA DE MEXICO") mientras la cuenta en 1CRM está
+    registrada con el nombre en inglés ("Weidmann Electrical Technology") — la MISMA empresa, dos
+    nombres distintos que solo comparten la marca/razón social raíz ("Weidmann"). El filter_text de
+    1CRM con el nombre COMPLETO del PO devolvía 0 registros (no es un problema de esta función — la
+    búsqueda de 1CRM ya no encontraba nada que comparar), así que nunca llegaba a intentar el match
+    local. Fallback: si el nombre completo no da nada, reintenta filter_text con SOLO la primera
+    PALABRA (normalmente la marca/razón social distintiva en nombres de empresa).
+
+    OJO — primer intento de este fallback tenía un falso positivo real: comparar por PREFIJO de
+    texto compacto hacía que "EMPRESA..." (razón social inventada de prueba) matcheara "EMPRESARIAL
+    SANTINOX" (cuenta real, nada que ver) porque "empresarial" empieza con las letras "empresa". Se
+    corrigió comparando la PRIMERA PALABRA COMPLETA (no un prefijo parcial) y exigiendo que sea la
+    ÚNICA cuenta candidata con esa palabra — ante varias cuentas que comparten una primera palabra
+    genérica ("Industrias X" vs "Industrias Y"), no se adivina, se deja sin encontrar."""
     nombre = (nombre or "").strip()
     if not nombre or not CRM_BASE:
         return None
+
+    def _mejor_de(data: dict) -> dict | None:
+        n = _norm(nombre)
+        nc = _compact(nombre)
+        mejor = None
+        for r in data.get("records", []):
+            rn = _norm(r.get("name", ""))
+            rc = _compact(r.get("name", ""))
+            # match exacto, o uno contenido en el otro con largo razonable (evita falsos por 1-2 letras)
+            if rn == n or (len(min(nc, rc, key=len)) >= 6 and (nc in rc or rc in nc)):
+                mejor = r
+                if rn == n:
+                    break
+        return mejor
+
     data = _crm_get("data/Account", {"filter_text": nombre, "limit": 20})
-    n = _norm(nombre)
-    nc = _compact(nombre)
-    mejor = None
-    for r in data.get("records", []):
-        rn = _norm(r.get("name", ""))
-        rc = _compact(r.get("name", ""))
-        # match exacto, o uno contenido en el otro con largo razonable (evita falsos por 1-2 letras)
-        if rn == n or (len(min(nc, rc, key=len)) >= 6 and (nc in rc or rc in nc)):
-            mejor = r
-            if rn == n:
-                break
+    mejor = _mejor_de(data)
+
+    if not mejor:
+        primera = _norm(nombre).split(" ")[0] if nombre else ""
+        if len(primera) >= 5:
+            data2 = _crm_get("data/Account", {"filter_text": primera, "limit": 20})
+            recs2 = data2.get("records", [])
+            candidatos = [r for r in recs2 if (_norm(r.get("name", "")).split(" ") or [""])[0] == primera]
+            if len(candidatos) == 1:
+                mejor = candidatos[0]
+
     if not mejor:
         return None
     return {
