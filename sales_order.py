@@ -239,6 +239,28 @@ def cotizacion_por_ref(ref: str) -> dict | None:
             "cuenta_id": rec.get("billing_account_id") or ""}
 
 
+def cotizacion_por_id(quote_id: str) -> dict | None:
+    """Igual que cotizacion_por_ref pero buscando directo por id — se usa cuando el usuario elige
+    a mano cuál de varias cotizaciones candidatas AMBIGUAS es la correcta (ver cotejar(...,
+    forzar_quote_id=...)). Devuelve {id, nombre, lines[...], referenciada:True, cuenta_id} o None."""
+    if not quote_id or not CRM_BASE:
+        return None
+    full = _crm_get(f"data/Quote/{quote_id}")
+    rec = full.get("record", full)
+    if not rec.get("id"):
+        return None
+    lines = []
+    for li in (rec.get("line_items") or []):
+        pn = li.get("mfr_part_no") or ""
+        lines.append({
+            "part_number": pn, "part_compact": _compact(pn),
+            "unit_price": _num(li.get("unit_price")), "quantity": _num(li.get("quantity")),
+            "descripcion": li.get("name", ""),
+        })
+    return {"id": rec["id"], "nombre": rec.get("name", ""), "lines": lines, "referenciada": True,
+            "cuenta_id": rec.get("billing_account_id") or ""}
+
+
 def _vigencia(quote_id: str) -> dict:
     """Detalle mínimo de una cotización candidata: valid_until, quote_stage, vigente."""
     d = _crm_get(f"data/Quote/{quote_id}")
@@ -374,9 +396,14 @@ def so_existente_por_po(po_number: str, cuenta_id: str = "") -> dict | None:
     return None
 
 
-def cotejar(po: dict) -> dict:
+def cotejar(po: dict, forzar_quote_id: str = "") -> dict:
     """Cruza el PO contra las cotizaciones del cliente. NO escribe nada.
-    Devuelve un diagnóstico completo para armar el previo y elegir la cotización de referencia."""
+    Devuelve un diagnóstico completo para armar el previo y elegir la cotización de referencia.
+
+    `forzar_quote_id`: cuando el cotejo salió AMBIGUO (ver 'ambiguo' en el resultado — varias
+    cotizaciones candidatas sin que ninguna sea un match claro) y el usuario YA eligió a mano cuál
+    es la correcta, se vuelve a cotejar tratando esa cotización como la referenciada — mismo
+    mecanismo que cuando el PO SÍ trae el folio citado."""
     if not CRM_BASE:
         return {"error": "1CRM no configurado"}
     if po.get("error"):
@@ -384,7 +411,7 @@ def cotejar(po: dict) -> dict:
 
     # Cotización REFERENCIADA en el propio PO (cita/adjunta nuestro presupuesto Q2026-…): mejor pista
     # de origen. La buscamos primero porque además define la cuenta cuando el nombre no matchea.
-    ref_q = cotizacion_por_ref(po.get("cotizacion_ref", ""))
+    ref_q = cotizacion_por_id(forzar_quote_id) if forzar_quote_id else cotizacion_por_ref(po.get("cotizacion_ref", ""))
 
     cuenta = buscar_cuenta(po.get("cliente", ""))
     if not cuenta and ref_q and ref_q.get("cuenta_id"):
@@ -521,8 +548,17 @@ def cotejar(po: dict) -> dict:
         discrepancias.insert(0, f"⚠ La orden va dirigida a «{po.get('proveedor','otro')}», no a nosotros. "
                                 f"CONFIRMA que esta orden de compra es para nosotros antes de crear la Sales Order.")
 
+    # AMBIGÜEDAD: ninguna cotización fue citada en el PO y hay MÁS de una candidata con cobertura
+    # real, sin que el match sea exacto (todo_ok) — pedido explícito de Gabriel: si solo hay UNA
+    # coincidencia clara (precio y/o producto exactos) se asume esa; si hay varias sin ganador
+    # claro, hay que PREGUNTAR en vez de adivinar con candidatas[0]. No se arma so_draft todavía —
+    # el usuario elige primero (ver cotejar(..., forzar_quote_id=...) para la segunda vuelta).
+    candidata_citada = any(c["referenciada"] for c in candidatas)
+    con_cobertura = [c for c in candidatas if c["items_cubiertos"] > 0]
+    ambiguo = (not candidata_citada) and len(con_cobertura) > 1 and not todo_ok
+
     # DRAFT de la Sales Order (para el PREVIO). Referencia = candidata top (citada o mayor cobertura).
-    so_draft = _armar_draft(cuenta, tm, po, items_out, candidatas, quotes, para_nosotros)
+    so_draft = None if ambiguo else _armar_draft(cuenta, tm, po, items_out, candidatas, quotes, para_nosotros)
 
     return {
         "ok": True,
@@ -530,6 +566,7 @@ def cotejar(po: dict) -> dict:
         "po_number": po.get("po_number", ""),
         "proveedor": po.get("proveedor", ""),
         "para_nosotros": para_nosotros,
+        "ambiguo": ambiguo,
         "so_draft": so_draft,               # True / False / None (no lo dice)
         "terminos_pago": tm["terminos_pago"],         # default_terms del cliente
         "moneda": po.get("moneda", "") or tm["moneda"],
@@ -538,9 +575,10 @@ def cotejar(po: dict) -> dict:
         "cotizaciones_candidatas": candidatas,
         "discrepancias": discrepancias,
         "todo_ok": todo_ok and para_nosotros is not False,
-        "resumen": f"{encontrados}/{len(items_out)} productos ubicados en cotizaciones; "
-                   f"{len(candidatas)} cotización(es) candidata(s); "
-                   f"{len(discrepancias)} discrepancia(s).",
+        "resumen": (f"{encontrados}/{len(items_out)} productos ubicados en cotizaciones; "
+                    f"{len(candidatas)} cotización(es) candidata(s); "
+                    f"{len(discrepancias)} discrepancia(s)."
+                    + (" Hay varias cotizaciones candidatas sin un match exacto — elige cuál es." if ambiguo else "")),
     }
 
 

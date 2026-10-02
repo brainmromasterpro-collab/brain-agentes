@@ -4117,6 +4117,28 @@ def _procesar_orden_compra(stream_id: str, file_url: str, nombre: str = "orden",
     log.info(f"Cotejo PO emitido | {cotejo.get('resumen','')}")
 
 
+def _recotejar_con_cotizacion(stream_id: str, po: dict, quote_id: str) -> None:
+    """El cotejo salió AMBIGUO (varias cotizaciones candidatas, ninguna con match exacto) y el
+    usuario eligió a mano cuál es la correcta — se vuelve a cotejar el MISMO po (ya viene completo
+    en la metadata del botón, no hace falta releer el archivo) forzando esa cotización como
+    referencia. Emite un nuevo [COTEJO_PO] que reemplaza al ambiguo, ya con el so_draft armado."""
+    try:
+        import sales_order
+    except Exception as e:
+        log.error(f"sales_order no disponible: {e}")
+        return
+    if not quote_id:
+        return
+    cotejo = sales_order.cotejar(po, forzar_quote_id=quote_id)
+    payload = {"po": po, "cotejo": cotejo}
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[COTEJO_PO]" + json.dumps(payload, ensure_ascii=False),
+        "procesado": True, "metadata": {"cotejo_po": True},
+    }).execute()
+    _log_stream(stream_id, cotejo.get("resumen", "Cotejo listo"), "ok")
+
+
 def _crear_so_confirmada(stream_id: str, draft: dict) -> None:
     """Crea la Sales Order tras la aprobación del usuario en el previo (metadata.so_action='crear').
     Escribe al CRM SOLO aquí, con el draft ya confirmado. Emite el widget [SO_CREADA]."""
@@ -5151,6 +5173,9 @@ def procesar_mensaje(msg: dict) -> None:
         # Confirmaciones (botón ya apretado) — van primero.
         if _md0.get("so_action") == "crear":
             _crear_so_confirmada(stream_id, _md0.get("draft") or {})
+            return
+        if _md0.get("so_action") == "elegir_cotizacion":
+            _recotejar_con_cotizacion(stream_id, _md0.get("po") or {}, _md0.get("quote_id", ""))
             return
         # SHIPPING (envío al cliente): tracking -> elegir SO -> form -> In Preparation;
         # "shipped" -> elegir envío -> Shipped.
