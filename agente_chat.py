@@ -4891,6 +4891,32 @@ def _shippings_en_preparacion(stream_id: str) -> list:
     return [c for sid, c in creados.items() if sid not in enviados]
 
 
+def _cuenta_del_stream(stream_id: str) -> dict | None:
+    """Cliente/cuenta de ESTE stream de Sales Order, derivado del [COTEJO_PO] más reciente en el
+    historial (el cotejo del PO, al inicio del flujo, ya resolvió y guardó la cuenta del cliente).
+    Se usa para ESCOPAR operaciones posteriores (envío, etc.) a la cuenta correcta — sin esto,
+    sos_por_enviar() mostraba Sales Orders de CUALQUIER cliente del sistema, no solo el de este
+    stream (bug real reportado por Gabriel con un PO de Weidmann)."""
+    try:
+        rows = (supabase.table("mensajes").select("content")
+                .eq("stream_id", stream_id).ilike("content", "%COTEJO_PO%")
+                .order("created_at", desc=True).limit(20).execute())
+        for r in (rows.data or []):
+            content = r.get("content") or ""
+            if not content.startswith("[COTEJO_PO]"):
+                continue
+            try:
+                p = json.loads(content[len("[COTEJO_PO]"):])
+            except Exception:
+                continue
+            cuenta = (p.get("cotejo") or {}).get("cuenta")
+            if cuenta and cuenta.get("id"):
+                return cuenta
+    except Exception as e:
+        log.warning(f"No se pudo derivar la cuenta del stream {stream_id}: {e}")
+    return None
+
+
 def _procesar_tracking_envio(stream_id: str, tracking: str = "") -> None:
     """Llegó un tracking de salida -> muestra los Sales Orders pendientes de enviar para elegir a
     cuál corresponde. Emite [SHIPPING_COTEJO] modo elegir_so."""
@@ -4899,7 +4925,8 @@ def _procesar_tracking_envio(stream_id: str, tracking: str = "") -> None:
     except Exception as e:
         log.error(f"sales_shipping no disponible: {e}")
         return
-    sos = sales_shipping.sos_por_enviar()
+    _cuenta = _cuenta_del_stream(stream_id)
+    sos = sales_shipping.sos_por_enviar(cuenta_id=(_cuenta or {}).get("id", ""))
     if not sos:
         supabase.table("mensajes").insert({
             "stream_id": stream_id, "role": "assistant",
@@ -5166,9 +5193,14 @@ def procesar_mensaje(msg: dict) -> None:
         _es_factura = bool(re.search(r'factura|firmad|facturad|facturar|cerrar\s+venta', _low))
         _es_estado = (not _file_url and not _urls and
                       bool(re.search(r'c[oó]mo va|estado (de la venta|operativo)|estatus de la venta|rollup|resumen de (la )?venta', _low)))
+        # BUG REAL confirmado: \b[A-Z0-9]{8,30}\b también matcheaba palabras normales en MAYÚSCULAS
+        # sin nada de tracking (ej. "COTIZACION", 10 letras) — cualquier mensaje en mayúsculas con
+        # una palabra larga se clasificaba como "está dando un número de guía". Un tracking real
+        # SIEMPRE trae al menos un dígito (UPS/FedEx/DHL); exigirlo descarta las palabras sueltas
+        # sin tocar los casos reales (alfanumérico o solo dígitos).
         _es_tracking = (not _es_shipped and not _es_estado and
                         bool(_urls or re.search(r'tracking|gu[ií]a|rastreo|n[uú]mero de env[ií]o|env[ií]o|shipping', _low)
-                             or re.search(r'\b[A-Z0-9]{8,30}\b', contenido or "")))
+                             or re.search(r'\b(?=[A-Z0-9]{8,30}\b)[A-Z0-9]*\d[A-Z0-9]*\b', contenido or "")))
 
         if _file_url:
             # Una IMAGEN en ordenes puede ser la guía de envío (tracking saliente) o la orden de

@@ -55,9 +55,22 @@ def leer_evidencia_envio(imagenes: list[bytes], model_id: str = "") -> dict:
     return datos
 
 
-def sos_por_enviar(limite: int = 40) -> list[dict]:
+def sos_por_enviar(limite: int = 40, cuenta_id: str = "") -> list[dict]:
     """Sales Orders con líneas pendientes de enviar (no cerradas). Trae cliente y líneas para el
-    checklist de qué se envía."""
+    checklist de qué se envía.
+
+    BUG REAL #1 confirmado por Gabriel: sin `cuenta_id`, esto trae Sales Orders de TODOS los
+    clientes del sistema — al cotejar el envío de un PO de un cliente puntual (ej. Weidmann) dentro
+    de su stream, aparecían como candidatos SOs de OTROS clientes que no tienen nada que ver. Si se
+    pasa `cuenta_id`, se filtra a solo las SO de ESA cuenta — el llamador lo deriva del cliente ya
+    resuelto en el cotejo del PO de este mismo stream.
+
+    BUG REAL #2 confirmado en vivo: usar `rec["name"]` como título hacía ver "2 productos como 1"
+    cuando una SO con 2 líneas originales (copiadas de la cotización al crearse) tenía DESPUÉS una
+    línea borrada (ej. PO solo pedía una de las dos) — el campo `name`, copiado UNA SOLA VEZ de la
+    cotización al crear la SO, se queda obsoleto y sigue mencionando el producto ya quitado. Se usa
+    en su lugar el NÚMERO de la SO (`prefix`+`so_number`, ej. "SO2026-0930-286") — estable y nunca
+    desactualizado — y las líneas reales (`line_items`, siempre al día) se muestran aparte."""
     data = sales_order._crm_get("data/SalesOrder", {"order_by": "date_modified desc", "limit": limite})
     out: list[dict] = []
     for so in data.get("records", []):
@@ -67,9 +80,13 @@ def sos_por_enviar(limite: int = 40) -> list[dict]:
         rec = sales_order._crm_get(f"data/SalesOrder/{sid}").get("record", {})
         if rec.get("so_stage") in SO_STAGE_CERRADAS:
             continue
+        if cuenta_id and rec.get("billing_account_id") != cuenta_id:
+            continue
         cuenta = sales_order.cuenta_por_id(rec.get("billing_account_id", ""))
+        numero_so = f"{rec.get('prefix', '')}{rec.get('so_number', '')}".strip() or rec.get("name", "")
         out.append({
-            "id": sid, "nombre": rec.get("name", ""), "so_stage": rec.get("so_stage"),
+            "id": sid, "nombre": numero_so, "so_stage": rec.get("so_stage"),
+            "po_number": rec.get("purchase_order_num", ""),
             "cliente": (cuenta or {}).get("nombre", ""),
             "url": f"{CRM_BASE}/index.php?module=SalesOrders&action=DetailView&record={sid}",
             "lineas": [{"name": li.get("name"), "mfr_part_no": li.get("mfr_part_no"),
