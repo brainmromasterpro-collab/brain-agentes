@@ -350,6 +350,30 @@ def _precio_coincide(po_precio: float | None, cot_precio: float | None) -> bool:
     return abs(po_precio - cot_precio) <= max(TOL_ABS, TOL_REL * cot_precio)
 
 
+def so_existente_por_po(po_number: str, cuenta_id: str = "") -> dict | None:
+    """¿YA existe una Sales Order para este número de PO? Evita duplicados — si ya está creada,
+    el flujo debe solo confirmarlo en vez de volver a cotejar/crear otra. Verificado en vivo:
+    filters[purchase_order_num] SÍ filtra de verdad en el módulo SalesOrder (a diferencia de otros
+    campos relate ya documentados en reference_1crm_api_quirks — probado con PO real e inexistente)."""
+    po_number = (po_number or "").strip()
+    if not po_number:
+        return None
+    data = _crm_get("data/SalesOrder", {"filters[purchase_order_num]": po_number, "limit": 5})
+    for r in data.get("records", []):
+        sid = r.get("id")
+        if not sid:
+            continue
+        rec = _crm_get(f"data/SalesOrder/{sid}").get("record", {})
+        if cuenta_id and rec.get("billing_account_id") != cuenta_id:
+            continue  # mismo número de PO pero de OTRO cliente — coincidencia, no duplicado
+        numero = f"{rec.get('prefix', '')}{rec.get('so_number', '')}".strip() or rec.get("name", "")
+        return {
+            "id": sid, "numero": numero, "so_stage": rec.get("so_stage"),
+            "url": f"{CRM_BASE}/index.php?module=SalesOrders&action=DetailView&record={sid}",
+        }
+    return None
+
+
 def cotejar(po: dict) -> dict:
     """Cruza el PO contra las cotizaciones del cliente. NO escribe nada.
     Devuelve un diagnóstico completo para armar el previo y elegir la cotización de referencia."""
@@ -371,6 +395,17 @@ def cotejar(po: dict) -> dict:
             "avisos": [f"No encontré en el CRM la cuenta del cliente «{po.get('cliente','?')}». "
                        f"Verifica el nombre o si el cliente ya existe."],
             "cuenta": None, "items": [], "cotizaciones_candidatas": [],
+        }
+
+    # ¿Ya existe una SO para este PO? Si sí, no hace falta cotejar contra cotizaciones — solo
+    # confirmar que ya está creada (pedido explícito de Gabriel: evitar duplicar Sales Orders).
+    so_ya = so_existente_por_po(po.get("po_number", ""), cuenta["id"])
+    if so_ya:
+        return {
+            "ok": True, "ya_existe": True, "so": so_ya, "cuenta": cuenta,
+            "avisos": [f"Ya existe la Sales Order {so_ya['numero']} para el PO «{po.get('po_number', '')}» "
+                       f"— no hace falta crear otra."],
+            "items": [], "cotizaciones_candidatas": [],
         }
 
     # Términos de pago + moneda de ESTE cliente (van a la Sales Order).
