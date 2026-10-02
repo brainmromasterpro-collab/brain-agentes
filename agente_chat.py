@@ -4095,6 +4095,7 @@ def _procesar_orden_compra(stream_id: str, file_url: str, nombre: str = "orden",
 
     _log_stream(stream_id, f"Leyendo orden de compra: {nombre}", "info")
     po = orden_compra.leer_po(url=file_url, nombre=nombre, mime=mime)
+    po["file_url"] = file_url  # se re-sube a 1CRM (sección Documentos de la SO) al crearla — ver subir_po_a_so
     if po.get("error"):
         _log_stream(stream_id, f"No se pudo leer el PO: {po['error']}", "error")
         supabase.table("mensajes").insert({
@@ -4168,6 +4169,19 @@ def _crear_so_confirmada(stream_id: str, draft: dict) -> None:
     }).execute()
     _log_stream(stream_id, f"Sales Order {res.get('so_numero','')} creada ✓", "ok")
     log.info(f"Sales Order creada: {res.get('so_id')} ({res.get('so_numero')})")
+
+    # Subir el PO original a la sección de Documentos/Notas de la SO — best-effort: si falla, la SO
+    # ya quedó creada y esto NO la afecta, solo se loguea (ver sales_order.subir_po_a_so).
+    _file_url = (draft or {}).get("file_url", "")
+    if _file_url and res.get("so_id"):
+        try:
+            up = sales_order.subir_po_a_so(res["so_id"], _file_url, (draft or {}).get("po_number", ""))
+            if up.get("ok"):
+                _log_stream(stream_id, "PO original guardado en la SO (Documentos) ✓", "ok")
+            else:
+                _log_stream(stream_id, f"No se pudo guardar el PO en la SO: {up.get('error','')}", "warn")
+        except Exception as e:
+            log.warning(f"subir_po_a_so falló: {e}")
 
 
 # ─────────────────────────────────────────────────────────────

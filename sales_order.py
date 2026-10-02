@@ -351,6 +351,7 @@ def _armar_draft(cuenta: dict, tm: dict, po: dict, items_out: list,
         "currency_id": tm["currency_id"], "moneda": po.get("moneda", "") or tm["moneda"],
         "terms": tm["terminos_pago"],
         "po_number": po.get("po_number", ""),
+        "file_url": po.get("file_url", ""),  # para subir el PO a Documentos/Notas al crear la SO
         "para_nosotros": para_nosotros,
         "lineas": lineas,
         # Trazabilidad: de dónde sale cada dato (el usuario lo ve en el previo).
@@ -657,3 +658,77 @@ def crear_sales_order(draft: dict) -> dict:
         "cotizacion_ya_estaba_aceptada": cotizacion_ya_aceptada,
         "url": f"{CRM_BASE}/index.php?module=SalesOrders&action=DetailView&record={so_id}",
     }
+
+
+# ─────────────────────────────────────────────────────────────
+# 5. SUBIR EL PO ORIGINAL A LA SALES ORDER (sección Documentos/Notas)
+# ─────────────────────────────────────────────────────────────
+def subir_po_a_so(so_id: str, file_url: str, po_number: str = "") -> dict:
+    """Sube el archivo original del PO como Nota/Archivo adjunto de la Sales Order recién creada —
+    pedido explícito de Gabriel: el documento debe quedar guardado y ligado a la SO, no solo leído
+    desde donde se subió.
+
+    1CRM Cloud no acepta subir archivos vía la API REST (el campo 'filename' de Note es tipo
+    'file_ref', igual que en Documents — bloquea upload.php a clientes HTTP externos, mismo patrón
+    ya usado en agente_publicador.subir_imagen_a_crm). Único mecanismo que funciona: un browser real
+    con sesión (Playwright) — login → abrir la SO → click 'Nueva Nota o Archivo Adjunto' (ya trae
+    'Relativo a' pre-rellenado con ESTA SalesOrder, confirmado en vivo) → nombre + archivo → guardar.
+
+    Verificado en vivo (create+GET+delete controlado): la Nota queda con parent_type='SalesOrders',
+    parent_id=<so_id> y filename con el archivo real — sin esto, probar a ciegas: el listado por
+    filter_text NO trae esos campos (hay que leer el detalle), que es como se confirmó.
+
+    Fallback silencioso: si Playwright falla por cualquier motivo, NO bloquea la creación de la SO
+    (que ya quedó hecha) — solo se loguea el error."""
+    if not file_url or not so_id:
+        return {"ok": False, "error": "falta file_url o so_id"}
+    import tempfile
+    import pathlib
+    from urllib.parse import urlparse
+
+    crm_url = CRM_BASE
+    crm_user = os.environ.get("ONECRM_USERNAME", "")
+    crm_pass = os.environ.get("ONECRM_PASSWORD", "")
+    nombre_nota = f"PO {po_number}".strip() if po_number else "Orden de compra"
+
+    # Descargar el PO a un archivo temporal con un nombre limpio (el que ve el usuario en 1CRM).
+    try:
+        r = httpx.get(file_url, timeout=30, follow_redirects=True)
+        r.raise_for_status()
+        ext = pathlib.Path(urlparse(file_url).path).suffix or ".pdf"
+        safe = (po_number or "orden_compra").replace("/", "-").replace(" ", "_")
+        tmp_path = str(pathlib.Path(tempfile.gettempdir()) / f"PO_{safe}{ext}")
+        pathlib.Path(tmp_path).write_bytes(r.content)
+    except Exception as e:
+        log.warning(f"No se pudo descargar el PO para subirlo a 1CRM: {e}")
+        return {"ok": False, "error": str(e)}
+
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            page = browser.new_context(ignore_https_errors=True, viewport={"width": 1400, "height": 1000}).new_page()
+
+            page.goto(f"{crm_url}/index.php?module=Users&action=Login", timeout=30000)
+            page.fill('input[name="user_name"]', crm_user)
+            page.fill('input[name="user_password"]', crm_pass)
+            page.click('input[type="submit"], button[type="submit"]')
+            page.wait_for_url(f"{crm_url}/index.php*", timeout=20000)
+
+            page.goto(f"{crm_url}/index.php?module=SalesOrders&action=DetailView&record={so_id}", timeout=30000)
+            page.wait_for_load_state("networkidle", timeout=30000)
+
+            page.locator("text=Nueva Nota o Archivo Adjunto").first.click(timeout=10000)
+            page.wait_for_timeout(1000)
+            page.fill('input[name="name"]', nombre_nota)
+            page.set_input_files('input[name="filename"]', tmp_path)
+            page.wait_for_timeout(500)
+            page.click("#QuickCreateForm_0_save")
+            page.wait_for_timeout(3000)  # upload.php + async.php de guardado, sin respuesta fácil de interceptar
+
+            browser.close()
+        log.info(f"PO subido a la SO {so_id} como Nota '{nombre_nota}'")
+        return {"ok": True}
+    except Exception as e:
+        log.warning(f"No se pudo subir el PO a 1CRM (SO ya quedó creada, esto no la afecta): {e}")
+        return {"ok": False, "error": str(e)}
