@@ -381,6 +381,16 @@ def so_existente_por_po(po_number: str, cuenta_id: str = "") -> dict | None:
     po_number = (po_number or "").strip()
     if not po_number:
         return None
+    objetivo = _compact(po_number)
+
+    def _como_resultado(sid: str, rec: dict) -> dict:
+        numero = f"{rec.get('prefix', '')}{rec.get('so_number', '')}".strip() or rec.get("name", "")
+        return {
+            "id": sid, "numero": numero, "so_stage": rec.get("so_stage"),
+            "url": f"{CRM_BASE}/index.php?module=SalesOrders&action=DetailView&record={sid}",
+        }
+
+    # 1) Rápido: filtro nativo por "Núm. Pedido de Compra" (purchase_order_num).
     data = _crm_get("data/SalesOrder", {"filters[purchase_order_num]": po_number, "limit": 5})
     for r in data.get("records", []):
         sid = r.get("id")
@@ -389,11 +399,25 @@ def so_existente_por_po(po_number: str, cuenta_id: str = "") -> dict | None:
         rec = _crm_get(f"data/SalesOrder/{sid}").get("record", {})
         if cuenta_id and rec.get("billing_account_id") != cuenta_id:
             continue  # mismo número de PO pero de OTRO cliente — coincidencia, no duplicado
-        numero = f"{rec.get('prefix', '')}{rec.get('so_number', '')}".strip() or rec.get("name", "")
-        return {
-            "id": sid, "numero": numero, "so_stage": rec.get("so_stage"),
-            "url": f"{CRM_BASE}/index.php?module=SalesOrders&action=DetailView&record={sid}",
-        }
+        return _como_resultado(sid, rec)
+
+    # 2) Respaldo (pedido de Gabriel): buscar entre las SO DEL CLIENTE si el número coincide en
+    # "Núm. Pedido de Compra" O en el campo "SalesOrder" (el documento del PO que se ligó a la SO,
+    # cuyo nombre es el número de PO), comparando sin espacios/guiones/mayúsculas — cubre PO
+    # capturados con formato distinto (espacios, sufijos de renglón "/10", etc.).
+    if cuenta_id:
+        data = _crm_get("data/SalesOrder", {"filters[billing_account_id]": cuenta_id, "limit": 100})
+        for r in data.get("records", []):
+            sid = r.get("id")
+            if not sid:
+                continue
+            rec = _crm_get(f"data/SalesOrder/{sid}").get("record", {})
+            if rec.get("billing_account_id") != cuenta_id:
+                continue
+            for campo in (rec.get("purchase_order_num"), rec.get("SalesOrder")):
+                c = _compact(str(campo or ""))
+                if c and (c == objetivo or (len(c) >= 8 and (c.startswith(objetivo) or objetivo.startswith(c)))):
+                    return _como_resultado(sid, rec)
     return None
 
 
