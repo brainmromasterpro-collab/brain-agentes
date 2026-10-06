@@ -416,14 +416,24 @@ def _armar_draft(cuenta: dict, tm: dict, po: dict, items_out: list,
         if cid and pcn:
             po_qty_map[(cid, pcn)] = it.get("cantidad_po")
 
+    po_precio_map: dict = {}
+    for it in items_out:
+        cid = (it.get("cotizacion") or {}).get("id")
+        pcn = _clave(it.get("part_number_cotizacion") or "", it.get("descripcion_cotizacion") or "")
+        if cid and pcn:
+            po_precio_map[(cid, pcn)] = it.get("precio_po")
+
     lineas = []
     for ln in ref_quote["lines"]:
+        po_precio = po_precio_map.get((ref["id"], ln["part_compact"]))
         po_qty = po_qty_map.get((ref["id"], ln["part_compact"]))
         pedido = po_qty is not None
         lineas.append({
             "part_number": ln["part_number"] or ln["descripcion"], "descripcion": ln["descripcion"],
             "unit_price": ln["unit_price"], "quote_qty": ln["quantity"],
             "po_qty": po_qty, "pedido": pedido, "incluir_default": pedido,
+            "precio_po": po_precio,
+            "precio": po_precio if (pedido and po_precio is not None) else ln["unit_price"],  # el PO manda; editable
             "cantidad": po_qty if pedido else ln["quantity"],   # cantidad final propuesta
         })
 
@@ -702,6 +712,11 @@ def cotejar(po: dict, forzar_quote_id: str = "") -> dict:
 
     # DRAFT de la Sales Order (para el PREVIO). Referencia = candidata top (citada o mayor cobertura).
     so_draft = None if ambiguo else _armar_draft(cuenta, tm, po, items_out, candidatas, quotes, para_nosotros)
+    if so_draft and forzar_quote_id:
+        # El usuario eligió esta cotización a mano: una cotización vencida/draft solo ADVIERTE, no bloquea
+        # (él decide; el previo y la confirmación siguen siendo obligatorios).
+        so_draft["puede_crear"] = para_nosotros is not False
+        so_draft["aviso_vigencia"] = bool(so_draft.get("quote_vigente") is False)
 
     return {
         "ok": True,
@@ -710,6 +725,7 @@ def cotejar(po: dict, forzar_quote_id: str = "") -> dict:
         "proveedor": po.get("proveedor", ""),
         "para_nosotros": para_nosotros,
         "ambiguo": ambiguo,
+        "forzada": bool(forzar_quote_id),
         "so_draft": so_draft,               # True / False / None (no lo dice)
         "terminos_pago": tm["terminos_pago"],         # default_terms del cliente
         "moneda": po.get("moneda", "") or tm["moneda"],
@@ -779,8 +795,32 @@ def crear_sales_order(draft: dict) -> dict:
             _crm_delete("SalesOrderLine", li["id"]); quitadas += 1
             continue
         qty = d.get("cantidad")
+        patch: dict = {}
         if qty is not None and _num(li.get("quantity")) != _num(qty):
-            _crm_patch("SalesOrderLine", li["id"], {"quantity": qty}); ajustadas += 1
+            patch["quantity"] = qty
+        # Correcciones del usuario en el previo (precio / descripción / nº de parte) — cuando el PO
+        # no coincide exacto con la cotización elegida, el usuario aclara los datos finales.
+        precio = _num(d.get("precio"))
+        if precio is not None and precio != _num(li.get("unit_price")):
+            patch["unit_price"] = f"{precio:.2f}"
+        if d.get("descripcion") and d["descripcion"] != li.get("name"):
+            patch["name"] = d["descripcion"]
+        if d.get("mfr_part_no") is not None and d["mfr_part_no"] != (li.get("mfr_part_no") or ""):
+            patch["mfr_part_no"] = d["mfr_part_no"]
+        if patch:
+            q_final = _num(patch.get("quantity", li.get("quantity"))) or 0
+            u_final = _num(patch.get("unit_price", li.get("unit_price"))) or 0
+            if "quantity" in patch or "unit_price" in patch:
+                patch["ext_price"] = f"{q_final * u_final:.2f}"  # la API no recalcula la línea sola
+            _crm_patch("SalesOrderLine", li["id"], patch); ajustadas += 1
+
+    # 2b) La API no recalcula los totales de la SO al editar líneas: se recalculan (subtotal + IVA
+    # por línea) y se parchan amount/subtotal (verificado en vivo que son editables).
+    if ajustadas or quitadas:
+        fresh = (_crm_get(f"data/SalesOrder/{so_id}").get("record", {}).get("line_items") or [])
+        sub = sum(_num(l.get("ext_price")) or 0 for l in fresh)
+        iva = sum((_num(l.get("ext_price")) or 0) * ((_num(l.get("line_tax_perc")) or 0) / 100) for l in fresh)
+        _crm_patch("SalesOrder", so_id, {"subtotal": f"{sub:.2f}", "amount": f"{sub + iva:.2f}"})
 
     # 3) Reafirmar cotización aceptada (normalmente ya quedó 'Closed Accepted' sola; si no, enforce).
     q = _crm_get(f"data/Quote/{quote_id}").get("record", {})
