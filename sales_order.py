@@ -390,6 +390,13 @@ def _match_por_precio(descripcion: str, po_precio, indice: dict) -> list:
     return [(q, ln) for (q, ln, _t) in hits] if len(hits) == 1 else []
 
 
+def _etiqueta_coincidencia(puntaje: float, n_items: int) -> str:
+    """exacta / casi exacta / cercana según el puntaje contra el máximo posible (parte exacta 6 +
+    precio idéntico 12 = 18 por renglón del PO)."""
+    r = puntaje / (18 * max(n_items, 1))
+    return "exacta" if r >= 0.9 else ("casi exacta" if r >= 0.55 else "cercana")
+
+
 def _armar_draft(cuenta: dict, tm: dict, po: dict, items_out: list,
                  candidatas: list, quotes: list, para_nosotros) -> dict | None:
     """Arma el borrador de la Sales Order para el PREVIO: qué se va a mandar y DE DÓNDE sale cada dato,
@@ -607,7 +614,10 @@ def cotejar(po: dict, forzar_quote_id: str = "") -> dict:
         for (q, _ln) in candidatos:
             cobertura[q["id"]] = cobertura.get(q["id"], 0) + 1
             p_ok = _precio_coincide(po_precio, _ln["unit_price"])
-            puntaje[q["id"]] = puntaje.get(q["id"], 0) + (base if (q["id"], id(_ln)) not in extras else 2) + (12 if p_ok else 0)
+            _dif = (abs(po_precio - _ln["unit_price"]) / max(abs(_ln["unit_price"]), 0.01)
+                    if (po_precio is not None and _ln["unit_price"]) else 9)
+            _bono_precio = 12 if p_ok else (6 if _dif <= 0.05 else (2 if _dif <= 0.15 else 0))
+            puntaje[q["id"]] = puntaje.get(q["id"], 0) + (base if (q["id"], id(_ln)) not in extras else 2) + _bono_precio
             precio_ok_n[q["id"]] = precio_ok_n.get(q["id"], 0) + (1 if p_ok else 0)
 
         estado = "ok" if precio_ok else "precio_distinto"
@@ -661,6 +671,7 @@ def cotejar(po: dict, forzar_quote_id: str = "") -> dict:
             "id": q["id"], "nombre": q["nombre"],
             "items_cubiertos": cov, "total_items_po": len(po.get("items", [])),
             "items_precio_ok": precio_ok_n.get(q["id"], 0), "puntaje": puntaje.get(q["id"], 0),
+            "coincidencia": _etiqueta_coincidencia(puntaje.get(q["id"], 0), len(po.get("items", []))),
             "referenciada": es_ref,
             **vig,
             "url": f"{CRM_BASE}/index.php?module=Quotes&action=DetailView&record={q['id']}",
