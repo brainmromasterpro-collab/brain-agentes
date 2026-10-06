@@ -369,6 +369,27 @@ def _match_texto_precio(descripcion: str, po_precio, indice: dict) -> tuple[list
     return [], ""
 
 
+def _match_por_precio(descripcion: str, po_precio, indice: dict) -> list:
+    """Líneas de cotización cuyo PRECIO coincide con el del PO (el precio es lo más importante, pedido
+    de Gabriel), aunque el número de parte/descripción no coincidan. Cuenta si comparte al menos una
+    palabra significativa con la descripción del PO, o si es la ÚNICA línea con ese precio."""
+    if po_precio is None:
+        return []
+    toks = _tokens(descripcion)
+    hits, vistos = [], set()
+    for lst in indice.values():
+        for (q, ln) in lst:
+            k = (q["id"], ln["part_compact"], ln["unit_price"])
+            if k in vistos or ln["unit_price"] is None or not _precio_coincide(po_precio, ln["unit_price"]):
+                continue
+            vistos.add(k)
+            hits.append((q, ln, bool(toks & _tokens(ln.get("descripcion", "")))))
+    con_texto = [(q, ln) for (q, ln, t) in hits if t]
+    if con_texto:
+        return con_texto
+    return [(q, ln) for (q, ln, _t) in hits] if len(hits) == 1 else []
+
+
 def _armar_draft(cuenta: dict, tm: dict, po: dict, items_out: list,
                  candidatas: list, quotes: list, para_nosotros) -> dict | None:
     """Arma el borrador de la Sales Order para el PREVIO: qué se va a mandar y DE DÓNDE sale cada dato,
@@ -554,6 +575,16 @@ def cotejar(po: dict, forzar_quote_id: str = "") -> dict:
         candidatos, tipo_match = _match_item(pc, it.get("descripcion", ""), indice)
         if not candidatos:
             candidatos, tipo_match = _match_texto_precio(it.get("descripcion", ""), po_precio, indice)
+        # Si ningún candidato por parte/descripción tiene el precio del PO, agregar las líneas de
+        # cualquier cotización que SÍ tengan ese precio (el precio manda).
+        extras: set = set()
+        if po_precio is not None and not any(_precio_coincide(po_precio, ln["unit_price"]) for (_q, ln) in candidatos):
+            for (q, ln) in _match_por_precio(it.get("descripcion", ""), po_precio, indice):
+                if not any(q["id"] == q2["id"] and ln is ln2 for (q2, ln2) in candidatos):
+                    candidatos = list(candidatos) + [(q, ln)]
+                    extras.add((q["id"], id(ln)))
+            if extras and not tipo_match:
+                tipo_match = "precio"
         parcial = tipo_match in ("parcial", "descripcion", "similar", "precio")
 
         if not candidatos:
@@ -570,11 +601,13 @@ def cotejar(po: dict, forzar_quote_id: str = "") -> dict:
             ok = _precio_coincide(po_precio, ln["unit_price"])
             if mejor_q is None or (ok and not precio_ok):
                 mejor_q, mejor_ln, precio_ok = q, ln, ok
+        if (mejor_q["id"], id(mejor_ln)) in extras:
+            tipo_match, parcial = "precio", True
         base = {"exacto": 6, "parcial": 4, "descripcion": 4, "similar": 3, "precio": 2}.get(tipo_match, 1)
         for (q, _ln) in candidatos:
             cobertura[q["id"]] = cobertura.get(q["id"], 0) + 1
             p_ok = _precio_coincide(po_precio, _ln["unit_price"])
-            puntaje[q["id"]] = puntaje.get(q["id"], 0) + base + (5 if p_ok else 0)
+            puntaje[q["id"]] = puntaje.get(q["id"], 0) + (base if (q["id"], id(_ln)) not in extras else 2) + (12 if p_ok else 0)
             precio_ok_n[q["id"]] = precio_ok_n.get(q["id"], 0) + (1 if p_ok else 0)
 
         estado = "ok" if precio_ok else "precio_distinto"
