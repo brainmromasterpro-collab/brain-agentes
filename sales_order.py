@@ -88,6 +88,14 @@ def _compact(s: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", _norm(s))
 
 
+def _clave(pn: str, desc: str = "") -> str:
+    """Clave de comparación de una línea: el número de parte compacto, o —si la cotización/SO no
+    tiene número de parte (líneas libres tipo "Lamina de acero inoxidable")— la descripción compacta.
+    Sin esto esas líneas no se indexaban y NUNCA podían coincidir con un PO (bug real, PO Weidmann
+    4501054140)."""
+    return (_compact(pn) or _compact(desc))[:40]
+
+
 def _num(v) -> float | None:
     try:
         return float(str(v).replace(",", "").replace("$", "").strip())
@@ -190,22 +198,34 @@ def _es_para_nosotros(proveedor: str) -> bool | None:
 # ─────────────────────────────────────────────────────────────
 # 2. COTIZACIONES DEL CLIENTE (índice de líneas)
 # ─────────────────────────────────────────────────────────────
-def cotizaciones_cliente(cuenta_id: str, limite: int = 40) -> list[dict]:
+def cotizaciones_cliente(cuenta_id: str, limite: int = 300) -> list[dict]:
     """Cotizaciones recientes del cliente CON sus líneas. Cada una:
     {id, nombre, lines:[{part_number, part_compact, unit_price, quantity, descripcion}]}."""
-    data = _crm_get("data/Quote", {
-        "filters[billing_account_id]": cuenta_id,
-        "order_by": "date_modified desc",
-        "limit": limite,
-    })
+    # La API devuelve páginas cortas (~20): se pagina hasta `limite`. Con 40 se perdían cotizaciones
+    # viejas del cliente (bug real: la cotización de 5999833 de Weidmann quedaba fuera, 161 en total).
+    registros: list = []
+    offset = 0
+    while len(registros) < limite:
+        data = _crm_get("data/Quote", {
+            "filters[billing_account_id]": cuenta_id,
+            "order_by": "date_modified desc",
+            "limit": 20, "offset": offset,
+        })
+        page = data.get("records", [])
+        if not page:
+            break
+        registros += page
+        offset += 20
+        if len(page) < 20:
+            break
     out: list[dict] = []
-    for q in data.get("records", []):
+    for q in registros[:limite]:
         lines = []
         for li in (q.get("line_items") or []):
             pn = li.get("mfr_part_no") or ""
             lines.append({
                 "part_number": pn,
-                "part_compact": _compact(pn),
+                "part_compact": _clave(pn, li.get("name", "")),
                 "unit_price": _num(li.get("unit_price")),
                 "quantity":   _num(li.get("quantity")),
                 "descripcion": li.get("name", ""),
@@ -231,7 +251,7 @@ def cotizacion_por_ref(ref: str) -> dict | None:
     for li in (rec.get("line_items") or []):
         pn = li.get("mfr_part_no") or ""
         lines.append({
-            "part_number": pn, "part_compact": _compact(pn),
+            "part_number": pn, "part_compact": _clave(pn, li.get("name", "")),
             "unit_price": _num(li.get("unit_price")), "quantity": _num(li.get("quantity")),
             "descripcion": li.get("name", ""),
         })
@@ -253,7 +273,7 @@ def cotizacion_por_id(quote_id: str) -> dict | None:
     for li in (rec.get("line_items") or []):
         pn = li.get("mfr_part_no") or ""
         lines.append({
-            "part_number": pn, "part_compact": _compact(pn),
+            "part_number": pn, "part_compact": _clave(pn, li.get("name", "")),
             "unit_price": _num(li.get("unit_price")), "quantity": _num(li.get("quantity")),
             "descripcion": li.get("name", ""),
         })
@@ -312,6 +332,43 @@ def _match_item(pc: str, descripcion: str, indice: dict) -> tuple[list, str]:
     return [], ""
 
 
+_STOP = {"para", "con", "sin", "del", "los", "las", "una", "uno", "por", "mas", "que", "de", "en", "el", "la", "y", "x"}
+
+
+def _tokens(txt: str) -> set:
+    """Palabras significativas (>=3 letras/dígitos, sin acentos ni palabras vacías) de un texto."""
+    return {w for w in re.findall(r"[A-Z0-9]+", _norm(txt)) if len(w) >= 3 and w.lower() not in _STOP}
+
+
+def _match_texto_precio(descripcion: str, po_precio, indice: dict) -> tuple[list, str]:
+    """Último respaldo cuando el número de parte del PO no aparece en ninguna cotización (el cliente
+    usa SU código interno y la cotización no trae número de parte): busca en las líneas de las
+    cotizaciones por (a) DESCRIPCIÓN parecida (>=50% de las palabras del PO presentes en la línea)
+    y/o (b) PRECIO exacto. Siempre se devuelve como match por confirmar (tipo 'similar'/'precio'),
+    nunca silencioso — pedido de Gabriel: con una sola coincidencia (producto O precio), preguntar."""
+    toks = _tokens(descripcion)
+    similares, por_precio = [], []
+    vistos = set()
+    for lst in indice.values():
+        for (q, ln) in lst:
+            k = (q["id"], ln["part_compact"], ln["unit_price"])
+            if k in vistos:
+                continue
+            vistos.add(k)
+            lt = _tokens(ln.get("descripcion", ""))
+            if toks and len(toks & lt) / len(toks) >= 0.5 and len(toks & lt) >= 2:
+                p_ok = po_precio is not None and ln["unit_price"] is not None and _precio_coincide(po_precio, ln["unit_price"])
+                similares.append((p_ok, len(toks & lt) / len(toks), q, ln))
+            elif po_precio is not None and ln["unit_price"] is not None and _precio_coincide(po_precio, ln["unit_price"]):
+                por_precio.append((q, ln))
+    if similares:
+        similares.sort(key=lambda t: (t[0], t[1]), reverse=True)  # mejor coincidencia primero
+        return [(q, ln) for (_p, _o, q, ln) in similares], "similar"
+    if len(por_precio) == 1:  # precio solo cuenta si es una coincidencia única (si no, es azar)
+        return por_precio, "precio"
+    return [], ""
+
+
 def _armar_draft(cuenta: dict, tm: dict, po: dict, items_out: list,
                  candidatas: list, quotes: list, para_nosotros) -> dict | None:
     """Arma el borrador de la Sales Order para el PREVIO: qué se va a mandar y DE DÓNDE sale cada dato,
@@ -327,7 +384,7 @@ def _armar_draft(cuenta: dict, tm: dict, po: dict, items_out: list,
     po_qty_map: dict = {}
     for it in items_out:
         cid = (it.get("cotizacion") or {}).get("id")
-        pcn = _compact(it.get("part_number_cotizacion") or "")
+        pcn = _clave(it.get("part_number_cotizacion") or "", it.get("descripcion_cotizacion") or "")
         if cid and pcn:
             po_qty_map[(cid, pcn)] = it.get("cantidad_po")
 
@@ -336,7 +393,7 @@ def _armar_draft(cuenta: dict, tm: dict, po: dict, items_out: list,
         po_qty = po_qty_map.get((ref["id"], ln["part_compact"]))
         pedido = po_qty is not None
         lineas.append({
-            "part_number": ln["part_number"], "descripcion": ln["descripcion"],
+            "part_number": ln["part_number"] or ln["descripcion"], "descripcion": ln["descripcion"],
             "unit_price": ln["unit_price"], "quote_qty": ln["quantity"],
             "po_qty": po_qty, "pedido": pedido, "incluir_default": pedido,
             "cantidad": po_qty if pedido else ln["quantity"],   # cantidad final propuesta
@@ -493,7 +550,9 @@ def cotejar(po: dict, forzar_quote_id: str = "") -> dict:
         po_precio = _num(it.get("precio_unitario"))
         po_qty = _num(it.get("cantidad"))
         candidatos, tipo_match = _match_item(pc, it.get("descripcion", ""), indice)
-        parcial = tipo_match in ("parcial", "descripcion")
+        if not candidatos:
+            candidatos, tipo_match = _match_texto_precio(it.get("descripcion", ""), po_precio, indice)
+        parcial = tipo_match in ("parcial", "descripcion", "similar", "precio")
 
         if not candidatos:
             items_out.append({
@@ -516,6 +575,7 @@ def cotejar(po: dict, forzar_quote_id: str = "") -> dict:
         items_out.append({
             "part_number": pn,
             "part_number_cotizacion": mejor_ln["part_number"],  # el número tal cual está en la cotización
+            "descripcion_cotizacion": mejor_ln["descripcion"],
             "cantidad_po": po_qty,                        # la cantidad del PO manda
             "cantidad_cotizacion": mejor_ln["quantity"],
             "precio_po": po_precio,
@@ -530,6 +590,13 @@ def cotejar(po: dict, forzar_quote_id: str = "") -> dict:
             discrepancias.append(
                 f"«{pn}» parece ser el código interno del cliente; el número real «{mejor_ln['part_number']}» "
                 f"aparece en la descripción (cot. {mejor_q['nombre'][:30]}) — confirma que es el mismo producto."
+            )
+        elif tipo_match in ("similar", "precio"):
+            motivo = "descripción parecida" if tipo_match == "similar" else "mismo precio"
+            discrepancias.append(
+                f"«{pn}» ({it.get('descripcion', '')[:40]}) no tiene número de parte en la cotización; "
+                f"la coincidencia es solo por {motivo} con «{(mejor_ln['descripcion'] or mejor_ln['part_number'])[:40]}» "
+                f"(cot. {mejor_q['nombre'][:30]}) — confirma que es la misma cotización."
             )
         elif tipo_match == "parcial":
             discrepancias.append(
@@ -648,14 +715,14 @@ def crear_sales_order(draft: dict) -> dict:
     # 2) Ajustar líneas: mapear por número de parte (compacto). PATCH cantidad, DELETE no-seleccionadas.
     sel = {}
     for ln in draft.get("lineas", []):
-        pc = _compact(ln.get("part_number", ""))
+        pc = _clave(ln.get("part_number", ""))
         if pc:
             sel[pc] = ln
     full = _crm_get(f"data/SalesOrder/{so_id}")
     lineas_so = (full.get("record", full).get("line_items") or [])
     ajustadas, quitadas = 0, 0
     for li in lineas_so:
-        pc = _compact(li.get("mfr_part_no", ""))
+        pc = _clave(li.get("mfr_part_no", ""), li.get("name", ""))
         d = sel.get(pc)
         if d is None or d.get("incluir") is False:
             _crm_delete("SalesOrderLine", li["id"]); quitadas += 1
