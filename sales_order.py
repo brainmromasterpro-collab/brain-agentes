@@ -542,6 +542,8 @@ def cotejar(po: dict, forzar_quote_id: str = "") -> dict:
 
     items_out: list[dict] = []
     cobertura: dict[str, int] = {}     # quote_id → nº de items del PO que cubre
+    puntaje: dict[str, float] = {}     # quote_id → puntaje de coincidencia (parte/descripción/precio)
+    precio_ok_n: dict[str, int] = {}   # quote_id → nº de items cuyo precio coincide
     discrepancias: list[str] = []
 
     for it in po.get("items", []):
@@ -568,8 +570,12 @@ def cotejar(po: dict, forzar_quote_id: str = "") -> dict:
             ok = _precio_coincide(po_precio, ln["unit_price"])
             if mejor_q is None or (ok and not precio_ok):
                 mejor_q, mejor_ln, precio_ok = q, ln, ok
+        base = {"exacto": 6, "parcial": 4, "descripcion": 4, "similar": 3, "precio": 2}.get(tipo_match, 1)
         for (q, _ln) in candidatos:
             cobertura[q["id"]] = cobertura.get(q["id"], 0) + 1
+            p_ok = _precio_coincide(po_precio, _ln["unit_price"])
+            puntaje[q["id"]] = puntaje.get(q["id"], 0) + base + (5 if p_ok else 0)
+            precio_ok_n[q["id"]] = precio_ok_n.get(q["id"], 0) + (1 if p_ok else 0)
 
         estado = "ok" if precio_ok else "precio_distinto"
         items_out.append({
@@ -621,13 +627,14 @@ def cotejar(po: dict, forzar_quote_id: str = "") -> dict:
         candidatas.append({
             "id": q["id"], "nombre": q["nombre"],
             "items_cubiertos": cov, "total_items_po": len(po.get("items", [])),
+            "items_precio_ok": precio_ok_n.get(q["id"], 0), "puntaje": puntaje.get(q["id"], 0),
             "referenciada": es_ref,
             **vig,
             "url": f"{CRM_BASE}/index.php?module=Quotes&action=DetailView&record={q['id']}",
         })
         if not vig["vigente"]:
             discrepancias.append(f"La cotización «{q['nombre'][:30]}» está {vig['motivo']}.")
-    candidatas.sort(key=lambda c: (c["referenciada"], c["items_cubiertos"], c["vigente"]), reverse=True)
+    candidatas.sort(key=lambda c: (c["referenciada"], c["puntaje"], c["items_cubiertos"], c["vigente"]), reverse=True)
 
     encontrados = sum(1 for i in items_out if i["estado"] != "no_encontrado")
     todo_ok = (encontrados == len(items_out) and len(items_out) > 0
@@ -647,7 +654,7 @@ def cotejar(po: dict, forzar_quote_id: str = "") -> dict:
     # el usuario elige primero (ver cotejar(..., forzar_quote_id=...) para la segunda vuelta).
     candidata_citada = any(c["referenciada"] for c in candidatas)
     con_cobertura = [c for c in candidatas if c["items_cubiertos"] > 0]
-    ambiguo = (not candidata_citada) and len(con_cobertura) > 1 and not todo_ok
+    ambiguo = (not candidata_citada) and len(con_cobertura) >= 1 and not todo_ok
 
     # DRAFT de la Sales Order (para el PREVIO). Referencia = candidata top (citada o mayor cobertura).
     so_draft = None if ambiguo else _armar_draft(cuenta, tm, po, items_out, candidatas, quotes, para_nosotros)
@@ -670,7 +677,7 @@ def cotejar(po: dict, forzar_quote_id: str = "") -> dict:
         "resumen": (f"{encontrados}/{len(items_out)} productos ubicados en cotizaciones; "
                     f"{len(candidatas)} cotización(es) candidata(s); "
                     f"{len(discrepancias)} discrepancia(s)."
-                    + (" Hay varias cotizaciones candidatas sin un match exacto — elige cuál es." if ambiguo else "")),
+                    + (" Ninguna cotización coincide exacto (parte y precio) — elige cuál es, ordenadas de mayor a menor coincidencia." if ambiguo else "")),
     }
 
 
