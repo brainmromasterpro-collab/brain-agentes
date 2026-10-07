@@ -238,6 +238,7 @@ def cotizaciones_cliente(cuenta_id: str, limite: int = 300) -> list[dict]:
     # related_quote_id de las SO del cliente (el GET por id sí las devuelve).
     ya = {q["id"] for q in out}
     so_ids: dict = {}
+    q_extra: set = set()   # cotizaciones ligadas directo a facturas (Invoice.from_quote_id)
     # SO abiertas (listado) + SO CERRADAS, que tampoco salen en el listado pero sí cuelgan de las
     # facturas del cliente (Invoice.from_so_id).
     for mod, campo in (("SalesOrder", "id"), ("Invoice", "from_so_id")):
@@ -247,14 +248,22 @@ def cotizaciones_cliente(cuenta_id: str, limite: int = 300) -> list[dict]:
             if not page:
                 break
             for r in page:
-                sid = r.get("id") if campo == "id" else (_crm_get(f"data/Invoice/{r['id']}").get("record", {}) or {}).get("from_so_id")
-                if sid:
-                    so_ids[sid] = True
+                if campo == "id":
+                    so_ids[r["id"]] = True
+                    continue
+                inv = _crm_get(f"data/Invoice/{r['id']}").get("record", {}) or {}
+                if inv.get("from_so_id"):
+                    so_ids[inv["from_so_id"]] = True
+                if inv.get("from_quote_id"):
+                    q_extra.add(inv["from_quote_id"])
             if len(page) < 20:
                 break
             off += 20
     for sid in so_ids:
         qid = (_crm_get(f"data/SalesOrder/{sid}").get("record", {}) or {}).get("related_quote_id")
+        if qid:
+            q_extra.add(qid)
+    for qid in q_extra:
         if qid and qid not in ya:
             cq = cotizacion_por_id(qid)
             if cq:
