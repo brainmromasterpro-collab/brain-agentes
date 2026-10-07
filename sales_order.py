@@ -198,26 +198,70 @@ def _es_para_nosotros(proveedor: str) -> bool | None:
 # ─────────────────────────────────────────────────────────────
 # 2. COTIZACIONES DEL CLIENTE (índice de líneas)
 # ─────────────────────────────────────────────────────────────
+def cotizaciones_ocultas_ui(po: dict, cuenta_id: str, excluir: set, max_ids: int = 25) -> list[dict]:
+    """Cotizaciones del cliente que la API de 1CRM NO lista (cerradas/aceptadas/vencidas-cerradas, sobre
+    todo las antiguas cuya SO ya no cuelga de nada visible) pero que el buscador de la interfaz SÍ
+    encuentra. Caso real: Q2024-0426-1114 'Lamina Acero inoxidable c26' (Closed Accepted, línea a
+    $2,239.38 idéntica al PO) — invisible para data/Quote, y su SO tampoco sale. Se busca en la UI
+    (Playwright, mismo patrón que subir_po_a_so) por número de parte y palabras clave de la
+    descripción, se toma el ID de cada resultado y se lee por la API (el GET por id sí funciona).
+    Solo se llama cuando no hay match exacto de parte+precio. Cualquier falla devuelve []."""
+    import re as _re
+    from urllib.parse import quote_plus
+    consultas: list = []
+    for it in po.get("items", []):
+        if it.get("part_number"):
+            consultas.append(str(it["part_number"]))
+        toks = [t for t in re.findall(r"[A-Za-z0-9]+", _norm(it.get("descripcion", ""))) if len(t) >= 4 and t.lower() not in _STOP]
+        if toks:
+            consultas.append(" ".join(toks[:3]))
+    if not consultas or not CRM_BASE:
+        return []
+    ids: list = []
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            page = browser.new_context(ignore_https_errors=True).new_page()
+            page.goto(f"{CRM_BASE}/index.php?module=Users&action=Login", timeout=30000)
+            page.fill('input[name="user_name"]', os.environ.get("ONECRM_USERNAME", ""))
+            page.fill('input[name="user_password"]', os.environ.get("ONECRM_PASSWORD", ""))
+            page.click('input[type="submit"], button[type="submit"]')
+            page.wait_for_url(f"{CRM_BASE}/index.php*", timeout=20000)
+            for c in consultas[:6]:
+                page.goto(f"{CRM_BASE}/index.php?module=Quotes&action=index&query_string={quote_plus(c)}", timeout=40000)
+                page.wait_for_load_state("networkidle", timeout=40000)
+                for a in page.locator("a[href*='module=Quotes'][href*='action=DetailView']").all():
+                    m = _re.search(r"record=([0-9a-f-]{36})", a.get_attribute("href") or "")
+                    if m and m.group(1) not in excluir and m.group(1) not in ids:
+                        ids.append(m.group(1))
+            browser.close()
+    except Exception as e:
+        log.warning(f"Búsqueda de cotizaciones ocultas en la UI falló: {e}")
+        return []
+    out = []
+    for qid in ids[:max_ids]:
+        cq = cotizacion_por_id(qid)
+        if cq and cq.get("cuenta_id") == cuenta_id:
+            cq["cerrada"] = True
+            out.append(cq)
+    return out
+
+
 def cotizaciones_cliente(cuenta_id: str, limite: int = 300) -> list[dict]:
     """Cotizaciones recientes del cliente CON sus líneas. Cada una:
     {id, nombre, lines:[{part_number, part_compact, unit_price, quantity, descripcion}]}."""
     # La API devuelve páginas cortas (~20): se pagina hasta `limite`. Con 40 se perdían cotizaciones
     # viejas del cliente (bug real: la cotización de 5999833 de Weidmann quedaba fuera, 161 en total).
-    registros: list = []
-    offset = 0
-    while len(registros) < limite:
-        data = _crm_get("data/Quote", {
-            "filters[billing_account_id]": cuenta_id,
-            "order_by": "date_modified desc",
-            "limit": 20, "offset": offset,
-        })
-        page = data.get("records", [])
-        if not page:
-            break
-        registros += page
-        offset += 20
-        if len(page) < 20:
-            break
+    from concurrent.futures import ThreadPoolExecutor
+    prim = _crm_get("data/Quote", {"filters[billing_account_id]": cuenta_id, "order_by": "date_modified desc", "limit": 20, "offset": 0})
+    registros: list = list(prim.get("records", []))
+    total = int(prim.get("total_results") or len(registros))
+    if len(registros) == 20 and total > 20:
+        offs = list(range(20, min(total, limite), 20))
+        with ThreadPoolExecutor(8) as ex:
+            for page in ex.map(lambda o: _crm_get("data/Quote", {"filters[billing_account_id]": cuenta_id, "order_by": "date_modified desc", "limit": 20, "offset": o}).get("records", []), offs):
+                registros += page
     out: list[dict] = []
     for q in registros[:limite]:
         lines = []
@@ -236,40 +280,40 @@ def cotizaciones_cliente(cuenta_id: str, limite: int = 300) -> list[dict]:
     # Sales Order — de 980 solo salen 974). Pero se pueden reutilizar (pedido de Gabriel: aunque estén
     # cerradas o vencidas deben salir como opción y que el usuario escoja), así que se recuperan por el
     # related_quote_id de las SO del cliente (el GET por id sí las devuelve).
+    from concurrent.futures import ThreadPoolExecutor
     ya = {q["id"] for q in out}
-    so_ids: dict = {}
+    so_ids: set = set()
     q_extra: set = set()   # cotizaciones ligadas directo a facturas (Invoice.from_quote_id)
-    # SO abiertas (listado) + SO CERRADAS, que tampoco salen en el listado pero sí cuelgan de las
-    # facturas del cliente (Invoice.from_so_id).
-    for mod, campo in (("SalesOrder", "id"), ("Invoice", "from_so_id")):
-        off = 0
+
+    def _paginas(mod):
+        res, off = [], 0
         while off < 400:
             page = _crm_get(f"data/{mod}", {"filters[billing_account_id]": cuenta_id, "limit": 20, "offset": off}).get("records", [])
             if not page:
                 break
-            for r in page:
-                if campo == "id":
-                    so_ids[r["id"]] = True
-                    continue
-                inv = _crm_get(f"data/Invoice/{r['id']}").get("record", {}) or {}
-                if inv.get("from_so_id"):
-                    so_ids[inv["from_so_id"]] = True
-                if inv.get("from_quote_id"):
-                    q_extra.add(inv["from_quote_id"])
+            res += page
             if len(page) < 20:
                 break
             off += 20
-    for sid in so_ids:
-        qid = (_crm_get(f"data/SalesOrder/{sid}").get("record", {}) or {}).get("related_quote_id")
-        if qid:
-            q_extra.add(qid)
-    for qid in q_extra:
-        if qid and qid not in ya:
-            cq = cotizacion_por_id(qid)
+        return res
+
+    # SO abiertas (listado) + SO CERRADAS, que tampoco salen en el listado pero sí cuelgan de las
+    # facturas del cliente (Invoice.from_so_id). Los GET por id se hacen en paralelo (eran lentos).
+    so_ids.update(r["id"] for r in _paginas("SalesOrder"))
+    with ThreadPoolExecutor(8) as ex:
+        for inv in ex.map(lambda r: (_crm_get(f"data/Invoice/{r['id']}").get("record", {}) or {}), _paginas("Invoice")):
+            if inv.get("from_so_id"):
+                so_ids.add(inv["from_so_id"])
+            if inv.get("from_quote_id"):
+                q_extra.add(inv["from_quote_id"])
+        for rec in ex.map(lambda sid: (_crm_get(f"data/SalesOrder/{sid}").get("record", {}) or {}), list(so_ids)):
+            if rec.get("related_quote_id"):
+                q_extra.add(rec["related_quote_id"])
+        nuevos = [qid for qid in q_extra if qid and qid not in ya]
+        for cq in ex.map(cotizacion_por_id, nuevos):
             if cq:
                 cq["cerrada"] = True
                 out.append(cq)
-                ya.add(qid)
     return out
 
 
@@ -681,12 +725,32 @@ def cotejar(po: dict, forzar_quote_id: str = "") -> dict:
         if ref_id not in {q["id"] for q in quotes}:
             quotes.insert(0, ref_q)
 
+    def _indexar(qs):
+        idx: dict[str, list[tuple[dict, dict]]] = {}
+        for q in qs:
+            for ln in q["lines"]:
+                if ln["part_compact"]:
+                    idx.setdefault(ln["part_compact"], []).append((q, ln))
+        return idx
+
     # índice part_compact → lista de (quote, line)
-    indice: dict[str, list[tuple[dict, dict]]] = {}
-    for q in quotes:
-        for ln in q["lines"]:
-            if ln["part_compact"]:
-                indice.setdefault(ln["part_compact"], []).append((q, ln))
+    indice = _indexar(quotes)
+
+    # Si algún renglón NO tiene match exacto de parte+precio, buscar también las cotizaciones que la API
+    # no lista (cerradas/aceptadas antiguas) en el buscador de la interfaz — pedido de Gabriel: aunque
+    # estén cerradas o vencidas, si coinciden deben salir como opción y que el usuario escoja.
+    def _exacto_con_precio(it) -> bool:
+        pr = _num(it.get("precio_unitario"))
+        return any(_precio_coincide(pr, ln["unit_price"]) for _q, ln in indice.get(_compact(it.get("part_number", "")), []))
+    if po.get("items") and not all(_exacto_con_precio(it) for it in po["items"]):
+        try:
+            extra = cotizaciones_ocultas_ui(po, cuenta["id"], {q["id"] for q in quotes})
+        except Exception as e:
+            log.warning(f"cotizaciones_ocultas_ui: {e}")
+            extra = []
+        if extra:
+            quotes = quotes + extra
+            indice = _indexar(quotes)
 
     items_out: list[dict] = []
     cobertura: dict[str, int] = {}     # quote_id → nº de items del PO que cubre
