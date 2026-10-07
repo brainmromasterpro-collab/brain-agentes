@@ -536,6 +536,57 @@ def so_existente_por_po(po_number: str, cuenta_id: str = "") -> dict | None:
     return None
 
 
+def ventas_previas(cuenta_id: str, po: dict, max_hits: int = 5) -> list[dict]:
+    """Ventas YA HECHAS al cliente (Facturas y Sales Orders) cuyas líneas coinciden con los renglones
+    del PO por descripción y/o precio. Las cotizaciones aceptadas/cerradas NO salen en el listado de
+    cotizaciones de la API, y una línea agregada directo a la SO/Factura (como la lámina de Weidmann,
+    FAC243 a $2,239.38) tampoco está en ninguna cotización — pero es la mejor prueba de que ese producto
+    ya se vendió a ese precio. Devuelve [{tipo, numero, fecha, descripcion, precio, cantidad,
+    coincide_precio, coincide_descripcion, url}] de mejor a menor coincidencia."""
+    hits = []
+    for it in po.get("items", []):
+        toks = _tokens(it.get("descripcion", ""))
+        pc = _compact(it.get("part_number", ""))
+        po_precio = _num(it.get("precio_unitario"))
+        for mod, url_mod, pref in (("Invoice", "Invoices", "INV"), ("SalesOrder", "SalesOrders", "SO")):
+            offset = 0
+            while offset < 400:
+                data = _crm_get(f"data/{mod}", {"filters[billing_account_id]": cuenta_id, "limit": 20, "offset": offset})
+                page = data.get("records", [])
+                if not page:
+                    break
+                for rec in page:
+                    for ln in (rec.get("line_items") or []):
+                        ratio = (len(toks & _tokens(ln.get("name", ""))) / len(toks)) if toks else 0
+                        pr = _pts_precio(po_precio, _num(ln.get("unit_price")))
+                        mismo_pn = bool(pc) and _compact(ln.get("mfr_part_no", "")) == pc
+                        c_desc = ratio >= 0.5 or mismo_pn
+                        c_prec = pr >= 12
+                        if not (c_desc or (c_prec and ratio >= 0.2)):
+                            continue
+                        hits.append({
+                            "score": (12 if c_prec else pr) + 8 * ratio + (6 if mismo_pn else 0),
+                            "tipo": "Factura" if mod == "Invoice" else "Sales Order",
+                            "numero": (rec.get("_display") or rec.get("name") or "").split(":")[0],
+                            "fecha": (rec.get("invoice_date") or rec.get("date_entered") or "")[:10],
+                            "descripcion": ln.get("name", ""), "precio": _num(ln.get("unit_price")),
+                            "cantidad": _num(ln.get("quantity")),
+                            "coincide_precio": c_prec, "coincide_descripcion": c_desc,
+                            "url": f"{CRM_BASE}/index.php?module={url_mod}&action=DetailView&record={rec.get('id')}",
+                            "_id": rec.get("id"), "_mod": mod,
+                        })
+                if len(page) < 20:
+                    break
+                offset += 20
+    hits.sort(key=lambda h: h["score"], reverse=True)
+    top = hits[:max_hits]
+    for h in top:
+        h.pop("score", None)
+        det = _crm_get(f"data/{h.pop('_mod')}/{h.pop('_id')}").get("record", {})  # el listado no trae fecha
+        h["fecha"] = (det.get("invoice_date") or det.get("date_entered") or "")[:10]
+    return top
+
+
 def cotejar(po: dict, forzar_quote_id: str = "") -> dict:
     """Cruza el PO contra las cotizaciones del cliente. NO escribe nada.
     Devuelve un diagnóstico completo para armar el previo y elegir la cotización de referencia.
@@ -746,6 +797,7 @@ def cotejar(po: dict, forzar_quote_id: str = "") -> dict:
         "para_nosotros": para_nosotros,
         "ambiguo": ambiguo,
         "forzada": bool(forzar_quote_id),
+        "ventas_previas": ventas_previas(cuenta["id"], po),
         "so_draft": so_draft,               # True / False / None (no lo dice)
         "terminos_pago": tm["terminos_pago"],         # default_terms del cliente
         "moneda": po.get("moneda", "") or tm["moneda"],
