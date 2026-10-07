@@ -340,14 +340,26 @@ def _tokens(txt: str) -> set:
     return {w for w in re.findall(r"[A-Z0-9]+", _norm(txt)) if len(w) >= 3 and w.lower() not in _STOP}
 
 
-def _match_texto_precio(descripcion: str, po_precio, indice: dict) -> tuple[list, str]:
-    """Último respaldo cuando el número de parte del PO no aparece en ninguna cotización (el cliente
-    usa SU código interno y la cotización no trae número de parte): busca en las líneas de las
-    cotizaciones por (a) DESCRIPCIÓN parecida (>=50% de las palabras del PO presentes en la línea)
-    y/o (b) PRECIO exacto. Siempre se devuelve como match por confirmar (tipo 'similar'/'precio'),
-    nunca silencioso — pedido de Gabriel: con una sola coincidencia (producto O precio), preguntar."""
+def _pts_precio(po_precio, cot_precio) -> int:
+    """Puntos por cercanía de precio PO vs cotizado: idéntico (al centavo/0.02%) 12, <=1% 8, <=5% 5, <=15% 2."""
+    if po_precio is None or not cot_precio:
+        return 0
+    d = abs(po_precio - cot_precio)
+    if d <= 0.05 or d / max(abs(cot_precio), 0.01) <= 0.0002:
+        return 12
+    r = d / max(abs(cot_precio), 0.01)
+    return 8 if r <= 0.01 else (5 if r <= 0.05 else (2 if r <= 0.15 else 0))
+
+
+def _match_texto_precio(descripcion: str, po_precio, indice: dict, max_quotes: int = 6) -> tuple[list, str]:
+    """Respaldo cuando el número de parte del PO no aparece en ninguna cotización (el cliente usa SU
+    código interno / la cotización no trae número de parte): puntúa TODAS las líneas de las
+    cotizaciones del cliente por (a) palabras de la descripción en común y (b) cercanía de PRECIO
+    (idéntico +12, <=5% +6, <=15% +2; el precio es el indicador principal) y devuelve las mejores
+    cotizaciones (hasta `max_quotes`) de más a menos cercana, para que el usuario elija. Siempre es
+    un match por confirmar. Cada línea trae '_txt' (proporción de palabras del PO que comparte)."""
     toks = _tokens(descripcion)
-    similares, por_precio = [], []
+    mejores: dict = {}   # quote_id -> (score, q, ln)
     vistos = set()
     for lst in indice.values():
         for (q, ln) in lst:
@@ -355,18 +367,22 @@ def _match_texto_precio(descripcion: str, po_precio, indice: dict) -> tuple[list
             if k in vistos:
                 continue
             vistos.add(k)
-            lt = _tokens(ln.get("descripcion", ""))
-            if toks and len(toks & lt) / len(toks) >= 0.5 and len(toks & lt) >= 2:
-                p_ok = po_precio is not None and ln["unit_price"] is not None and _precio_coincide(po_precio, ln["unit_price"])
-                similares.append((p_ok, len(toks & lt) / len(toks), q, ln))
-            elif po_precio is not None and ln["unit_price"] is not None and _precio_coincide(po_precio, ln["unit_price"]):
-                por_precio.append((q, ln))
-    if similares:
-        similares.sort(key=lambda t: (t[0], t[1]), reverse=True)  # mejor coincidencia primero
-        return [(q, ln) for (_p, _o, q, ln) in similares], "similar"
-    if len(por_precio) == 1:  # precio solo cuenta si es una coincidencia única (si no, es azar)
-        return por_precio, "precio"
-    return [], ""
+            comunes = len(toks & _tokens(ln.get("descripcion", ""))) if toks else 0
+            ratio = comunes / len(toks) if toks else 0
+            score_txt = 8 * ratio
+            score_pr = _pts_precio(po_precio, ln["unit_price"])
+            if comunes < 1 and score_pr < 12:
+                score_pr = score_pr / 2   # precio parecido pero producto sin relación: vale la mitad
+            score = score_txt + score_pr
+            if (comunes < 1 and score_pr < 1) or score < 1.5:
+                continue   # sin palabras en común y sin precio IDÉNTICO: ruido (precios parecidos de productos distintos)
+            if q["id"] not in mejores or score > mejores[q["id"]][0]:
+                ln2 = dict(ln); ln2["_txt"] = ratio
+                mejores[q["id"]] = (score, q, ln2)
+    ordenadas = sorted(mejores.values(), key=lambda t: t[0], reverse=True)[:max_quotes]
+    if not ordenadas:
+        return [], ""
+    return [(q, ln) for (_s, q, ln) in ordenadas], "similar"
 
 
 def _match_por_precio(descripcion: str, po_precio, indice: dict) -> list:
@@ -620,14 +636,14 @@ def cotejar(po: dict, forzar_quote_id: str = "") -> dict:
                 mejor_q, mejor_ln, precio_ok = q, ln, ok
         if (mejor_q["id"], id(mejor_ln)) in extras:
             tipo_match, parcial = "precio", True
-        base = {"exacto": 6, "parcial": 4, "descripcion": 4, "similar": 3, "precio": 2}.get(tipo_match, 1)
+        base = {"exacto": 6, "parcial": 4, "descripcion": 4, "similar": 0, "precio": 2}.get(tipo_match, 1)
         for (q, _ln) in candidatos:
             cobertura[q["id"]] = cobertura.get(q["id"], 0) + 1
             p_ok = _precio_coincide(po_precio, _ln["unit_price"])
-            _dif = (abs(po_precio - _ln["unit_price"]) / max(abs(_ln["unit_price"]), 0.01)
-                    if (po_precio is not None and _ln["unit_price"]) else 9)
-            _bono_precio = 12 if p_ok else (6 if _dif <= 0.05 else (2 if _dif <= 0.15 else 0))
-            puntaje[q["id"]] = puntaje.get(q["id"], 0) + (base if (q["id"], id(_ln)) not in extras else 2) + _bono_precio
+            _bono_precio = _pts_precio(po_precio, _ln["unit_price"])
+            if tipo_match == "similar" and _ln.get("_txt", 0) == 0 and _bono_precio < 12:
+                _bono_precio = _bono_precio / 2   # precio parecido de un producto sin relación vale la mitad
+            puntaje[q["id"]] = puntaje.get(q["id"], 0) + (base if (q["id"], id(_ln)) not in extras else 2) + _bono_precio + 10 * _ln.get("_txt", 0)
             precio_ok_n[q["id"]] = precio_ok_n.get(q["id"], 0) + (1 if p_ok else 0)
 
         estado = "ok" if precio_ok else "precio_distinto"
