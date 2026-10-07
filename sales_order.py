@@ -374,7 +374,11 @@ def _match_texto_precio(descripcion: str, po_precio, indice: dict, max_quotes: i
             if comunes < 1 and score_pr < 12:
                 score_pr = score_pr / 2   # precio parecido pero producto sin relación: vale la mitad
             score = score_txt + score_pr
-            if (comunes < 1 and score_pr < 1) or score < 1.5:
+            # Congruente con el CRM: solo se sugiere si hay relación REAL de producto o precio idéntico —
+            # >=50% de las palabras del PO, o precio idéntico, o precio <=5% con alguna palabra en común.
+            # (Antes entraban productos sin relación solo por tener un precio parecido: básculas,
+            # hidrolavadoras, cafeteras... que confundían al usuario.)
+            if not (ratio >= 0.5 or score_pr >= 12 or (comunes >= 1 and _pts_precio(po_precio, ln["unit_price"]) >= 5)):
                 continue   # sin palabras en común y sin precio IDÉNTICO: ruido (precios parecidos de productos distintos)
             if q["id"] not in mejores or score > mejores[q["id"]][0]:
                 ln2 = dict(ln); ln2["_txt"] = ratio
