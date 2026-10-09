@@ -134,6 +134,36 @@ def _terminos_proveedor(nombre: str) -> str:
     return ""
 
 
+_MONEDAS_NOMBRE = {"USD": "US Dollar", "MXN": "Mexican Peso", "EUR": "Euro", "CAD": "Canadian Dollar",
+                   "GBP": "UK Pound", "CNY": "Chinese Yuan Renminbi", "JPY": "Japanese Yen"}
+_monedas_cache: dict = {}
+
+
+def _monedas_crm() -> dict:
+    """{codigo ISO: {id, codigo, nombre}} de las monedas de 1CRM (nombre inglés → código)."""
+    if not _monedas_cache:
+        try:
+            recs = sales_order._crm_get("data/Currency", {"limit": 50}).get("records", [])
+            por_nombre = {r.get("name"): r.get("id") for r in recs}
+            for cod, nom in _MONEDAS_NOMBRE.items():
+                if por_nombre.get(nom):
+                    _monedas_cache[cod] = {"id": por_nombre[nom], "codigo": cod, "nombre": nom}
+        except Exception:
+            pass
+    return _monedas_cache
+
+
+def _modelo_en_titulo(link: dict) -> str:
+    """Número de parte para la línea del PO cuando ni el link ni la SO lo traen separado: el código
+    del título del link que aparece dentro de la línea de la SO (ej. "BI2-M12-AP6X")."""
+    dc = sales_order._compact(link.get("descripcion_so", ""))
+    for tok in re.findall(r"[A-Za-z0-9][A-Za-z0-9\-_./]{3,}[A-Za-z0-9]", link.get("nombre", "") or ""):
+        c = sales_order._compact(tok)
+        if len(c) >= 5 and re.search(r"[A-Z]", c) and re.search(r"\d", c) and c in dc:
+            return tok.upper()
+    return ""
+
+
 def _so_detalle(so_id: str) -> dict:
     """Detalle completo de UNA Sales Order candidata (so_stage, cliente, currency_id, so_number,
     términos y perfil fiscal de la cuenta) — se llama solo para las pocas que ya matchearon, no
@@ -274,6 +304,7 @@ def buscar_sales_orders_candidatas(links_data: list[dict]) -> dict:
                 **link,
                 "part_number_so": ln["part_number"],
                 "descripcion_so": ln["descripcion"],
+                "cantidad_so": ln.get("quantity"),
                 "tipo_match": tipo_match,
                 "match_parcial": tipo_match in ("parcial", "descripcion"),
             })
@@ -289,12 +320,15 @@ def buscar_sales_orders_candidatas(links_data: list[dict]) -> dict:
         # Proveedor sugerido = dominio del primer link (normalmente todos vienen del mismo
         # marketplace en una sola compra); el usuario lo puede corregir en el widget.
         proveedor_sugerido = _proveedor_de_url(links[0]["url"]) if links else ""
+        cods = {(l.get("moneda") or "").upper() for l in links if l.get("moneda")}
+        moneda_po = _monedas_crm().get(next(iter(cods))) if len(cods) == 1 else None
         terminos_prov = _terminos_proveedor(proveedor_sugerido)
         terminos_g = terminos_prov
         lineas_sugeridas = [{
             "name": l.get("nombre") or l.get("descripcion_so") or "Producto",
-            "mfr_part_no": l.get("part_number") or l.get("part_number_so") or "",
-            "quantity": 1,
+            "mfr_part_no": l.get("part_number") or l.get("part_number_so") or _modelo_en_titulo(l),
+            # Se compra lo que pide la línea de la SO (antes siempre 1); editable en el borrador.
+            "quantity": l.get("cantidad_so") or 1,
             "unit_price": sales_order._num(l.get("precio_costo")) or 0,
         } for l in links]
         grupos_out.append({
@@ -303,7 +337,12 @@ def buscar_sales_orders_candidatas(links_data: list[dict]) -> dict:
             "so_numero": detalle["so_number"],
             "so_url": f"{CRM_BASE}/index.php?module=SalesOrders&action=DetailView&record={so_id}",
             "cliente": detalle["cliente"],
-            "currency_id": detalle["currency_id"],
+            # La moneda del PO es la del PROVEEDOR (en la que se paga el link, ej. eBay en USD), no
+            # la de la Sales Order del cliente (puede ser MXN) — mismo criterio que las condiciones.
+            "currency_id": moneda_po["id"] if moneda_po else detalle["currency_id"],
+            "moneda_codigo": moneda_po["codigo"] if moneda_po else "",
+            "moneda_so_id": detalle["currency_id"],
+            "monedas_opciones": list(_monedas_crm().values()),
             "terminos_pago": terminos_g,
             "terminos_origen": "proveedor",
             "tax_code_id": detalle["tax_code_id"],
