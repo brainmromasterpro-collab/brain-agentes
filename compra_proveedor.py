@@ -95,6 +95,46 @@ def sales_orders_abiertas(limite: int = 150) -> list[dict]:
     return out
 
 
+def _terminos_para_po(cuenta_full: dict) -> str:
+    """Condiciones de pago para el PO/Bill. Prioridad: `default_purchase_terms` (Condiciones de la
+    Compra); si está vacío, se usa `default_terms` (Condiciones de la Venta) y por último
+    `payment_terms` — el cliente suele tener configurado solo uno (caso real: Weidmann tenía
+    "Net 30 Days" en Venta y Compra vacío, y se bloqueaba el PO). Se normaliza al valor que acepta
+    el enum de PurchaseOrder/Bill ("Net 30 Days" → "Net 30", "Net_30" → "Net 30")."""
+    for campo in ("default_purchase_terms", "default_terms", "payment_terms"):
+        v = (cuenta_full.get(campo) or "").strip()
+        if not v:
+            continue
+        v = v.replace("_", " ")
+        if v.lower().startswith("advance") and "100" in v:
+            return "100% Advance"
+        if v.lower().startswith("advance") and "50" in v:
+            return "Advance 50% / 50%"
+        v = re.sub(r"\s+days?$", "", v, flags=re.I)
+        return v
+    return ""
+
+
+def _terminos_proveedor(nombre: str) -> str:
+    """Condiciones de pago pactadas con el PROVEEDOR (el trato del PO es con él): si ya existe
+    como cuenta Supplier en 1CRM y tiene términos de compra/pago, esos mandan. Vacío si no existe
+    o no tiene (entonces se cae a los del cliente de la SO)."""
+    nombre = (nombre or "").strip()
+    if not nombre:
+        return ""
+    try:
+        data = sales_order._crm_get("data/Account", {
+            "filters[account_type]": "Supplier", "filter_text": nombre, "limit": 10})
+        n = sales_order._norm(nombre)
+        for r in data.get("records", []):
+            if sales_order._norm(r.get("name", "")) == n:
+                full = sales_order._crm_get(f"data/Account/{r['id']}").get("record", {})
+                return _terminos_para_po(full)
+    except Exception:
+        pass
+    return ""
+
+
 def _so_detalle(so_id: str) -> dict:
     """Detalle completo de UNA Sales Order candidata (so_stage, cliente, currency_id, so_number,
     términos y perfil fiscal de la cuenta) — se llama solo para las pocas que ya matchearon, no
@@ -117,7 +157,7 @@ def _so_detalle(so_id: str) -> dict:
         "so_number": rec.get("so_number"),
         "cliente": (cuenta or {}).get("nombre", ""),
         "currency_id": rec.get("currency_id") or "",
-        "terminos_pago": cuenta_full.get("default_purchase_terms", "") or "",
+        "terminos_pago": _terminos_para_po(cuenta_full),
         "tax_code_id": cuenta_full.get("tax_code_id") or "",
     }
 
@@ -254,6 +294,8 @@ def buscar_sales_orders_candidatas(links_data: list[dict]) -> dict:
         # Proveedor sugerido = dominio del primer link (normalmente todos vienen del mismo
         # marketplace en una sola compra); el usuario lo puede corregir en el widget.
         proveedor_sugerido = _proveedor_de_url(links[0]["url"]) if links else ""
+        terminos_prov = _terminos_proveedor(proveedor_sugerido)
+        terminos_g = terminos_prov or detalle["terminos_pago"]
         lineas_sugeridas = [{
             "name": l.get("nombre") or l.get("descripcion_so") or "Producto",
             "mfr_part_no": l.get("part_number") or l.get("part_number_so") or "",
@@ -267,13 +309,14 @@ def buscar_sales_orders_candidatas(links_data: list[dict]) -> dict:
             "so_url": f"{CRM_BASE}/index.php?module=SalesOrders&action=DetailView&record={so_id}",
             "cliente": detalle["cliente"],
             "currency_id": detalle["currency_id"],
-            "terminos_pago": detalle["terminos_pago"],
+            "terminos_pago": terminos_g,
+            "terminos_origen": "proveedor" if terminos_prov else "cliente",
             "tax_code_id": detalle["tax_code_id"],
             # Condiciones de pago es un campo OBLIGATORIO en 1CRM (pedido explícito de Gabriel:
             # nunca crear el PO en silencio sin esto) — se avisa aquí para que el usuario lo
             # configure en la cuenta del cliente antes de confirmar; crear_po_y_ap también lo
             # bloquea como segunda barrera aunque el frontend ya lo prevenga.
-            "sin_terminos_pago": not detalle["terminos_pago"],
+            "sin_terminos_pago": not terminos_g,
             "ya_comprado": yc,
             "proveedor_nombre": proveedor_sugerido,
             "lineas": lineas_sugeridas,
@@ -386,17 +429,19 @@ def crear_po_y_ap(draft: dict) -> dict:
     lineas = draft.get("lineas") or []
     if not lineas:
         return {"error": "faltan líneas para crear la orden de compra"}
-    # Condiciones de pago es obligatorio en 1CRM (pedido explícito de Gabriel) — solo se exige
-    # cuando hay una Sales Order de por medio (con cliente real detrás); un gasto general
-    # (so_id vacío) no tiene cliente del que sacar términos.
-    if draft.get("so_id") and not draft.get("terminos_pago"):
-        return {"error": "El cliente de esta Sales Order no tiene Condiciones de pago configuradas "
-                         "en 1CRM (campo obligatorio) — configúralas en la cuenta del cliente antes "
-                         "de crear la orden de compra."}
-
     supplier_id = _buscar_o_crear_proveedor(draft.get("proveedor_nombre", ""))
     if not supplier_id:
         return {"error": "no se pudo resolver ni dar de alta el proveedor"}
+
+    # Condiciones de pago es obligatorio en 1CRM (pedido explícito de Gabriel). El trato del PO es
+    # con el PROVEEDOR: si él tiene términos, esos mandan (el usuario pudo cambiar el proveedor en
+    # el widget); si no, los del cliente de la SO. Solo se exige cuando hay SO de por medio.
+    terminos = _terminos_proveedor(draft.get("proveedor_nombre", "")) or draft.get("terminos_pago") or ""
+    draft = {**draft, "terminos_pago": terminos}
+    if draft.get("so_id") and not terminos:
+        return {"error": "Ni el proveedor ni el cliente de esta Sales Order tienen Condiciones de pago "
+                         "configuradas en 1CRM (campo obligatorio) — configúralas en la cuenta del "
+                         "proveedor o del cliente antes de crear la orden de compra."}
 
     currency_id = draft.get("currency_id") or ""
     total = sum(float(ln.get("unit_price") or 0) * float(ln.get("quantity") or 1) for ln in lineas)
