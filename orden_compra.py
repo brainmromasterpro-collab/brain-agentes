@@ -181,9 +181,19 @@ _NORM_SYS = (
     '    {"part_number": "número de parte/modelo tal cual", "descripcion": "texto del renglón", '
     '"cantidad": number, "precio_unitario": number o null}\n'
     "  ],\n"
-    '  "notas": "cualquier dato dudoso o que faltó, en una línea"\n'
+    '  "notas": "cualquier dato dudoso o que faltó, en una línea",\n'
+    '  "tipo_documento": "orden_compra | comprobante_pago | otro",\n'
+    '  "monto_pagado": number o null  (solo si es un comprobante de pago/transferencia: el importe),\n'
+    '  "referencia_pago": "folio/referencia/clave de rastreo del comprobante, o \\"\\""\n'
     "}\n\n"
     "REGLAS:\n"
+    "- MRO Online 4U / MRO Master Pro / MRO MasterPro son NOSOTROS (el PROVEEDOR/vendedor). NUNCA los pongas "
+    "como 'cliente': el cliente es la OTRA empresa (la que compra o paga).\n"
+    "- COMPROBANTE DE PAGO/TRANSFERENCIA (BBVA, SPEI, traspaso, depósito): tipo_documento='comprobante_pago'; "
+    "el CLIENTE es quien PAGA (ordenante / titular de la cuenta de retiro / nombre del encabezado de la "
+    "operación), NO el beneficiario ('nombre del tercero' / cuenta de depósito, que somos nosotros). "
+    "Si el concepto dice 'COT 2159' o similar, pon '2159' en cotizacion_ref. items puede ir vacío. "
+    "Restaura los espacios en nombres pegados (DEHERRAMIENTAMAQUINADO → DE HERRAMIENTA MAQUINADO).\n"
     "- NO inventes. Si un precio o cantidad no aparece, usa null (precio) o deja el item con lo que haya.\n"
     "- El part_number es el identificador del producto (SKU/modelo/mfr part no), NO la descripción.\n"
     "- Si el documento incluye o cita una COTIZACIÓN/PRESUPUESTO nuestro (de MRO Master Pro), pon su "
@@ -303,7 +313,7 @@ def leer_po_texto(texto: str, model_id: str = "") -> dict:
     texto = (texto or "").strip()
     if not texto:
         return {"error": "texto vacío", "items": []}
-    datos = normalizar(texto[:30000], model_id=model_id)
+    datos = _corregir_comprador(normalizar(texto[:30000], model_id=model_id))
     datos["formato"] = "texto"
     return datos
 
@@ -330,6 +340,24 @@ def leer_po_url(url: str, model_id: str = "") -> dict:
     return datos
 
 
+def _corregir_comprador(datos: dict) -> dict:
+    """Red de seguridad: el CLIENTE nunca somos nosotros (MRO). Si el modelo puso a MRO como cliente y
+    al otro como proveedor (error real con un comprobante de transferencia), se intercambian."""
+    import re as _re
+    nuestros = [_re.sub(r"[^A-Z0-9]", "", n.upper()) for n in
+                os.environ.get("NUESTRO_NOMBRE", "MRO Master Pro,MRO MasterPro,MRO Online 4U").split(",") if n.strip()]
+    def _es_nuestro(x: str) -> bool:
+        c = _re.sub(r"[^A-Z0-9]", "", (x or "").upper())
+        return bool(c) and any(t and (t in c or c in t) for t in nuestros)
+    if _es_nuestro(datos.get("cliente", "")):
+        prov = datos.get("proveedor", "")
+        datos["cliente"] = prov if prov and not _es_nuestro(prov) else ""
+        datos["proveedor"] = "MRO Online 4U SA de CV"
+    if not datos.get("po_number") and datos.get("tipo_documento") == "comprobante_pago" and datos.get("referencia_pago"):
+        datos["po_number"] = f"PAGO-{datos['referencia_pago']}"
+    return datos
+
+
 def leer_po(url: str = "", data: bytes = b"", nombre: str = "", mime: str = "", model_id: str = "") -> dict:
     """Punto de entrada: baja el archivo (o usa data), extrae texto y lo normaliza.
     Devuelve {cliente, po_number, moneda, items[...], notas, formato} o {error}."""
@@ -346,7 +374,7 @@ def leer_po(url: str = "", data: bytes = b"", nombre: str = "", mime: str = "", 
         imgs = _imagen_a_png(data)
         if not imgs:
             return {"error": "no pude abrir la imagen de la orden", "items": [], "formato": "imagen"}
-        datos = normalizar_vision(imgs, model_id=model_id)
+        datos = _corregir_comprador(normalizar_vision(imgs, model_id=model_id))
         datos["formato"] = "imagen"
         return datos
 
@@ -366,6 +394,6 @@ def leer_po(url: str = "", data: bytes = b"", nombre: str = "", mime: str = "", 
                 return datos
         return {"error": f"no pude extraer texto del archivo ({fmt})", "items": [], "formato": fmt}
 
-    datos = normalizar(texto, model_id=model_id)
+    datos = _corregir_comprador(normalizar(texto, model_id=model_id))
     datos["formato"] = fmt
     return datos

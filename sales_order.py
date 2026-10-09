@@ -248,6 +248,67 @@ def cotizaciones_ocultas_ui(po: dict, cuenta_id: str, excluir: set, max_ids: int
     return out
 
 
+def cotizacion_por_numero(numero: str) -> dict | None:
+    """Cotización por su NÚMERO CORTO (p.ej. 'COT 2159' en el concepto de una transferencia → folio
+    Q2026-0914-2159). filter_text no encuentra por número suelto y el listado de la API omite las
+    cerradas. Pasos: 1) listado por el sufijo '-2159' del folio; 2) si no está (cerrada/oculta), se
+    infiere la FECHA del folio por los números vecinos listados (2157→0911, 2160→0916 ⇒ entre
+    0911 y 0916) y se busca el folio completo en el buscador de la interfaz (Playwright), que sí
+    encuentra cerradas. Devuelve la cotización (como cotizacion_por_id) o None."""
+    import re as _re
+    from datetime import date as _d, timedelta
+    n = _re.sub(r"\D", "", str(numero or ""))
+    if len(n) < 3 or not CRM_BASE:
+        return None
+    por_num: dict = {}
+    off = 0
+    while off < 1100:
+        page = _crm_get("data/Quote", {"limit": 20, "offset": off}).get("records", [])
+        if not page:
+            break
+        for q in page:
+            m = _re.match(r"(Q|CMRO)(\d{4})-(\d{2})(\d{2})-(\d+)", (q.get("_display") or ""))
+            if m:
+                por_num[int(m.group(5))] = (m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4)), q["id"])
+        off += 20
+    k = int(n)
+    if k in por_num:
+        return cotizacion_por_id(por_num[k][4])
+    bajos = [x for x in por_num if x < k]
+    altos = [x for x in por_num if x > k]
+    if not bajos or not altos:
+        return None
+    lo, hi = por_num[max(bajos)], por_num[min(altos)]
+    try:
+        d0, d1 = _d(lo[1], lo[2], lo[3]), _d(hi[1], hi[2], hi[3])
+    except ValueError:
+        return None
+    fechas = [d0 + timedelta(days=i) for i in range(0, min((d1 - d0).days, 45) + 1)]
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            page = browser.new_context(ignore_https_errors=True).new_page()
+            page.goto(f"{CRM_BASE}/index.php?module=Users&action=Login", timeout=30000)
+            page.fill('input[name="user_name"]', os.environ.get("ONECRM_USERNAME", ""))
+            page.fill('input[name="user_password"]', os.environ.get("ONECRM_PASSWORD", ""))
+            page.click('input[type="submit"], button[type="submit"]')
+            page.wait_for_url(f"{CRM_BASE}/index.php*", timeout=20000)
+            for f in fechas:
+                folio = f"{lo[0]}{f.year}-{f.month:02d}{f.day:02d}-{n}"
+                page.goto(f"{CRM_BASE}/index.php?module=Home&action=UnifiedSearch&query_string={folio}", timeout=40000)
+                page.wait_for_load_state("networkidle", timeout=40000)
+                for a in page.locator("a[href*='module=Quotes'][href*='action=DetailView']").all():
+                    if folio in (a.inner_text(timeout=500) or ""):
+                        mm = _re.search(r"record=([0-9a-f-]{36})", a.get_attribute("href") or "")
+                        browser.close()
+                        return cotizacion_por_id(mm.group(1)) if mm else None
+            browser.close()
+    except Exception as e:
+        log.warning(f"cotizacion_por_numero UI falló: {e}")
+    return None
+
+
 def cotizaciones_cliente(cuenta_id: str, limite: int = 300) -> list[dict]:
     """Cotizaciones recientes del cliente CON sus líneas. Cada una:
     {id, nombre, lines:[{part_number, part_compact, unit_price, quantity, descripcion}]}."""
@@ -361,7 +422,7 @@ def cotizacion_por_id(quote_id: str) -> dict | None:
             "descripcion": li.get("name", ""),
         })
     return {"id": rec["id"], "nombre": rec.get("name", ""), "lines": lines, "referenciada": True,
-            "cuenta_id": rec.get("billing_account_id") or ""}
+            "cuenta_id": rec.get("billing_account_id") or "", "amount": _num(rec.get("amount"))}
 
 
 def _vigencia(quote_id: str) -> dict:
@@ -686,6 +747,9 @@ def cotejar(po: dict, forzar_quote_id: str = "") -> dict:
     # Cotización REFERENCIADA en el propio PO (cita/adjunta nuestro presupuesto Q2026-…): mejor pista
     # de origen. La buscamos primero porque además define la cuenta cuando el nombre no matchea.
     ref_q = cotizacion_por_id(forzar_quote_id) if forzar_quote_id else cotizacion_por_ref(po.get("cotizacion_ref", ""))
+    if not ref_q and not forzar_quote_id and re.fullmatch(r"(?i)\s*(cot\w*\.?\s*)?#?\d{3,5}\s*", po.get("cotizacion_ref", "") or ""):
+        # Referencia por NÚMERO CORTO (p.ej. concepto 'COT 2159' de una transferencia) → folio completo.
+        ref_q = cotizacion_por_numero(po["cotizacion_ref"])
 
     cuenta = buscar_cuenta(po.get("cliente", ""))
     if not cuenta and ref_q and ref_q.get("cuenta_id"):
@@ -697,6 +761,20 @@ def cotejar(po: dict, forzar_quote_id: str = "") -> dict:
                        f"Verifica el nombre o si el cliente ya existe."],
             "cuenta": None, "items": [], "cotizaciones_candidatas": [],
         }
+
+    # COMPROBANTE DE PAGO sin renglones (el cliente pagó una cotización y mandó la captura): la
+    # cotización citada ES el pedido — se toman sus líneas como renglones del PO y se verifica que el
+    # importe pagado cuadre con su total (con IVA). El usuario ve el previo y decide.
+    avisos_pago: list = []
+    if ref_q and not po.get("items") and po.get("tipo_documento") == "comprobante_pago":
+        po["items"] = [{"part_number": l["part_number"], "descripcion": l["descripcion"],
+                        "cantidad": l["quantity"], "precio_unitario": l["unit_price"]} for l in ref_q["lines"]]
+        monto, total = _num(po.get("monto_pagado")), ref_q.get("amount")
+        if monto is not None and total:
+            if abs(monto - total) <= max(1.0, 0.005 * total):
+                avisos_pago.append(f"Pago de ${monto:,.2f} = total de la cotización «{ref_q['nombre'][:40]}» (${total:,.2f} con IVA). ✓")
+            else:
+                avisos_pago.append(f"⚠ El pago (${monto:,.2f}) NO coincide con el total de la cotización «{ref_q['nombre'][:40]}» (${total:,.2f}).")
 
     # ¿Ya existe una SO para este PO? Si sí, no hace falta cotejar contra cotizaciones — solo
     # confirmar que ya está creada (pedido explícito de Gabriel: evitar duplicar Sales Orders).
@@ -871,6 +949,7 @@ def cotejar(po: dict, forzar_quote_id: str = "") -> dict:
                and not any(i.get("match_parcial") for i in items_out)
                and any(c["vigente"] for c in candidatas))
 
+    discrepancias = avisos_pago + discrepancias
     # Aviso duro si la orden parece ser para OTRO proveedor.
     if para_nosotros is False:
         discrepancias.insert(0, f"⚠ La orden va dirigida a «{po.get('proveedor','otro')}», no a nosotros. "
