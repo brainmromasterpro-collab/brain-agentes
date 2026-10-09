@@ -1854,6 +1854,21 @@ def _extraer_producto_link(url: str, diag: list | None = None) -> dict:
     return _traducir(parsed) if parsed else {"error": "No encontré datos de producto en el link (¿es una página de producto?)."}
 
 
+def _get_imagen_directo(url: str, timeout: int = 15):
+    """Descarga directa de una imagen con headers de navegador. Si la URL es http:// y falla (el
+    caso real: wenglor.com por http:// da ConnectTimeout, por https:// responde 200), reintenta con
+    https:// — antes la foto del producto nunca se rehosteaba ni se subía al CRM."""
+    hdr = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                         "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+           "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"}
+    try:
+        return httpx.get(url, timeout=timeout, follow_redirects=True, headers=hdr)
+    except Exception:
+        if url.startswith("http://"):
+            return httpx.get("https://" + url[len("http://"):], timeout=timeout, follow_redirects=True, headers=hdr)
+        raise
+
+
 def _rehost_imagen_preview(imagen_url: str, marca: str = "", part_number: str = "") -> str:
     """Descarga la imagen del sitio de origen, le corre el MISMO chequeo de calidad que la
     publicación real (marca de agua → reemplazo, Remove.bg, resize a 500x500 — ver
@@ -1883,7 +1898,7 @@ def _rehost_imagen_preview(imagen_url: str, marca: str = "", part_number: str = 
                     return None
                 fetch = sc.replace("browser=true", "browser=false").replace("render_js=true", "render_js=false")
                 return httpx.get(fetch.replace("{url}", quote_plus(imagen_url)), timeout=40)
-            return httpx.get(imagen_url, timeout=15, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"})
+            return _get_imagen_directo(imagen_url, 15)
         except Exception:
             return None
 
@@ -1895,6 +1910,13 @@ def _rehost_imagen_preview(imagen_url: str, marca: str = "", part_number: str = 
         if not _ok(r):
             r = _dl(True)
         if not _ok(r):
+            # No se pudo bajar la foto del sitio: buscar una limpia en internet por marca+modelo.
+            alt = _buscar_imagen_limpia(marca, part_number) if (marca or part_number) else None
+            if alt:
+                safe = (part_number or "producto").replace("/", "-").replace(" ", "_")
+                path = f"link-preview/{safe}_{str(uuid.uuid4())[:6]}.png"
+                supabase.storage.from_("product-images").upload(path=path, file=alt, file_options={"content-type": "image/png", "upsert": "true"})
+                return supabase.storage.from_("product-images").get_public_url(path)
             return imagen_url
         content = _procesar_imagen_producto(r.content, marca, part_number, imagen_url)
         if not content:
@@ -2231,7 +2253,7 @@ def _rehost_imagen(imagen_url: str, part_number: str = "", marca: str = "") -> s
                     return None
                 fetch = sc.replace("browser=true", "browser=false").replace("render_js=true", "render_js=false")
                 return httpx.get(fetch.replace("{url}", quote_plus(imagen_url)), timeout=40)
-            return httpx.get(imagen_url, timeout=20, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"})
+            return _get_imagen_directo(imagen_url, 20)
         except Exception:
             return None
 
