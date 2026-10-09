@@ -623,7 +623,20 @@ def crear_producto_en_crm(ficha: dict, modelo: str) -> str:
 # ─────────────────────────────────────────
 # SUBIR IMAGEN AL PRODUCTO EN 1CRM
 # ─────────────────────────────────────────
-def subir_imagen_a_crm(product_id: str, foto_url: str) -> bool:
+def _nombre_archivo(nombre: str, fallback: str = "producto", max_len: int = 70) -> str:
+    """Nombre de archivo SEGURO a partir del título del producto: ASCII, sin acentos y sin
+    caracteres especiales (1CRM rechaza guardar archivos con /, ?, &, %, etc. en el nombre — pasaba
+    cuando el nombre de la imagen era la URL de origen). 'I12H003 / wenglor / Robust design…' →
+    'I12H003_wenglor_Robust_design'."""
+    import re as _re, unicodedata
+    t = unicodedata.normalize("NFKD", nombre or "").encode("ascii", "ignore").decode()
+    t = _re.sub(r"[^A-Za-z0-9]+", "_", t).strip("_")
+    if len(t) > max_len:
+        t = t[:max_len].rsplit("_", 1)[0]   # corta en límite de palabra, no a media palabra
+    return t.rstrip("_") or fallback
+
+
+def subir_imagen_a_crm(product_id: str, foto_url: str, nombre: str = "") -> bool:
     """
     Sube la imagen del producto a 1CRM usando Playwright (browser headless).
 
@@ -641,10 +654,12 @@ def subir_imagen_a_crm(product_id: str, foto_url: str) -> bool:
     try:
         img_resp = httpx.get(foto_url, timeout=30, follow_redirects=True)
         img_resp.raise_for_status()
-        suffix = ".png" if "png" in foto_url.lower() else ".jpg"
+        _b = img_resp.content
+        suffix = ".png" if _b[:8] == b"\x89PNG\r\n\x1a\n" else (".jpg" if _b[:3] == b"\xff\xd8\xff" else ".png")
         # Usar nombre de archivo limpio basado en el product_id (evita tmp{random})
         tmp_dir = pathlib.Path(tempfile.gettempdir())
-        img_path = str(tmp_dir / f"1crm_img_{product_id[:8]}{suffix}")
+        # El archivo se llama como el TÍTULO del producto (no la URL de origen ni un id genérico).
+        img_path = str(tmp_dir / f"{_nombre_archivo(nombre, fallback='1crm_img_' + product_id[:8])}{suffix}")
         pathlib.Path(img_path).write_bytes(img_resp.content)
         log.info(f"Imagen descargada: {len(img_resp.content)} bytes → {img_path}")
     except Exception as e:
@@ -738,11 +753,15 @@ def subir_imagen_a_crm(product_id: str, foto_url: str) -> bool:
 
     except Exception as e:
         log.error(f"Error Playwright subiendo imagen: {e}")
-        # Fallback: guardar al menos la URL como campo de referencia
+        # Fallback: guardar la URL como referencia SOLO si es limpia (nuestro storage, sin ? & % ni
+        # caracteres especiales). Una URL externa larga con query hacía que 1CRM rechazara el guardado.
         try:
-            mod = discover_product_module()
-            onecrm_patch(f"data/{mod}/{product_id}", {"image_url": foto_url})
-            log.info(f"Fallback: image_url guardada en 1CRM: {foto_url[:80]}")
+            if foto_url.startswith("https://") and "supabase.co/storage" in foto_url and not any(c in foto_url for c in "?&%#"):
+                mod = discover_product_module()
+                onecrm_patch(f"data/{mod}/{product_id}", {"image_url": foto_url})
+                log.info(f"Fallback: image_url guardada en 1CRM: {foto_url[:80]}")
+            else:
+                log.warning("Fallback image_url omitido: la URL tiene caracteres especiales/externa")
         except Exception as fe:
             log.error(f"Fallback image_url también falló: {fe}")
         return False
@@ -832,7 +851,7 @@ def procesar_job_publicador(job: dict) -> None:
         # ── Subir imagen (si existe) ─────────────────────────────────────
         imagen_subida = False
         if foto_url:
-            imagen_subida = subir_imagen_a_crm(product_id, foto_url)
+            imagen_subida = subir_imagen_a_crm(product_id, foto_url, ficha.get("nombre", ""))
         else:
             log.warning("Sin foto_url — producto creado sin imagen")
 
