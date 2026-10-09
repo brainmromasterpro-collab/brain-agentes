@@ -196,10 +196,31 @@ def buscar_sales_orders_candidatas(links_data: list[dict]) -> dict:
         # nunca podía coincidir (bug real: SO2026-1008-289 ↔ link de Turck BI2-M12-AP6X). Se busca el
         # part number del link (>=5 chars, compacto) DENTRO de la descripción compacta de cada línea,
         # y también cada código del título del link dentro de la línea.
-        if not candidatos and len(pc) >= 5:
+        # Los anuncios (eBay, etc.) suelen NO traer part_number separado: el modelo solo está en el
+        # TÍTULO ("Turck BI2-M12-AP6X Inductive Sensor", part_number=""). Se sacan del título los
+        # códigos tipo modelo (mezcla de letras y dígitos, >=5 chars) y se buscan en ambos sentidos.
+        codigos = []
+        if pc:
+            codigos.append(pc)
+        for tok in re.findall(r"[A-Za-z0-9][A-Za-z0-9\-_./]{3,}[A-Za-z0-9]", texto_busqueda):
+            c = sales_order._compact(tok)
+            if len(c) >= 5 and re.search(r"[A-Z]", c) and re.search(r"\d", c) and c not in codigos:
+                codigos.append(c)
+        if not candidatos and codigos:
+            titulo_c = sales_order._compact(texto_busqueda)
             for so in sos:
                 for ln in so["lines"]:
-                    if pc in sales_order._compact(ln["descripcion"]):
+                    dc = sales_order._compact(ln["descripcion"])
+                    # (a) código del link dentro de la línea de la SO
+                    hit = any(c in dc for c in codigos)
+                    # (b) código de la línea de la SO (en su nombre) dentro del título del link
+                    if not hit:
+                        for tok in re.findall(r"[A-Za-z0-9][A-Za-z0-9\-_./]{3,}[A-Za-z0-9]", ln["descripcion"]):
+                            c = sales_order._compact(tok)
+                            if len(c) >= 5 and re.search(r"[A-Z]", c) and re.search(r"\d", c) and c in titulo_c:
+                                hit = True
+                                break
+                    if hit:
                         candidatos.append((so, ln))
                         tipo_match = "descripcion"
 
