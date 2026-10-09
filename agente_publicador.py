@@ -627,13 +627,13 @@ def _nombre_archivo(nombre: str, fallback: str = "producto", max_len: int = 70) 
     """Nombre de archivo SEGURO a partir del título del producto: ASCII, sin acentos y sin
     caracteres especiales (1CRM rechaza guardar archivos con /, ?, &, %, etc. en el nombre — pasaba
     cuando el nombre de la imagen era la URL de origen). 'I12H003 / wenglor / Robust design…' →
-    'I12H003_wenglor_Robust_design'."""
+    'I12H003 wenglor Robust design'."""
     import re as _re, unicodedata
     t = unicodedata.normalize("NFKD", nombre or "").encode("ascii", "ignore").decode()
-    t = _re.sub(r"[^A-Za-z0-9]+", "_", t).strip("_")
+    t = _re.sub(r"[^A-Za-z0-9]+", " ", t).strip()   # solo espacios: 1CRM no admite otros separadores
     if len(t) > max_len:
-        t = t[:max_len].rsplit("_", 1)[0]   # corta en límite de palabra, no a media palabra
-    return t.rstrip("_") or fallback
+        t = t[:max_len].rsplit(" ", 1)[0]   # corta en límite de palabra, no a media palabra
+    return t.strip() or fallback
 
 
 def subir_imagen_a_crm(product_id: str, foto_url: str, nombre: str = "") -> bool:
