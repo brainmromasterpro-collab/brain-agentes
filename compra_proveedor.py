@@ -96,12 +96,12 @@ def sales_orders_abiertas(limite: int = 150) -> list[dict]:
 
 
 def _terminos_para_po(cuenta_full: dict) -> str:
-    """Condiciones de pago para el PO/Bill. Prioridad: `default_purchase_terms` (Condiciones de la
-    Compra); si está vacío, se usa `default_terms` (Condiciones de la Venta) y por último
-    `payment_terms` — el cliente suele tener configurado solo uno (caso real: Weidmann tenía
-    "Net 30 Days" en Venta y Compra vacío, y se bloqueaba el PO). Se normaliza al valor que acepta
-    el enum de PurchaseOrder/Bill ("Net 30 Days" → "Net 30", "Net_30" → "Net 30")."""
-    for campo in ("default_purchase_terms", "default_terms", "payment_terms"):
+    """Condiciones de pago del PROVEEDOR para el PO/Bill. Prioridad: `default_purchase_terms`
+    (Condiciones de la Compra) y luego `payment_terms` (así viene configurado eBay:
+    "advance_100%"). NUNCA se usan `default_terms` (Condiciones de la Venta) ni nada de la cuenta
+    del cliente: el PO es un trato con el proveedor, no con el cliente de la SO. Se normaliza al
+    valor que acepta el enum de PurchaseOrder/Bill ("Net 30 Days" → "Net 30", "Net_30" → "Net 30")."""
+    for campo in ("default_purchase_terms", "payment_terms"):
         v = (cuenta_full.get(campo) or "").strip()
         if not v:
             continue
@@ -116,9 +116,8 @@ def _terminos_para_po(cuenta_full: dict) -> str:
 
 
 def _terminos_proveedor(nombre: str) -> str:
-    """Condiciones de pago pactadas con el PROVEEDOR (el trato del PO es con él): si ya existe
-    como cuenta Supplier en 1CRM y tiene términos de compra/pago, esos mandan. Vacío si no existe
-    o no tiene (entonces se cae a los del cliente de la SO)."""
+    """Condiciones de pago pactadas con el PROVEEDOR (el trato del PO es con él). Vacío si el
+    proveedor no existe aún en 1CRM o no tiene términos configurados."""
     nombre = (nombre or "").strip()
     if not nombre:
         return ""
@@ -141,11 +140,8 @@ def _so_detalle(so_id: str) -> dict:
     para las 150 del índice. `billing_account` viene vacío en la API (verificado en vivo) — el
     nombre del cliente hay que resolverlo aparte con `billing_account_id`.
 
-    OJO — campo de términos CORRECTO (decidido con Gabriel): la cuenta tiene DOS campos de
-    términos distintos: `default_terms` ("Condiciones de la Venta", lo que usa
-    sales_order.crear_sales_order vía _terminos_y_moneda — NO usar aquí) y
-    `default_purchase_terms` ("Condiciones de la Compra" — el correcto para un Purchase Order,
-    aunque el proveedor real sea otro como eBay). También se trae `tax_code_id` (perfil fiscal de
+    Las condiciones de pago NO se toman de aquí: el PO es un trato con el proveedor y salen de la
+    cuenta del proveedor (`_terminos_proveedor`). Sí se trae `tax_code_id` (perfil fiscal de
     la cuenta) para aplicarlo a las líneas del PO."""
     d = sales_order._crm_get(f"data/SalesOrder/{so_id}")
     rec = d.get("record", d)
@@ -157,7 +153,6 @@ def _so_detalle(so_id: str) -> dict:
         "so_number": rec.get("so_number"),
         "cliente": (cuenta or {}).get("nombre", ""),
         "currency_id": rec.get("currency_id") or "",
-        "terminos_pago": _terminos_para_po(cuenta_full),
         "tax_code_id": cuenta_full.get("tax_code_id") or "",
     }
 
@@ -295,7 +290,7 @@ def buscar_sales_orders_candidatas(links_data: list[dict]) -> dict:
         # marketplace en una sola compra); el usuario lo puede corregir en el widget.
         proveedor_sugerido = _proveedor_de_url(links[0]["url"]) if links else ""
         terminos_prov = _terminos_proveedor(proveedor_sugerido)
-        terminos_g = terminos_prov or detalle["terminos_pago"]
+        terminos_g = terminos_prov
         lineas_sugeridas = [{
             "name": l.get("nombre") or l.get("descripcion_so") or "Producto",
             "mfr_part_no": l.get("part_number") or l.get("part_number_so") or "",
@@ -310,7 +305,7 @@ def buscar_sales_orders_candidatas(links_data: list[dict]) -> dict:
             "cliente": detalle["cliente"],
             "currency_id": detalle["currency_id"],
             "terminos_pago": terminos_g,
-            "terminos_origen": "proveedor" if terminos_prov else "cliente",
+            "terminos_origen": "proveedor",
             "tax_code_id": detalle["tax_code_id"],
             # Condiciones de pago es un campo OBLIGATORIO en 1CRM (pedido explícito de Gabriel:
             # nunca crear el PO en silencio sin esto) — se avisa aquí para que el usuario lo
@@ -435,13 +430,13 @@ def crear_po_y_ap(draft: dict) -> dict:
 
     # Condiciones de pago es obligatorio en 1CRM (pedido explícito de Gabriel). El trato del PO es
     # con el PROVEEDOR: si él tiene términos, esos mandan (el usuario pudo cambiar el proveedor en
-    # el widget); si no, los del cliente de la SO. Solo se exige cuando hay SO de por medio.
-    terminos = _terminos_proveedor(draft.get("proveedor_nombre", "")) or draft.get("terminos_pago") or ""
+    # el widget). Los del cliente de la SO NO se usan. Solo se exige cuando hay SO de por medio.
+    terminos = _terminos_proveedor(draft.get("proveedor_nombre", ""))
     draft = {**draft, "terminos_pago": terminos}
     if draft.get("so_id") and not terminos:
-        return {"error": "Ni el proveedor ni el cliente de esta Sales Order tienen Condiciones de pago "
+        return {"error": f"El proveedor «{draft.get('proveedor_nombre','')}» no tiene Condiciones de pago "
                          "configuradas en 1CRM (campo obligatorio) — configúralas en la cuenta del "
-                         "proveedor o del cliente antes de crear la orden de compra."}
+                         "proveedor antes de crear la orden de compra."}
 
     currency_id = draft.get("currency_id") or ""
     total = sum(float(ln.get("unit_price") or 0) * float(ln.get("quantity") or 1) for ln in lineas)
