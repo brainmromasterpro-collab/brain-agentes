@@ -4106,6 +4106,12 @@ def _procesar_orden_compra(stream_id: str, file_url: str, nombre: str = "orden",
         }).execute()
         return
 
+    _emitir_cotejo_po(stream_id, po)
+
+
+def _emitir_cotejo_po(stream_id: str, po: dict) -> None:
+    """Cotejo del PO ya leído (cualquier origen: archivo, imagen, texto, link) + widget [COTEJO_PO]."""
+    import sales_order
     _log_stream(stream_id, f"Cotejando {len(po.get('items', []))} producto(s) contra cotizaciones…", "info")
     cotejo = sales_order.cotejar(po)
     payload = {"po": po, "cotejo": cotejo}
@@ -4116,6 +4122,30 @@ def _procesar_orden_compra(stream_id: str, file_url: str, nombre: str = "orden",
     }).execute()
     _log_stream(stream_id, cotejo.get("resumen", "Cotejo listo"), "ok")
     log.info(f"Cotejo PO emitido | {cotejo.get('resumen','')}")
+
+
+def _procesar_orden_compra_texto(stream_id: str, texto: str = "", url: str = "") -> None:
+    """PO pegado como TEXTO o como LINK (copy-paste) en el stream de Sales Order — mismo flujo que un
+    archivo: lee con el normalizador, luego cotejo + widget."""
+    try:
+        import orden_compra
+    except Exception as e:
+        log.error(f"orden_compra no disponible: {e}")
+        return
+    _log_stream(stream_id, "Leyendo orden de compra del link…" if url else "Leyendo orden de compra del texto…", "info")
+    po = orden_compra.leer_po_url(url) if url else orden_compra.leer_po_texto(texto)
+    if url and not po.get("error"):
+        po["file_url"] = url
+    if po.get("error") or not po.get("items"):
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": "No pude identificar una orden de compra en lo que mandaste"
+                       + (f": {po['error']}." if po.get("error") else " (no encontré productos).")
+                       + " Pega el texto completo de la orden, súbela como archivo o como captura.",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+    _emitir_cotejo_po(stream_id, po)
 
 
 def _recotejar_con_cotizacion(stream_id: str, po: dict, quote_id: str) -> None:
@@ -5259,6 +5289,19 @@ def procesar_mensaje(msg: dict) -> None:
             # orden de compra del cliente (flujo existente).
             _procesar_orden_compra(stream_id, _file_url, _file_name or "orden", _file_mime)
             return
+        # Texto/link pegado: ¿es una ORDEN DE COMPRA? (copy-paste del correo/portal del cliente). Un link
+        # de paquetería (UPS/FedEx/DHL/Estafeta...) o un mensaje corto de tracking NO lo es.
+        _carrier = re.search(r'ups\.com|fedex|dhl|estafeta|paquetexpress|tracking|rastreo|17track|correos', _low)
+        _kw_po = len(re.findall(r'orden de compra|purchase order|\bpo\b|cantidad|quantity|qty|precio|price|item|part\s*(no|number)|descripci', _low))
+        _lineas = len([l for l in (contenido or "").splitlines() if l.strip()])
+        if not _file_url and not _es_shipped and not _es_estado and not _carrier:
+            _url_po = next((u for u in _urls), "")
+            if _url_po and len(_urls) == 1 and len((contenido or "").replace(_url_po, "").strip()) < 80:
+                _procesar_orden_compra_texto(stream_id, url=_url_po.rstrip(").,"))
+                return
+            if len(contenido or "") >= 120 and (_kw_po >= 2 or _lineas >= 4):
+                _procesar_orden_compra_texto(stream_id, texto=contenido or "")
+                return
         if _es_shipped:
             _cotejo_marcar_shipped(stream_id)
             return

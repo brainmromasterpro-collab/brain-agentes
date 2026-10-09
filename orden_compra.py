@@ -36,7 +36,12 @@ def _ext(nombre: str, mime: str = "") -> str:
     for e in ("pdf", "xlsx", "xls", "docx", "doc", "csv", "txt", "eml"):
         if n.endswith("." + e):
             return e
+    for e in ("png", "jpg", "jpeg", "webp", "gif", "heic", "bmp"):
+        if n.endswith("." + e):
+            return "img"
     m = (mime or "").lower()
+    if m.startswith("image/"):
+        return "img"
     if "pdf" in m: return "pdf"
     if "sheet" in m or "excel" in m: return "xlsx"
     if "word" in m or "document" in m: return "docx"
@@ -61,8 +66,36 @@ def _texto_pdf(data: bytes) -> str:
     return "\n".join(partes)
 
 
+def _texto_xls_legacy(data: bytes) -> str:
+    """Excel viejo (.xls binario, que openpyxl no abre) con xlrd."""
+    import xlrd
+    wb = xlrd.open_workbook(file_contents=data)
+    partes: list[str] = []
+    for ws in wb.sheets():
+        partes.append(f"[Hoja: {ws.name}]")
+        for r in range(ws.nrows):
+            celdas = [str(c).strip() for c in ws.row_values(r) if str(c).strip()]
+            if celdas:
+                partes.append(" | ".join(celdas))
+    return "\n".join(partes)
+
+
+def _texto_doc_legacy(data: bytes) -> str:
+    """Word viejo (.doc binario OLE, que python-docx no abre): rescata el texto legible (UTF-16 y
+    cp1252) — suficiente para que el normalizador encuentre cliente/PO/renglones."""
+    import re as _re
+    candidatos = []
+    for codec in ("utf-16-le", "cp1252"):
+        t = data.decode(codec, errors="ignore")
+        runs = _re.findall(r"[\w\s.,;:/\-()$%#&@'\"áéíóúÁÉÍÓÚñÑüÜ|]{6,}", t)
+        candidatos.append("\n".join(r.strip() for r in runs if r.strip()))
+    return max(candidatos, key=len)
+
+
 def _texto_xlsx(data: bytes) -> str:
     import openpyxl
+    if data[:4] == b"\xd0\xcf\x11\xe0":  # OLE2 = .xls viejo
+        return _texto_xls_legacy(data)
     wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     partes: list[str] = []
     for ws in wb.worksheets:
@@ -76,6 +109,8 @@ def _texto_xlsx(data: bytes) -> str:
 
 def _texto_docx(data: bytes) -> str:
     import docx
+    if data[:4] == b"\xd0\xcf\x11\xe0":  # OLE2 = .doc viejo
+        return _texto_doc_legacy(data)
     doc = docx.Document(io.BytesIO(data))
     partes = [p.text for p in doc.paragraphs if p.text.strip()]
     for tabla in doc.tables:
@@ -243,6 +278,58 @@ def normalizar_vision(imagenes: list[bytes], model_id: str = "") -> dict:
         return {"error": f"no pude leer el PDF escaneado con visión: {e}", "items": []}
 
 
+def _es_imagen(data: bytes) -> bool:
+    """Firma de archivo: PNG, JPEG, GIF, WEBP (por si el nombre/mime no lo dicen)."""
+    return data[:8] == b"\x89PNG\r\n\x1a\n" or data[:3] == b"\xff\xd8\xff" or data[:4] == b"GIF8" \
+        or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")
+
+
+def _imagen_a_png(data: bytes, max_lado: int = 2000) -> list[bytes]:
+    """Normaliza cualquier imagen a PNG (limita el lado largo para acotar el costo de visión)."""
+    try:
+        from PIL import Image
+        im = Image.open(io.BytesIO(data)).convert("RGB")
+        im.thumbnail((max_lado, max_lado))
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+        return [buf.getvalue()]
+    except Exception as e:
+        log.error(f"_imagen_a_png: {e}")
+        return []
+
+
+def leer_po_texto(texto: str, model_id: str = "") -> dict:
+    """PO pegado como TEXTO (copy-paste del correo/portal del cliente) — mismo normalizador."""
+    texto = (texto or "").strip()
+    if not texto:
+        return {"error": "texto vacío", "items": []}
+    datos = normalizar(texto[:30000], model_id=model_id)
+    datos["formato"] = "texto"
+    return datos
+
+
+def leer_po_url(url: str, model_id: str = "") -> dict:
+    """PO dado como URL: si apunta a un archivo (PDF/Excel/Word/imagen) se lee como archivo; si es
+    una PÁGINA web (portal del cliente) se baja el HTML visible y se normaliza como texto."""
+    import re as _re
+    from urllib.parse import urlparse
+    try:
+        r = httpx.get(url, timeout=40, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+    except Exception as e:
+        return {"error": f"no pude abrir el link: {e}", "items": []}
+    ct = (r.headers.get("content-type") or "").lower()
+    nombre = urlparse(url).path.rsplit("/", 1)[-1]
+    if "html" not in ct:
+        datos = leer_po(data=r.content, nombre=nombre, mime=ct, model_id=model_id)
+    else:
+        limpio = _re.sub(r"(?is)<(script|style|noscript|svg)[^>]*>.*?</\1>", " ", r.text)
+        texto = _re.sub(r"\s+", " ", _re.sub(r"<[^>]+>", " ", limpio)).strip()
+        datos = leer_po_texto(texto, model_id=model_id)
+        datos["formato"] = "link"
+    return datos
+
+
 def leer_po(url: str = "", data: bytes = b"", nombre: str = "", mime: str = "", model_id: str = "") -> dict:
     """Punto de entrada: baja el archivo (o usa data), extrae texto y lo normaliza.
     Devuelve {cliente, po_number, moneda, items[...], notas, formato} o {error}."""
@@ -253,6 +340,15 @@ def leer_po(url: str = "", data: bytes = b"", nombre: str = "", mime: str = "", 
             data = descargar(url)
     except Exception as e:
         return {"error": f"no pude descargar el archivo: {e}", "items": []}
+
+    # Captura/foto de la orden (screenshot, imagen): visión directa — no hay capa de texto.
+    if _ext(nombre, mime) == "img" or _es_imagen(data):
+        imgs = _imagen_a_png(data)
+        if not imgs:
+            return {"error": "no pude abrir la imagen de la orden", "items": [], "formato": "imagen"}
+        datos = normalizar_vision(imgs, model_id=model_id)
+        datos["formato"] = "imagen"
+        return datos
 
     texto, fmt = extraer_texto(data, nombre, mime)
     if not texto.strip():
