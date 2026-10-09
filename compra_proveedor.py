@@ -191,6 +191,18 @@ def buscar_sales_orders_candidatas(links_data: list[dict]) -> dict:
                     candidatos.extend(v)
                     tipo_match = "descripcion"
 
+        # Respaldo 2: líneas de SO SIN número de parte (el modelo viene solo dentro del nombre, ej.
+        # "46050 Turck BI2-M12-AP6X") — el índice solo tiene líneas con mfr_part_no, así que el link
+        # nunca podía coincidir (bug real: SO2026-1008-289 ↔ link de Turck BI2-M12-AP6X). Se busca el
+        # part number del link (>=5 chars, compacto) DENTRO de la descripción compacta de cada línea,
+        # y también cada código del título del link dentro de la línea.
+        if not candidatos and len(pc) >= 5:
+            for so in sos:
+                for ln in so["lines"]:
+                    if pc in sales_order._compact(ln["descripcion"]):
+                        candidatos.append((so, ln))
+                        tipo_match = "descripcion"
+
         if not candidatos:
             sin_match.append({**link, "motivo": "ningún producto de una Sales Order abierta coincide"})
             continue
