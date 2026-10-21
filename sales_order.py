@@ -176,12 +176,15 @@ def cuenta_por_id(cuenta_id: str) -> dict | None:
 
 
 def _terminos_y_moneda(cuenta_id: str) -> dict:
-    """Trae los TÉRMINOS DE PAGO (default_terms) y la MONEDA de la cuenta — específicos del cliente.
-    Van en la Sales Order: terms y currency_id."""
+    """Trae los TÉRMINOS DE PAGO y la MONEDA de la cuenta — específicos del cliente.
+    Van en la Sales Order: terms y currency_id.
+    1CRM usa 'payment_terms' (p.ej. 'Net_30'); 'default_terms' viene vacío en la API."""
     d = _crm_get(f"data/Account/{cuenta_id}")
     rec = d.get("record", d)
+    # payment_terms es el campo real en 1CRM Cloud; default_terms siempre llega vacío.
+    terminos = rec.get("payment_terms") or rec.get("default_terms") or ""
     return {
-        "terminos_pago": rec.get("default_terms") or "",
+        "terminos_pago": terminos,
         "currency_id":   rec.get("currency_id") or "",
         "moneda":        rec.get("currency") or "",
     }
@@ -1098,25 +1101,21 @@ def crear_sales_order(draft: dict) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────
-# 5. SUBIR EL PO ORIGINAL A LA SALES ORDER (sección Documentos/Notas)
+# 5. SUBIR EL PO ORIGINAL A LA SALES ORDER (módulo Documentos)
 # ─────────────────────────────────────────────────────────────
 def subir_po_a_so(so_id: str, file_url: str, po_number: str = "") -> dict:
-    """Sube el archivo original del PO como Nota/Archivo adjunto de la Sales Order recién creada —
-    pedido explícito de Gabriel: el documento debe quedar guardado y ligado a la SO, no solo leído
-    desde donde se subió.
+    """Sube el PO original al módulo Documents de 1CRM y lo relaciona a la Sales Order.
 
-    1CRM Cloud no acepta subir archivos vía la API REST (el campo 'filename' de Note es tipo
-    'file_ref', igual que en Documents — bloquea upload.php a clientes HTTP externos, mismo patrón
-    ya usado en agente_publicador.subir_imagen_a_crm). Único mecanismo que funciona: un browser real
-    con sesión (Playwright) — login → abrir la SO → click 'Nueva Nota o Archivo Adjunto' (ya trae
-    'Relativo a' pre-rellenado con ESTA SalesOrder, confirmado en vivo) → nombre + archivo → guardar.
+    El nombre del documento es el número de PO (p.ej. '8992'), o 'Orden de compra' si no hay número.
 
-    Verificado en vivo (create+GET+delete controlado): la Nota queda con parent_type='SalesOrders',
-    parent_id=<so_id> y filename con el archivo real — sin esto, probar a ciegas: el listado por
-    filter_text NO trae esos campos (hay que leer el detalle), que es como se confirmó.
+    Estrategia:
+      1. Playwright → Documents/EditView → rellena document_name + uploadfile + parent SalesOrder →
+         guarda. El campo 'parent_type'/'parent_id' en ese EditView vincula el doc a la SO.
+      2. Si falla (campo no encontrado / error): fallback a la Nota de la SO
+         (el mecanismo anterior que sí funciona, aunque aparece en Historial en vez de Documentos).
 
-    Fallback silencioso: si Playwright falla por cualquier motivo, NO bloquea la creación de la SO
-    (que ya quedó hecha) — solo se loguea el error."""
+    1CRM Cloud bloquea upload.php a HTTP externos, así que solo funciona vía browser real (Playwright).
+    Fallback silencioso: si ambas opciones fallan la SO ya quedó creada — esto no la afecta."""
     if not file_url or not so_id:
         return {"ok": False, "error": "falta file_url o so_id"}
     import tempfile
@@ -1126,15 +1125,16 @@ def subir_po_a_so(so_id: str, file_url: str, po_number: str = "") -> dict:
     crm_url = CRM_BASE
     crm_user = os.environ.get("ONECRM_USERNAME", "")
     crm_pass = os.environ.get("ONECRM_PASSWORD", "")
-    nombre_nota = f"PO {po_number}".strip() if po_number else "Orden de compra"
+    # Nombre = número de PO, sin prefijo.  Si no hay número, "Orden de compra".
+    nombre_doc = (po_number or "").strip() or "Orden de compra"
 
-    # Descargar el PO a un archivo temporal con un nombre limpio (el que ve el usuario en 1CRM).
+    # Descargar el PO a un archivo temporal con nombre limpio.
     try:
         r = httpx.get(file_url, timeout=30, follow_redirects=True)
         r.raise_for_status()
         ext = pathlib.Path(urlparse(file_url).path).suffix or ".pdf"
-        safe = (po_number or "orden_compra").replace("/", "-").replace(" ", "_")
-        tmp_path = str(pathlib.Path(tempfile.gettempdir()) / f"PO_{safe}{ext}")
+        safe = nombre_doc.replace("/", "-").replace(" ", "_")
+        tmp_path = str(pathlib.Path(tempfile.gettempdir()) / f"{safe}{ext}")
         pathlib.Path(tmp_path).write_bytes(r.content)
     except Exception as e:
         log.warning(f"No se pudo descargar el PO para subirlo a 1CRM: {e}")
@@ -1146,26 +1146,51 @@ def subir_po_a_so(so_id: str, file_url: str, po_number: str = "") -> dict:
             browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
             page = browser.new_context(ignore_https_errors=True, viewport={"width": 1400, "height": 1000}).new_page()
 
+            # --- Login ---
             page.goto(f"{crm_url}/index.php?module=Users&action=Login", timeout=30000)
             page.fill('input[name="user_name"]', crm_user)
             page.fill('input[name="user_password"]', crm_pass)
             page.click('input[type="submit"], button[type="submit"]')
             page.wait_for_url(f"{crm_url}/index.php*", timeout=20000)
 
-            page.goto(f"{crm_url}/index.php?module=SalesOrders&action=DetailView&record={so_id}", timeout=30000)
+            # --- Estrategia 1: Documents/EditView con parent = SalesOrder ---
+            doc_url = (
+                f"{crm_url}/index.php?module=Documents&action=EditView"
+                f"&parent_type=SalesOrders&parent_id={so_id}"
+            )
+            page.goto(doc_url, timeout=30000)
             page.wait_for_load_state("networkidle", timeout=30000)
 
+            # Verificar que estamos en el formulario de creación de Documentos
+            name_input = page.locator('input[name="document_name"]')
+            if name_input.count() > 0:
+                name_input.first.fill(nombre_doc)
+                # Campo de archivo: buscar inputs de tipo file (el campo se llama 'uploadfile' en 1CRM)
+                file_input = page.locator('input[name="uploadfile"], input[type="file"]').first
+                file_input.set_input_files(tmp_path)
+                page.wait_for_timeout(500)
+                # Guardar el documento
+                page.locator('input[type="submit"][name="button"], input[id*="save"], button[id*="save"]').first.click(timeout=8000)
+                page.wait_for_timeout(3000)
+                browser.close()
+                log.info(f"PO guardado en Documentos de la SO {so_id} con nombre '{nombre_doc}'")
+                return {"ok": True, "metodo": "documento"}
+
+            # --- Estrategia 2 (fallback): Nota en el subpanel de la SO ---
+            log.warning("Documents/EditView no encontrado — usando fallback Nota en la SO")
+            page.goto(f"{crm_url}/index.php?module=SalesOrders&action=DetailView&record={so_id}", timeout=30000)
+            page.wait_for_load_state("networkidle", timeout=30000)
             page.locator("text=Nueva Nota o Archivo Adjunto").first.click(timeout=10000)
             page.wait_for_timeout(1000)
-            page.fill('input[name="name"]', nombre_nota)
+            page.fill('input[name="name"]', nombre_doc)
             page.set_input_files('input[name="filename"]', tmp_path)
             page.wait_for_timeout(500)
             page.click("#QuickCreateForm_0_save")
-            page.wait_for_timeout(3000)  # upload.php + async.php de guardado, sin respuesta fácil de interceptar
-
+            page.wait_for_timeout(3000)
             browser.close()
-        log.info(f"PO subido a la SO {so_id} como Nota '{nombre_nota}'")
-        return {"ok": True}
+            log.info(f"PO guardado como Nota en la SO {so_id} con nombre '{nombre_doc}'")
+            return {"ok": True, "metodo": "nota"}
+
     except Exception as e:
         log.warning(f"No se pudo subir el PO a 1CRM (SO ya quedó creada, esto no la afecta): {e}")
         return {"ok": False, "error": str(e)}

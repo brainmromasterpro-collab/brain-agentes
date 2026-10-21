@@ -198,6 +198,11 @@ _NORM_SYS = (
     "- El part_number es el identificador del producto (SKU/modelo/mfr part no), NO la descripción.\n"
     "- Si el documento incluye o cita una COTIZACIÓN/PRESUPUESTO nuestro (de MRO Master Pro), pon su "
     "número en cotizacion_ref — sirve de referencia para saber de qué cotización salió la orden.\n"
+    "- IMPORTANTE: cuando el documento tenga VARIAS PÁGINAS o secciones y una de ellas sea una "
+    "COTIZACIÓN/PRESUPUESTO de MRO Master Pro (encabezado 'PRESUPUESTO', 'MRO | MasterPro', folio "
+    "Q20xx-…, columnas 'Precio Unitario / Importe'), pon su número en cotizacion_ref pero NO incluyas "
+    "sus líneas como items del PO. Los items deben venir ÚNICAMENTE del documento de PURCHASE ORDER "
+    "(la parte que dice 'PURCHASE ORDER', firmada por el CLIENTE, con su logo y su membrete).\n"
     "- Si el texto NO parece una orden de compra, devuelve items:[] y explica en notas.\n"
     "- Números sin separadores de miles ni símbolo de moneda (1234.56, no $1,234.56)."
 )
@@ -266,8 +271,18 @@ def normalizar_vision(imagenes: list[bytes], model_id: str = "") -> dict:
         return {"error": "sin imágenes que leer", "items": []}
     import base64
     import anthropic
-    contenido: list = [{"type": "text", "text":
-                        "Esta es una ORDEN DE COMPRA escaneada (imágenes). Extrae los datos al esquema pedido."}]
+    multi = len(imagenes) > 1
+    intro = (
+        "Este documento tiene VARIAS PÁGINAS. La primera página contiene la ORDEN DE COMPRA del cliente "
+        "(PURCHASE ORDER). Las páginas siguientes pueden ser cotizaciones/presupuestos nuestros adjuntos "
+        "o cualquier otro documento. Extrae los datos AL ESQUEMA PEDIDO tomando los items SOLO de la "
+        "página del PURCHASE ORDER. Si una página siguiente contiene un PRESUPUESTO nuestro "
+        "(encabezado 'PRESUPUESTO', 'MRO | MasterPro', folio Q20xx-…), pon su número en cotizacion_ref "
+        "pero NO incluyas sus líneas como items del PO."
+        if multi else
+        "Esta es una ORDEN DE COMPRA escaneada (imagen). Extrae los datos al esquema pedido."
+    )
+    contenido: list = [{"type": "text", "text": intro}]
     for img in imagenes:
         contenido.append({"type": "image", "source": {
             "type": "base64", "media_type": "image/png",
