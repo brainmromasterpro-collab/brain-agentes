@@ -1104,93 +1104,49 @@ def crear_sales_order(draft: dict) -> dict:
 # 5. SUBIR EL PO ORIGINAL A LA SALES ORDER (módulo Documentos)
 # ─────────────────────────────────────────────────────────────
 def subir_po_a_so(so_id: str, file_url: str, po_number: str = "") -> dict:
-    """Sube el PO original al módulo Documents de 1CRM y lo relaciona a la Sales Order.
+    """Crea un Documento en 1CRM con el PDF del PO y lo vincula a la Sales Order.
 
-    El nombre del documento es el número de PO (p.ej. '8992'), o 'Orden de compra' si no hay número.
+    Usa la API REST: descarga el archivo, lo codifica en base64 y hace POST a /data/Document
+    con parent_type=SalesOrders + parent_id=so_id.  Verificado en vivo: la API acepta el file
+    en base64 y guarda la relación directamente.  Sin Playwright.
 
-    Estrategia:
-      1. Playwright → Documents/EditView → rellena document_name + uploadfile + parent SalesOrder →
-         guarda. El campo 'parent_type'/'parent_id' en ese EditView vincula el doc a la SO.
-      2. Si falla (campo no encontrado / error): fallback a la Nota de la SO
-         (el mecanismo anterior que sí funciona, aunque aparece en Historial en vez de Documentos).
-
-    1CRM Cloud bloquea upload.php a HTTP externos, así que solo funciona vía browser real (Playwright).
-    Fallback silencioso: si ambas opciones fallan la SO ya quedó creada — esto no la afecta."""
+    Si falla (descarga o API) la SO ya quedó creada — el documento no afecta la SO."""
     if not file_url or not so_id:
         return {"ok": False, "error": "falta file_url o so_id"}
-    import tempfile
+
+    import base64
     import pathlib
     from urllib.parse import urlparse
 
-    crm_url = CRM_BASE
-    crm_user = os.environ.get("ONECRM_USERNAME", "")
-    crm_pass = os.environ.get("ONECRM_PASSWORD", "")
-    # Nombre = número de PO, sin prefijo.  Si no hay número, "Orden de compra".
     nombre_doc = (po_number or "").strip() or "Orden de compra"
 
-    # Descargar el PO a un archivo temporal con nombre limpio.
     try:
         r = httpx.get(file_url, timeout=30, follow_redirects=True)
         r.raise_for_status()
         ext = pathlib.Path(urlparse(file_url).path).suffix or ".pdf"
-        safe = nombre_doc.replace("/", "-").replace(" ", "_")
-        tmp_path = str(pathlib.Path(tempfile.gettempdir()) / f"{safe}{ext}")
-        pathlib.Path(tmp_path).write_bytes(r.content)
+        filename = f"{nombre_doc.replace('/', '-').replace(' ', '_')}{ext}"
+        file_b64 = base64.b64encode(r.content).decode("utf-8")
     except Exception as e:
         log.warning(f"No se pudo descargar el PO para subirlo a 1CRM: {e}")
         return {"ok": False, "error": str(e)}
 
     try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-            page = browser.new_context(ignore_https_errors=True, viewport={"width": 1400, "height": 1000}).new_page()
-
-            # --- Login ---
-            page.goto(f"{crm_url}/index.php?module=Users&action=Login", timeout=30000)
-            page.fill('input[name="user_name"]', crm_user)
-            page.fill('input[name="user_password"]', crm_pass)
-            page.click('input[type="submit"], button[type="submit"]')
-            page.wait_for_url(f"{crm_url}/index.php*", timeout=20000)
-
-            # --- Estrategia 1: Documents/EditView con parent = SalesOrder ---
-            doc_url = (
-                f"{crm_url}/index.php?module=Documents&action=EditView"
-                f"&parent_type=SalesOrders&parent_id={so_id}"
-            )
-            page.goto(doc_url, timeout=30000)
-            page.wait_for_load_state("networkidle", timeout=30000)
-
-            # Verificar que estamos en el formulario de creación de Documentos
-            name_input = page.locator('input[name="document_name"]')
-            if name_input.count() > 0:
-                name_input.first.fill(nombre_doc)
-                # Campo de archivo: buscar inputs de tipo file (el campo se llama 'uploadfile' en 1CRM)
-                file_input = page.locator('input[name="uploadfile"], input[type="file"]').first
-                file_input.set_input_files(tmp_path)
-                page.wait_for_timeout(500)
-                # Guardar el documento
-                page.locator('input[type="submit"][name="button"], input[id*="save"], button[id*="save"]').first.click(timeout=8000)
-                page.wait_for_timeout(3000)
-                browser.close()
-                log.info(f"PO guardado en Documentos de la SO {so_id} con nombre '{nombre_doc}'")
-                return {"ok": True, "metodo": "documento"}
-
-            # --- Estrategia 2 (fallback): Nota en el subpanel de la SO ---
-            log.warning("Documents/EditView no encontrado — usando fallback Nota en la SO")
-            page.goto(f"{crm_url}/index.php?module=SalesOrders&action=DetailView&record={so_id}", timeout=30000)
-            page.wait_for_load_state("networkidle", timeout=30000)
-            page.locator("text=Nueva Nota o Archivo Adjunto").first.click(timeout=10000)
-            page.wait_for_timeout(1000)
-            page.fill('input[name="name"]', nombre_doc)
-            page.set_input_files('input[name="filename"]', tmp_path)
-            page.wait_for_timeout(500)
-            page.click("#QuickCreateForm_0_save")
-            page.wait_for_timeout(3000)
-            browser.close()
-            log.info(f"PO guardado como Nota en la SO {so_id} con nombre '{nombre_doc}'")
-            return {"ok": True, "metodo": "nota"}
-
+        result = _crm_post("Document", {
+            "document_name": nombre_doc,
+            "status_id": "Active",
+            "revision": "1",
+            "change_log": "Orden de compra del cliente",
+            "filename": filename,
+            "file": file_b64,
+            "parent_type": "SalesOrders",
+            "parent_id": so_id,
+        })
+        doc_id = result.get("id")
+        if doc_id:
+            log.info(f"PO guardado en Documentos: id={doc_id} nombre='{nombre_doc}' SO={so_id}")
+            return {"ok": True, "metodo": "api", "doc_id": doc_id}
+        log.warning(f"API Document no devolvió id: {result}")
+        return {"ok": False, "error": f"sin id en respuesta: {result}"}
     except Exception as e:
         log.warning(f"No se pudo subir el PO a 1CRM (SO ya quedó creada, esto no la afecta): {e}")
         return {"ok": False, "error": str(e)}
