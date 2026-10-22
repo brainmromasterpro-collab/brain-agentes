@@ -1,0 +1,5840 @@
+"""
+AGENTE CHAT — Brain · MRO Master Pro
+======================================
+Worker que corre en Railway (dentro de main.py).
+
+Lee mensajes de la tabla `mensajes` donde procesado=false y role='user',
+los procesa con Claude (tool_use) y escribe la respuesta de vuelta.
+
+Capacidades:
+  A. Chat conversacional: responde preguntas sobre 1CRM, RFQs, métricas, internet
+  B. Extracción de números de parte: detecta cuando el usuario pega una lista
+     de part-numbers y crea RFQs automáticamente (como el extractor de imagen)
+
+Tabla Supabase requerida (correr una vez):
+  CREATE TABLE IF NOT EXISTS mensajes (
+      id          uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+      stream_id   uuid,
+      role        text NOT NULL CHECK (role IN ('user','assistant','system')),
+      content     text NOT NULL,
+      metadata    jsonb DEFAULT '{}',
+      procesado   boolean DEFAULT false,
+      created_at  timestamptz DEFAULT now()
+  );
+  ALTER TABLE mensajes ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY "lectura publica mensajes"
+      ON mensajes FOR SELECT USING (true);
+  CREATE POLICY "insert anon mensajes"
+      ON mensajes FOR INSERT WITH CHECK (true);
+  CREATE POLICY "update service_role mensajes"
+      ON mensajes FOR UPDATE USING (auth.role() = 'service_role');
+
+Variables de entorno (las mismas del proyecto):
+  ANTHROPIC_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_KEY
+  ONECRM_URL, ONECRM_USERNAME, ONECRM_PASSWORD
+  SERPAPI_KEY, GOOGLE_API_KEY, GOOGLE_CX
+"""
+
+import os
+import re
+import json
+import time
+import unicodedata
+import uuid
+import logging
+from datetime import datetime, timezone, timedelta
+from typing import Any
+
+import httpx
+import anthropic
+from dotenv import load_dotenv
+from supabase import create_client, Client
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("agente_chat")
+# Silenciar el flood de "HTTP Request: GET ..." (cada poll de los 5 agentes) para que los
+# logs sean legibles y se puedan ver los [PERF] y demás mensajes importantes.
+for _noisy in ("httpx", "httpcore", "anthropic", "hpack"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
+supabase: Client = create_client(
+    os.environ["SUPABASE_URL"],
+    os.environ["SUPABASE_SERVICE_KEY"],
+)
+claude = anthropic.Anthropic(
+    api_key=os.environ["ANTHROPIC_API_KEY"],
+    timeout=60.0,     # corta cualquier llamada colgada a los 60s (evita "procesando" perpetuo)
+    max_retries=1,    # a lo más 1 reintento → peor caso ~120s y responde, no cuelga para siempre
+)
+# Modelo del chat. Configurable por env var para poder cambiar/revertir sin re-deploy.
+CHAT_MODEL = os.environ.get("CHAT_MODEL", "claude-sonnet-5")
+
+ONECRM_BASE   = os.environ.get("ONECRM_URL", "").rstrip("/")
+POLL_INTERVAL = 5   # segundos — respuesta rápida en el chat
+
+GOOGLE_CLIENT_ID     = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_REFRESH_TOKEN = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
+GMAIL_USER           = "brain.mromasterpro@gmail.com"
+VENTAS_USER          = os.environ.get("GMAIL_DELEGATED_USER", "ventas@mromasterpro.com")
+
+
+# ─────────────────────────────────────────────────────────────
+# HERRAMIENTAS — IMPLEMENTACIONES
+# ─────────────────────────────────────────────────────────────
+
+def _onecrm_get(endpoint: str, params: dict = {}) -> dict:
+    user = os.environ.get("ONECRM_USERNAME", "")
+    pwd  = os.environ.get("ONECRM_PASSWORD",  "")
+    try:
+        resp = httpx.get(
+            f"{ONECRM_BASE}/api.php/{endpoint}",
+            auth=(user, pwd), params=params, timeout=20,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        return {"error": str(e), "records": [], "total_count": 0}
+
+
+_gmail_token_cache: dict  = {"token": None, "exp": 0.0}
+_ventas_token_cache: dict = {"token": None, "exp": 0.0}
+
+
+def _gmail_access_token() -> str:
+    """Obtiene un access token de Google. Lo cachea en memoria hasta ~5 min antes de expirar,
+    para no hacer un round-trip OAuth (~300ms) en cada llamada dentro de un mismo request."""
+    import time
+    if _gmail_token_cache["token"] and time.time() < _gmail_token_cache["exp"]:
+        return _gmail_token_cache["token"]
+    resp = httpx.post("https://oauth2.googleapis.com/token", data={
+        "client_id":     os.environ.get("GOOGLE_CLIENT_ID", GOOGLE_CLIENT_ID),
+        "client_secret": os.environ.get("GOOGLE_CLIENT_SECRET", GOOGLE_CLIENT_SECRET),
+        "refresh_token": os.environ.get("GOOGLE_REFRESH_TOKEN", GOOGLE_REFRESH_TOKEN),
+        "grant_type":    "refresh_token",
+    }, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    if "access_token" not in data:
+        raise ValueError(f"Google OAuth error: {data}")
+    _gmail_token_cache["token"] = data["access_token"]
+    _gmail_token_cache["exp"]   = time.time() + data.get("expires_in", 3600) - 300
+    return data["access_token"]
+
+
+def _gmail_access_token_ventas() -> str:
+    """Token de acceso para ventas@mromasterpro.com vía Service Account + DWD.
+    Requiere GOOGLE_SERVICE_ACCOUNT_JSON en env."""
+    import time
+    if _ventas_token_cache["token"] and time.time() < _ventas_token_cache["exp"]:
+        return _ventas_token_cache["token"]
+    sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+    if not sa_json:
+        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON no configurado")
+    from google.oauth2 import service_account
+    import google.auth.transport.requests
+    import base64 as _b64
+    # Acepta tanto JSON directo como JSON codificado en base64 (recomendado para Railway)
+    try:
+        info = json.loads(sa_json)
+    except json.JSONDecodeError:
+        info = json.loads(_b64.b64decode(sa_json).decode())
+    creds = service_account.Credentials.from_service_account_info(
+        info,
+        scopes=["https://www.googleapis.com/auth/gmail.modify"],
+    ).with_subject(VENTAS_USER)
+    creds.refresh(google.auth.transport.requests.Request())
+    _ventas_token_cache["token"] = creds.token
+    _ventas_token_cache["exp"]   = time.time() + 3300  # ~55 min
+    return creds.token
+
+
+def _gmail_decode_body(payload: dict) -> str:
+    """Extrae texto plano del payload de un mensaje de Gmail."""
+    import base64
+
+    def extract(part: dict) -> str:
+        mime = part.get("mimeType", "")
+        if mime == "text/plain":
+            data = part.get("body", {}).get("data", "")
+            if data:
+                return base64.urlsafe_b64decode(data + "==").decode("utf-8", errors="replace")
+        for sub in part.get("parts", []):
+            result = extract(sub)
+            if result:
+                return result
+        return ""
+
+    return extract(payload).strip()
+
+
+def _gmail_ultimo_mensaje_nuestro(thread_id: str, token: str) -> bool:
+    """True si el ÚLTIMO mensaje del hilo lo enviamos NOSOTROS (label SENT) — o sea, ya
+    respondimos y estamos esperando al cliente, por lo que la oportunidad NO es nueva.
+    False si el último mensaje es del cliente (hay algo nuevo que atender) o si no se puede
+    determinar (ante la duda, se trata como accionable)."""
+    if not thread_id:
+        return False
+    try:
+        th = httpx.get(
+            f"https://gmail.googleapis.com/gmail/v1/users/me/threads/{thread_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            params={"format": "minimal"}, timeout=15,
+        ).json()
+        msgs = th.get("messages", [])
+        if not msgs:
+            return False
+        # Gmail devuelve los mensajes en orden ascendente; el último es el más reciente.
+        return "SENT" in msgs[-1].get("labelIds", [])
+    except Exception:
+        return False
+
+
+def _leer_emails_con_token(token: str, max_emails: int, query: str) -> list[dict]:
+    """Lee emails de Gmail usando un access token ya obtenido."""
+    headers = {"Authorization": f"Bearer {token}"}
+    base = "https://gmail.googleapis.com/gmail/v1"
+    params = {"userId": "me", "maxResults": min(max_emails, 20), "q": query}
+    lista = httpx.get(f"{base}/users/me/messages", headers=headers, params=params, timeout=15).json()
+    emails = []
+    for m in lista.get("messages", []):
+        detail = httpx.get(f"{base}/users/me/messages/{m['id']}",
+            headers=headers, params={"userId": "me", "format": "full"}, timeout=15).json()
+        hdrs = {h["name"]: h["value"] for h in detail.get("payload", {}).get("headers", [])}
+        body = _gmail_decode_body(detail.get("payload", {}))
+        emails.append({
+            "id":        m["id"],
+            "thread_id": detail.get("threadId", ""),
+            "de":        hdrs.get("From", ""),
+            "para":      hdrs.get("To", ""),
+            "asunto":    hdrs.get("Subject", ""),
+            "fecha":     hdrs.get("Date", ""),
+            "snippet":   detail.get("snippet", ""),
+            "cuerpo":    body[:1500] if body else detail.get("snippet", ""),
+            "leido":     "UNREAD" not in detail.get("labelIds", []),
+        })
+    return emails
+
+
+def tool_leer_emails_gmail(max_emails: int = 10, query: str = "newer_than:1d",
+                           cuenta: str = "ventas") -> dict:
+    """Lee emails de Gmail.
+    cuenta: 'ventas' (ventas@mromasterpro.com, default), 'personal' (brain.mromasterpro@gmail.com),
+            'ambas' (combina los dos buzones).
+    query soporta filtros de Gmail: newer_than:1d, from:alguien@mail.com, subject:tema, is:unread, etc.
+    """
+    emails: list[dict] = []
+    errors: list[str] = []
+
+    if cuenta in ("ventas", "ambas"):
+        try:
+            token = _gmail_access_token_ventas()
+            emails += _leer_emails_con_token(token, max_emails, query)
+        except Exception as e:
+            errors.append(f"ventas@: {e}")
+
+    if cuenta in ("personal", "ambas"):
+        refresh = os.environ.get("GOOGLE_REFRESH_TOKEN", GOOGLE_REFRESH_TOKEN)
+        if refresh:
+            try:
+                token = _gmail_access_token()
+                emails += _leer_emails_con_token(token, max_emails, query)
+            except Exception as e:
+                errors.append(f"personal: {e}")
+
+    if not emails and errors:
+        return {"error": "; ".join(errors)}
+
+    # Deduplicar por id (puede haber overlap si el mismo correo está en ambas cuentas)
+    seen: set[str] = set()
+    unique = [e for e in emails if not (e["id"] in seen or seen.add(e["id"]))]  # type: ignore[func-returns-value]
+    return {"total": len(unique), "query": query, "cuenta": cuenta, "emails": unique}
+
+
+def tool_buscar_email_gmail(query: str, max_emails: int = 5) -> dict:
+    """Busca emails en Gmail con cualquier query: from:, subject:, has:attachment, etc."""
+    return tool_leer_emails_gmail(max_emails=max_emails, query=query)
+
+
+def tool_enviar_email_gmail(para: str, asunto: str, cuerpo: str, thread_id: str = "",
+                            message_id: str = "", cuenta: str = "ventas") -> dict:
+    """Envía o responde un email desde la cuenta de la empresa.
+    cuenta: 'ventas' (ventas@mromasterpro.com, default) o 'personal' (brain.mromasterpro@gmail.com).
+    Si se pasa thread_id y message_id, responde en el hilo existente (Reply).
+    """
+    import base64
+    from email.mime.text import MIMEText
+
+    try:
+        if cuenta == "ventas":
+            token   = _gmail_access_token_ventas()
+            from_addr = VENTAS_USER
+        else:
+            refresh = os.environ.get("GOOGLE_REFRESH_TOKEN", GOOGLE_REFRESH_TOKEN)
+            if not refresh:
+                return {"error": "GOOGLE_REFRESH_TOKEN no configurado"}
+            token   = _gmail_access_token()
+            from_addr = GMAIL_USER
+
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
+        msg = MIMEText(cuerpo, "plain", "utf-8")
+        msg["To"]      = para
+        msg["From"]    = from_addr
+        msg["Subject"] = asunto
+        if message_id:
+            msg["In-Reply-To"] = message_id
+            msg["References"]  = message_id
+
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+        body_payload: dict = {"raw": raw}
+        if thread_id:
+            body_payload["threadId"] = thread_id
+
+        resp = httpx.post(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+            headers=headers,
+            content=json.dumps(body_payload).encode(),
+            timeout=15,
+        )
+        if not resp.is_success:
+            return {"error": f"Gmail API {resp.status_code}", "detalle": resp.text[:500]}
+        data = resp.json()
+        return {
+            "ok":         True,
+            "message_id": data.get("id"),
+            "thread_id":  data.get("threadId"),
+            "enviado_a":  para,
+            "desde":      from_addr,
+            "asunto":     asunto,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def tool_diagnostico_gmail() -> dict:
+    """Diagnóstica el estado de la conexión Gmail — muestra si las variables están configuradas."""
+    client_id  = os.environ.get("GOOGLE_CLIENT_ID", "")
+    client_sec = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+    refresh    = os.environ.get("GOOGLE_REFRESH_TOKEN", "")
+    sa_json    = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+    status = {
+        "GOOGLE_CLIENT_ID":            "✅ configurado" if client_id  else "❌ falta",
+        "GOOGLE_CLIENT_SECRET":        "✅ configurado" if client_sec else "❌ falta",
+        "GOOGLE_REFRESH_TOKEN":        "✅ configurado" if refresh    else "❌ falta",
+        "GOOGLE_SERVICE_ACCOUNT_JSON": "✅ configurado" if sa_json   else "❌ falta",
+        "GMAIL_DELEGATED_USER":        VENTAS_USER,
+    }
+    if client_id and client_sec and refresh:
+        try:
+            _gmail_access_token()
+            status["conexion_personal"] = f"✅ token OK para {GMAIL_USER}"
+        except Exception as e:
+            status["conexion_personal"] = f"❌ error: {e}"
+    else:
+        status["conexion_personal"] = "❌ variables incompletas"
+    if sa_json:
+        try:
+            _gmail_access_token_ventas()
+            status["conexion_ventas"] = f"✅ token OK para {VENTAS_USER}"
+        except Exception as e:
+            status["conexion_ventas"] = f"❌ error: {e}"
+    else:
+        status["conexion_ventas"] = "❌ GOOGLE_SERVICE_ACCOUNT_JSON no configurado"
+    return status
+
+
+def _lookup_contact_by_email(email_addr: str) -> dict:
+    """Busca si un email pertenece a un contacto o cuenta en 1CRM. Máximo 3 llamadas HTTP."""
+    result: dict = {"contacto": None, "cuenta": None}
+    if not email_addr or not ONECRM_BASE:
+        return result
+
+    # 1 llamada: buscar contacto por email con fields necesarios
+    params = [
+        ("max_num", 3), ("filter_text", email_addr),
+        ("fields[]", "id"), ("fields[]", "first_name"), ("fields[]", "last_name"),
+        ("fields[]", "title"), ("fields[]", "primary_account_id"),
+    ]
+    contactos = _onecrm_get("data/Contact", dict(params)).get("records", [])
+    if contactos:
+        c = contactos[0]
+        result["contacto"] = {
+            "id":        c.get("id"),
+            "nombre":    f"{c.get('first_name','')} {c.get('last_name','')}".strip(),
+            "cargo":     c.get("title", ""),
+            "cuenta_id": c.get("primary_account_id", ""),
+        }
+        if c.get("primary_account_id"):
+            # 1 llamada: obtener nombre de la cuenta
+            acct = _onecrm_get(f"data/Account/{c['primary_account_id']}").get("record", {})
+            result["cuenta"] = {"id": acct.get("id"), "nombre": acct.get("name", "")}
+
+    # Si no encontramos contacto, buscar por dominio (1 llamada)
+    if not result["cuenta"] and "@" in email_addr:
+        domain = email_addr.split("@")[-1]
+        if domain not in ("gmail.com", "hotmail.com", "yahoo.com", "outlook.com", "icloud.com"):
+            keyword = domain.split(".")[0]
+            cuentas = _onecrm_get("data/Account", {"max_num": 3, "filter_text": keyword}).get("records", [])
+            if cuentas:
+                result["cuenta"] = {"id": cuentas[0].get("id"), "nombre": cuentas[0].get("name", "")}
+    return result
+
+
+def _check_products_in_crm(texto: str) -> list:
+    """Extrae posibles part-numbers del texto y verifica si están en el catálogo CRM."""
+    import re
+    patrones = re.findall(
+        r'\b([A-Z0-9]{3,}[-/][A-Z0-9]{2,}(?:[-/][A-Z0-9]+)*|[A-Z]{1,4}\d{4,}[A-Z0-9-]*)\b',
+        texto.upper()
+    )
+    resultados = []
+    vistos: set = set()
+    for pn in patrones[:5]:
+        if pn in vistos:
+            continue
+        vistos.add(pn)
+        data = _onecrm_get("data/AOS_Products_Quotes", {"max_num": 1, "filter_text": pn})
+        en_crm = len(data.get("records", [])) > 0
+        resultados.append({"part_number": pn, "en_catalogo_crm": en_crm})
+    return resultados
+
+
+def tool_escanear_emails_ventas(query: str = "newer_than:3d", max_emails: int = 10) -> dict:
+    """Escanea emails de Gmail buscando oportunidades de venta (RFQs, solicitudes de cotización).
+    Para cada email detecta: si el remitente es cliente en CRM, a qué cuenta pertenece,
+    qué productos/part-numbers menciona y si están en el catálogo.
+    """
+    import re
+    emails_raw = tool_leer_emails_gmail(max_emails=max_emails, query=query)
+    if "error" in emails_raw:
+        return emails_raw
+
+    keywords_rfq = ["rfq", "cotización", "cotizacion", "precio", "presupuesto", "quote",
+                    "disponibilidad", "solicitud", "necesitamos", "requerimos", "cuánto cuesta",
+                    "availability", "request for", "lead time"]
+
+    # Token de Gmail para revisar hilos (se toma una sola vez; _gmail_access_token no cachea).
+    _gmail_token = None
+    omitidas_ya_atendidas = 0
+
+    oportunidades = []
+    for email in emails_raw.get("emails", []):
+        de_raw = email.get("de", "")
+        match = re.search(r'[\w.+-]+@[\w.-]+\.\w+', de_raw)
+        email_addr = match.group(0).lower() if match else ""
+
+        texto_completo = (email.get("asunto", "") + " " + email.get("cuerpo", "")).lower()
+        es_rfq = any(k in texto_completo for k in keywords_rfq)
+
+        # Una oportunidad YA no es "nueva" si ya la atendimos: es decir, si el último mensaje del
+        # hilo lo enviamos nosotros (ya respondimos y esperamos al cliente). Si el cliente contestó
+        # después (último mensaje suyo), sigue siendo accionable.
+        if es_rfq:
+            try:
+                if _gmail_token is None:
+                    _gmail_token = _gmail_access_token()
+                if _gmail_ultimo_mensaje_nuestro(email.get("thread_id", ""), _gmail_token):
+                    omitidas_ya_atendidas += 1
+                    continue  # ya atendida — no aparece como nueva
+            except Exception:
+                pass  # ante la duda, se trata como accionable
+
+        # Los lookups a 1CRM son caros (~0.5s c/u). Solo se corren en correos que SÍ son RFQ;
+        # así el escaneo de una bandeja normal no dispara ~90 llamadas secuenciales al CRM.
+        if es_rfq:
+            crm_info = _lookup_contact_by_email(email_addr) if email_addr else {"contacto": None, "cuenta": None}
+            texto_upper = email.get("asunto", "") + " " + email.get("cuerpo", "")
+            productos = _check_products_in_crm(texto_upper)
+        else:
+            crm_info = {"contacto": None, "cuenta": None}
+            productos = []
+
+        cantidades = re.findall(r'\b(\d+)\s*(?:pz|pzas?|piezas?|unidades?|units?|qty|pcs?)\b', texto_completo)
+
+        oportunidades.append({
+            "email_id":              email.get("id"),
+            "thread_id":             email.get("thread_id", ""),
+            "asunto":                email.get("asunto"),
+            "de":                    de_raw,
+            "email_remitente":       email_addr,
+            "fecha":                 email.get("fecha"),
+            "snippet":               email.get("snippet"),
+            "es_rfq":                es_rfq,
+            "cliente_crm":           crm_info["cuenta"],
+            "contacto_crm":          crm_info["contacto"],
+            "es_cliente_conocido":   crm_info["cuenta"] is not None,
+            "productos_detectados":  productos,
+            "cantidades_mencionadas": cantidades,
+            "cuerpo_resumido":       email.get("cuerpo", "")[:800],
+        })
+
+    return {
+        "total_emails":          len(oportunidades),
+        "posibles_rfqs":         len([o for o in oportunidades if o["es_rfq"]]),
+        "clientes_conocidos":    len([o for o in oportunidades if o["es_cliente_conocido"]]),
+        "omitidas_ya_atendidas": omitidas_ya_atendidas,
+        "oportunidades":         oportunidades,
+    }
+
+
+def tool_notificar_sistema(titulo: str, mensaje: str = "", tipo: str = "oportunidad",
+                           stream_id: str = "") -> dict:
+    """Publica una notificación en el sistema (campana/toast del dashboard).
+    Úsala para avisar que hay oportunidades detectadas en el correo.
+    """
+    try:
+        payload: dict = {"tipo": tipo, "titulo": titulo, "mensaje": mensaje or "", "leida": False}
+        if stream_id:
+            payload["stream_id"] = stream_id
+        supabase.table("notificaciones").insert(payload).execute()
+        return {"ok": True, "titulo": titulo}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _notif(stream_id: str, titulo: str, mensaje: str = "", tipo: str = "oportunidad") -> None:
+    """Notificación DETERMINISTA (la emite la tool al tener éxito, no el modelo → nunca se salta)."""
+    try:
+        payload: dict = {"tipo": tipo, "titulo": titulo, "mensaje": mensaje or "", "leida": False}
+        if stream_id and stream_id not in ("None", ""):
+            payload["stream_id"] = stream_id
+        supabase.table("notificaciones").insert(payload).execute()
+    except Exception as e:
+        log.warning(f"notif determinista falló: {e}")
+
+
+def _onecrm_post(endpoint: str, payload: dict) -> dict:
+    user = os.environ.get("ONECRM_USERNAME", "")
+    pwd  = os.environ.get("ONECRM_PASSWORD",  "")
+    try:
+        resp = httpx.post(
+            f"{ONECRM_BASE}/api.php/{endpoint}",
+            auth=(user, pwd), json={"data": payload}, timeout=20,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _onecrm_patch(endpoint: str, payload: dict) -> dict:
+    """Actualiza (PATCH) un registro existente: endpoint = data/<Modelo>/<id>."""
+    user = os.environ.get("ONECRM_USERNAME", "")
+    pwd  = os.environ.get("ONECRM_PASSWORD",  "")
+    try:
+        resp = httpx.patch(
+            f"{ONECRM_BASE}/api.php/{endpoint}",
+            auth=(user, pwd), json={"data": payload}, timeout=20,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def tool_actualizar_oportunidad_crm(oportunidad_id: str, nombre: str = "", descripcion: str = "",
+                                    monto: float = 0, stream_id: str = "") -> dict:
+    """Actualiza una oportunidad EXISTENTE en 1CRM (para integrar información nueva/adicional de un
+    RFQ ya registrado — ej. agregar part-numbers o corregir cantidades en la descripción). Solo
+    manda los campos que cambian. La descripción se REEMPLAZA por lo que mandes: si vas a AÑADIR,
+    incluye lo previo + lo nuevo."""
+    if not oportunidad_id:
+        return {"error": "falta oportunidad_id"}
+    payload: dict = {}
+    if nombre:      payload["name"] = nombre
+    if descripcion: payload["description"] = descripcion
+    if monto:       payload["amount"] = monto
+    if not payload:
+        return {"error": "nada que actualizar"}
+    r = _onecrm_patch(f"data/Opportunity/{oportunidad_id}", payload)
+    ok = "error" not in r
+    if ok:
+        _notif(stream_id, "🔄 Oportunidad actualizada", descripcion[:120])
+    return {"ok": ok, "id": oportunidad_id,
+            "url_crm": f"{ONECRM_BASE}/index.php?module=Opportunities&action=DetailView&record={oportunidad_id}",
+            "error": r.get("error", "")}
+
+
+def tool_actualizar_cuenta_crm(cuenta_id: str, telefono: str = "", email: str = "",
+                               envio_calle: str = "", envio_ciudad: str = "", envio_estado: str = "",
+                               envio_cp: str = "", envio_pais: str = "", stream_id: str = "") -> dict:
+    """Actualiza una cuenta EXISTENTE (para completar un dato que faltaba, ej. la dirección de
+    envío). Solo manda los campos que llegan. Recuerda: el correo/teléfono de la PERSONA van en el
+    contacto, no en la cuenta — aquí solo si es un dato corporativo de la empresa."""
+    if not cuenta_id:
+        return {"error": "falta cuenta_id"}
+    payload: dict = {}
+    if telefono:     payload["phone_office"] = telefono
+    if email:        payload["email1"] = email
+    if envio_calle:  payload["shipping_address_street"] = envio_calle
+    if envio_ciudad: payload["shipping_address_city"] = envio_ciudad
+    if envio_estado: payload["shipping_address_state"] = envio_estado
+    if envio_cp:     payload["shipping_address_postalcode"] = envio_cp
+    if envio_pais:   payload["shipping_address_country"] = envio_pais
+    if not payload:
+        return {"error": "nada que actualizar"}
+    r = _onecrm_patch(f"data/Account/{cuenta_id}", payload)
+    ok = "error" not in r
+    if ok:
+        _notif(stream_id, "🔄 Cuenta actualizada")
+    return {"ok": ok, "id": cuenta_id,
+            "url_crm": f"{ONECRM_BASE}/index.php?module=Accounts&action=DetailView&record={cuenta_id}",
+            "error": r.get("error", "")}
+
+
+def tool_actualizar_contacto_crm(contacto_id: str, email: str = "", telefono: str = "",
+                                 whatsapp: str = "", cargo: str = "", stream_id: str = "") -> dict:
+    """Actualiza un contacto EXISTENTE (para completar/corregir email, teléfono, whatsapp o cargo de
+    la persona). Solo manda los campos que llegan."""
+    if not contacto_id:
+        return {"error": "falta contacto_id"}
+    payload: dict = {}
+    if email:    payload["email1"] = email
+    if telefono: payload["phone_work"] = telefono
+    if whatsapp: payload["phone_mobile"] = whatsapp
+    if cargo:    payload["title"] = cargo
+    if not payload:
+        return {"error": "nada que actualizar"}
+    r = _onecrm_patch(f"data/Contact/{contacto_id}", payload)
+    ok = "error" not in r
+    if ok:
+        _notif(stream_id, "🔄 Contacto actualizado")
+    return {"ok": ok, "id": contacto_id,
+            "url_crm": f"{ONECRM_BASE}/index.php?module=Contacts&action=DetailView&record={contacto_id}",
+            "error": r.get("error", "")}
+
+
+def tool_buscar_productos_crm(query: str, limite: int = 10) -> dict:
+    """Busca productos por modelo o marca en Supabase, luego verifica su existencia real en 1CRM
+    usando el crm_product_id. Así confirma que el producto está tanto en Supabase como en el CRM."""
+    q = query.strip()
+    candidatos = []
+    try:
+        for field in ("modelo", "marca"):
+            resp = supabase.table("rfqs").select(
+                "marca,modelo,estado,crm_url,crm_product_id"
+            ).eq("estado", "publicado").ilike(field, f"%{q}%").limit(limite).execute()
+            for r in (resp.data or []):
+                pid = r.get("crm_product_id")
+                if pid and not any(x["crm_product_id"] == pid for x in candidatos):
+                    candidatos.append(r)
+    except Exception as e:
+        return {"error": str(e), "total": 0, "resultados": []}
+
+    # Verificar en 1CRM por ID y traer detalles completos del producto
+    resultados = []
+    for r in candidatos:
+        pid = r.get("crm_product_id")
+        try:
+            crm_data = _onecrm_get(f"data/Product/{pid}")
+            rec = crm_data.get("record", {})
+            en_crm = bool(rec.get("id"))
+        except Exception:
+            rec = {}
+            en_crm = False
+        resultados.append({
+            "marca":        r.get("marca", ""),
+            "modelo":       r.get("modelo", ""),
+            "en_crm":       en_crm,
+            "crm_url":      r.get("crm_url", "") if en_crm else None,
+            "nombre_crm":   rec.get("name", ""),
+            "descripcion":  (rec.get("description") or "")[:300],
+            "precio":       rec.get("list_price"),
+            "moneda":       rec.get("currency_id", "USD"),
+            "disponible":   rec.get("is_available"),
+            "tiene_imagen": bool(rec.get("image_url")),
+            "imagen_url":   rec.get("image_url") or rec.get("thumbnail_url"),
+        })
+
+    return {"total": len(resultados), "resultados": resultados}
+
+
+def tool_ver_producto_crm(producto_id: str) -> dict:
+    """Obtiene el detalle completo de un producto del catálogo 1CRM por su ID."""
+    if not ONECRM_BASE:
+        return {"error": "1CRM no configurado"}
+    data = _onecrm_get(f"data/Product/{producto_id}")
+    record = data.get("record", data)
+    if "error" in data and not record:
+        return data
+    url_crm = f"{ONECRM_BASE}/index.php?module=ProductCatalog&action=DetailView&record={producto_id}"
+    return {
+        "id":           record.get("id", producto_id),
+        "nombre":       record.get("name", ""),
+        "num_parte":    record.get("manufacturers_part_no", ""),
+        "descripcion":  record.get("description", ""),
+        "precio":       record.get("unit_price"),
+        "moneda":       record.get("currency_id", "USD"),
+        "categoria":    record.get("category", ""),
+        "marca":        record.get("mft_suggested_retail_price", ""),
+        "imagen_url":   record.get("picture", ""),
+        "url_crm":      url_crm,
+        "raw":          {k: v for k, v in record.items() if v and k not in ("id",)},
+    }
+
+
+def tool_listar_productos_crm(categoria: str = "", limite: int = 15) -> dict:
+    """Lista productos del catálogo 1CRM con filtro opcional de categoría."""
+    if not ONECRM_BASE:
+        return {"error": "1CRM no configurado"}
+    params: dict = {
+        "fields": "id,name,manufacturers_part_no,unit_price,currency_id,category,picture",
+        "limit":  min(limite, 50),
+        "order_by": "date_modified desc",
+    }
+    if categoria:
+        params["filter_text"] = categoria
+    data = _onecrm_get("data/Product", params)
+    records = data.get("records", [])
+    return {
+        "total": data.get("total_results", len(records)),
+        "productos": [
+            {
+                "id":        r.get("id"),
+                "nombre":    r.get("name", ""),
+                "num_parte": r.get("manufacturers_part_no", ""),
+                "precio":    r.get("list_price"),
+                "moneda":    r.get("currency_id", "USD"),
+                "categoria": r.get("category", ""),
+                "tiene_imagen": bool(r.get("image_url")),
+                "url_crm": f"{ONECRM_BASE}/index.php?module=ProductCatalog&action=DetailView&record={r.get('id')}",
+            }
+            for r in records
+        ],
+    }
+
+
+def tool_buscar_clientes_crm(query: str = "", limite: int = 10) -> dict:
+    """Busca cuentas/clientes en 1CRM."""
+    if not ONECRM_BASE:
+        return {"error": "1CRM no configurado"}
+    params: dict = {"max_num": min(limite, 100)}
+    if query:
+        params["filter_text"] = query
+    data = _onecrm_get("data/Account", params)
+    records = data.get("records", [])
+    return {
+        "total": data.get("total_count", len(records)),
+        "cuentas": [
+            {
+                "id":        r.get("id"),
+                "nombre":    r.get("name", ""),
+                "tipo":      r.get("account_type", ""),
+                "industria": r.get("industry", ""),
+                "email":     r.get("email1", "") or r.get("email2", ""),
+                "telefono":  r.get("phone_office", "") or r.get("phone_alternate", ""),
+                "tel_alt":   r.get("phone_alternate", "") if r.get("phone_office") else "",
+                "web":       r.get("website", ""),
+                "ciudad":    r.get("billing_address_city", ""),
+                "pais":      r.get("billing_address_country", ""),
+                "url_crm":   f"{ONECRM_BASE}/index.php?module=Accounts&action=DetailView&record={r.get('id')}",
+            }
+            for r in records
+        ],
+    }
+
+
+def tool_ver_cliente_crm(cliente_id: str) -> dict:
+    """Obtiene el detalle completo de una cuenta/cliente en 1CRM."""
+    if not ONECRM_BASE:
+        return {"error": "1CRM no configurado"}
+    data = _onecrm_get(f"data/Account/{cliente_id}")
+    record = data.get("record", data)
+    return {
+        "id":        record.get("id", cliente_id),
+        "nombre":    record.get("name", ""),
+        "tipo":      record.get("account_type", ""),
+        "industria": record.get("industry", ""),
+        "email":     record.get("email1", "") or record.get("email2", ""),
+        "email2":    record.get("email2", "") if record.get("email1") else "",
+        "telefono":  record.get("phone_office", "") or record.get("phone_alternate", ""),
+        "tel_alt":   record.get("phone_alternate", ""),
+        "web":       record.get("website", ""),
+        "direccion": {
+            "calle":   record.get("billing_address_street", ""),
+            "ciudad":  record.get("billing_address_city", ""),
+            "estado":  record.get("billing_address_state", ""),
+            "pais":    record.get("billing_address_country", ""),
+        },
+        "descripcion": record.get("description", ""),
+        "url_crm":  f"{ONECRM_BASE}/index.php?module=Accounts&action=DetailView&record={cliente_id}",
+    }
+
+
+def tool_listar_cotizaciones_crm(estado: str = "", cliente_id: str = "", limite: int = 10) -> dict:
+    """Lista cotizaciones/quotes de 1CRM con filtros opcionales."""
+    if not ONECRM_BASE:
+        return {"error": "1CRM no configurado"}
+    params: dict = {
+        "fields": "id,name,quote_stage,grand_total,currency_id,date_quote_expected_closed,billing_account_name",
+        "limit":  min(limite, 30),
+        "order_by": "date_modified desc",
+    }
+    if estado:
+        params["filters[quote_stage]"] = estado
+    if cliente_id:
+        params["filters[billing_account_id]"] = cliente_id
+    data = _onecrm_get("data/Quotes", params)
+    records = data.get("records", [])
+    return {
+        "total": data.get("total_count", len(records)),
+        "cotizaciones": [
+            {
+                "id":       r.get("id"),
+                "nombre":   r.get("name", ""),
+                "estado":   r.get("quote_stage", ""),
+                "total":    r.get("grand_total"),
+                "moneda":   r.get("currency_id", "USD"),
+                "cliente":  r.get("billing_account_name", ""),
+                "cierre":   r.get("date_quote_expected_closed", ""),
+                "url_crm":  f"{ONECRM_BASE}/index.php?module=Quotes&action=DetailView&record={r.get('id')}",
+            }
+            for r in records
+        ],
+    }
+
+
+def tool_listar_oportunidades_crm(estado: str = "", cuenta_id: str = "", limite: int = 10) -> dict:
+    """Lista oportunidades/deals en 1CRM. estado puede ser: Prospecting, Qualification,
+    Proposal/Price Quote, Negotiation, Closed Won, Closed Lost."""
+    if not ONECRM_BASE:
+        return {"error": "1CRM no configurado"}
+    params: dict = {"max_num": min(limite, 50), "order_by": "date_modified desc"}
+    if estado:
+        params["search_params[sales_stage][0]"] = estado
+    if cuenta_id:
+        params["search_params[account_id][0]"] = cuenta_id
+    data = _onecrm_get("data/Opportunity", params)
+    records = data.get("records", [])
+    return {
+        "total": len(records),
+        "oportunidades": [
+            {
+                "id":        r.get("id"),
+                "nombre":    r.get("name", ""),
+                "etapa":     r.get("sales_stage", ""),
+                "monto":     r.get("amount", ""),
+                "moneda":    r.get("currency_id", ""),
+                "cierre":    r.get("date_closed", ""),
+                "cuenta":    r.get("account_name", ""),
+                "probabilidad": r.get("probability", ""),
+                "url_crm":   f"{ONECRM_BASE}/index.php?module=Opportunities&action=DetailView&record={r.get('id')}",
+            }
+            for r in records
+        ],
+    }
+
+
+def tool_crear_oportunidad_crm(
+    nombre: str,
+    cuenta_id: str,
+    monto: float = 0,
+    fecha_cierre: str = "",
+    etapa: str = "Prospecting",
+    descripcion: str = "",
+    stream_id: str = "",
+    permitir_parcial: bool = False,
+) -> dict:
+    """Crea una nueva oportunidad en 1CRM.
+    etapa: Prospecting | Qualification | Proposal/Price Quote | Negotiation | Closed Won | Closed Lost
+    fecha_cierre: formato YYYY-MM-DD
+    permitir_parcial: SOLO para el canal RFQ manual, y SOLO tras aprobación EXPLÍCITA del usuario de
+      "crear con lo que hay". Relaja el candado de RFQ+cantidad (la cuenta SIEMPRE es obligatoria —
+      1CRM la exige). En el flujo de correo NO se usa (queda la regla estricta).
+    """
+    if not ONECRM_BASE:
+        return {"error": "1CRM no configurado"}
+    # CANDADO DE INFO OBLIGATORIA: no se crea la oportunidad sin cuenta ni sin RFQ+cantidad.
+    # La cantidad debe venir en la descripción (formato "RFQ: <parts> | Qty: <n>"). Si falta,
+    # se rechaza para forzar al agente a pedir la información faltante antes de crear.
+    import re as _re
+    faltantes = []
+    if not cuenta_id or not str(cuenta_id).strip():
+        faltantes.append("cuenta")
+    # Cantidad real: un token de cantidad (qty/cant/unidad/pieza/pz/pcs) seguido de número.
+    # No basta con "hay un dígito" porque los part-numbers (ej. Q0120) ya traen dígitos.
+    _tiene_qty = bool(descripcion) and _re.search(
+        r'(?:(?:qty|cant)\w*\W*\d|\d\s*(?:unidad|pieza|\bpz|pcs|units?))',
+        descripcion, _re.I)
+    if not _tiene_qty and not permitir_parcial:
+        faltantes.append("RFQ + cantidad (Qty)")
+    # La cuenta es obligatoria SIEMPRE (1CRM exige account_id) — ni el override parcial la salta.
+    if faltantes:
+        return {
+            "error":     "INFO_INCOMPLETA",
+            "faltantes": faltantes,
+            "mensaje":   "No se puede crear la oportunidad: falta información obligatoria. "
+                         "Pide al cliente los datos faltantes (con [DECISION] para enviar el correo) "
+                         "en lugar de crear la oportunidad.",
+        }
+    import datetime
+    if not fecha_cierre:
+        fecha_cierre = (datetime.date.today() + datetime.timedelta(days=30)).isoformat()
+    payload = {
+        "name":        nombre,
+        "account_id":  cuenta_id,
+        "amount":      monto,
+        "date_closed": fecha_cierre,
+        "sales_stage": etapa,
+        "description": descripcion,
+    }
+    resp = _onecrm_post("data/Opportunity", payload)
+    opp_id = resp.get("id", "")
+    if opp_id:
+        _notif(stream_id, f"✅ Oportunidad creada — {nombre}", descripcion[:120])
+    return {
+        "ok":      bool(opp_id),
+        "id":      opp_id,
+        "nombre":  nombre,
+        "url_crm": f"{ONECRM_BASE}/index.php?module=Opportunities&action=DetailView&record={opp_id}" if opp_id else "",
+    }
+
+
+def _norm_nombre(s: str) -> str:
+    return "".join(c for c in (s or "").lower() if c.isalnum())
+
+
+def _buscar_cuenta_existente(nombre: str, email: str = "") -> dict | None:
+    """Busca una cuenta ya existente en 1CRM por CORREO (identificador confiable) o por NOMBRE de
+    empresa. Devuelve {id, nombre, url_crm, por} o None. Evita crear clientes duplicados."""
+    if not ONECRM_BASE:
+        return None
+    def _url(rid): return f"{ONECRM_BASE}/index.php?module=Accounts&action=DetailView&record={rid}"
+    try:
+        # 1) por email exacto (email1 o email2)
+        if email:
+            data = _onecrm_get("data/Account", {"filter_text": email, "max_num": 20})
+            for r in (data.get("records", []) or []):
+                if email.lower() in ((r.get("email1", "") or "").lower(), (r.get("email2", "") or "").lower()):
+                    return {"id": r.get("id"), "nombre": r.get("name", ""), "url_crm": _url(r.get("id")), "por": "correo"}
+        # 2) por nombre de empresa (normalizado; uno contenido en el otro, evita variaciones SA/SA de CV)
+        if nombre:
+            n = _norm_nombre(nombre)
+            if len(n) >= 6:
+                data = _onecrm_get("data/Account", {"filter_text": nombre, "max_num": 20})
+                for r in (data.get("records", []) or []):
+                    cn = _norm_nombre(r.get("name", ""))
+                    if cn and (cn == n or (len(min(cn, n, key=len)) >= 8 and (n in cn or cn in n))):
+                        return {"id": r.get("id"), "nombre": r.get("name", ""), "url_crm": _url(r.get("id")), "por": "nombre"}
+    except Exception as e:
+        log.warning(f"_buscar_cuenta_existente falló: {e}")
+    return None
+
+
+def tool_crear_cuenta_crm(
+    nombre: str,
+    tipo: str = "Customer",
+    email: str = "",
+    telefono: str = "",
+    tel_alternativo: str = "",
+    web: str = "",
+    ciudad: str = "",
+    estado: str = "",
+    pais: str = "Mexico",
+    descripcion: str = "",
+    envio_calle: str = "",
+    envio_ciudad: str = "",
+    envio_estado: str = "",
+    envio_cp: str = "",
+    envio_pais: str = "",
+    fact_calle: str = "",
+    fact_cp: str = "",
+    razon_social: str = "",
+    rfc: str = "",
+    regimen_fiscal: str = "",
+    condiciones_pago: str = "",
+    industria: str = "",
+    stream_id: str = "",
+) -> dict:
+    """Crea una nueva cuenta/empresa en 1CRM.
+    tipo: Customer | Supplier | Partner | Competitor | Press | Analyst | Other
+    Los campos envio_* llenan la dirección de envío (shipping) y fact_* la de facturación.
+    Datos fiscales para alta formal de cliente: razon_social, rfc, regimen_fiscal
+    (ej. 'Persona Moral - General', 'Persona Física - General'), condiciones_pago
+    (ej. 'advance_100%', 'Net_15', 'Net_30').
+    """
+    if not ONECRM_BASE:
+        return {"error": "1CRM no configurado"}
+    # DEDUPE: si la cuenta ya existe (por correo o nombre), NO crear duplicado — devolver la existente.
+    _ex = _buscar_cuenta_existente(nombre, email)
+    if _ex:
+        return {
+            "ok": True, "ya_existe": True, "id": _ex["id"], "nombre": _ex["nombre"],
+            "url_crm": _ex["url_crm"],
+            "mensaje": f"La cuenta '{_ex['nombre']}' YA EXISTE en 1CRM (coincidencia por {_ex['por']}). "
+                       f"No la dupliqué. Usa este cuenta_id para el contacto/oportunidad.",
+        }
+    payload: dict = {"name": nombre, "account_type": tipo or "Customer",
+                     # Defaults fijos (pedido de Gabriel): toda cuenta nueva nace en MXN y con el
+                     # tax code de IVA ("Impuesto al Valor Agregado").
+                     "currency_id": "16242fc8-aefa-63c3-1814-6489f1575687",   # Mexican Peso
+                     "tax_code_id": "b75e5df7-3a3e-4ed2-ff37-651e0a3c0e9b"}   # Impuesto al Valor Agregado
+    if email:         payload["email1"] = email
+    if telefono:      payload["phone_office"] = telefono
+    if tel_alternativo: payload["phone_alternate"] = tel_alternativo
+    if web:           payload["website"] = web
+    if fact_calle:    payload["billing_address_street"] = fact_calle
+    if ciudad:        payload["billing_address_city"] = ciudad
+    if estado:        payload["billing_address_state"] = estado
+    if fact_cp:       payload["billing_address_postalcode"] = fact_cp
+    if pais:          payload["billing_address_country"] = pais
+    if descripcion:   payload["description"] = descripcion
+    # Dirección de envío (shipping) — donde vive la "dirección de envío" del RFQ
+    if envio_calle:   payload["shipping_address_street"] = envio_calle
+    if envio_ciudad:  payload["shipping_address_city"] = envio_ciudad
+    if envio_estado:  payload["shipping_address_state"] = envio_estado
+    if envio_cp:      payload["shipping_address_postalcode"] = envio_cp
+    if envio_pais:    payload["shipping_address_country"] = envio_pais
+    # Datos fiscales (alta formal de cliente)
+    if razon_social:     payload["razon_social"] = razon_social
+    if rfc:              payload["rfc"] = rfc
+    if regimen_fiscal:   payload["fiscal_regime"] = regimen_fiscal
+    if condiciones_pago: payload["payment_terms"] = condiciones_pago
+    if industria:        payload["industry"] = industria
+    resp = _onecrm_post("data/Account", payload)
+    acct_id = resp.get("id", "")
+    if acct_id:
+        _notif(stream_id, f"✅ Alta de cuenta — {nombre}")
+    return {
+        "ok":      bool(acct_id),
+        "id":      acct_id,
+        "nombre":  nombre,
+        "url_crm": f"{ONECRM_BASE}/index.php?module=Accounts&action=DetailView&record={acct_id}" if acct_id else "",
+        "error":   resp.get("error", ""),
+    }
+
+
+def tool_crear_contacto_crm(
+    nombre: str,
+    apellido: str = "",
+    cuenta_id: str = "",
+    email: str = "",
+    whatsapp: str = "",
+    telefono: str = "",
+    cargo: str = "",
+    descripcion: str = "",
+    stream_id: str = "",
+) -> dict:
+    """Crea un contacto (persona) en 1CRM, opcionalmente ligado a una cuenta/empresa.
+    whatsapp se guarda en phone_mobile (1CRM no tiene campo de WhatsApp dedicado).
+    cuenta_id liga el contacto a su empresa mediante primary_account_id.
+    """
+    if not ONECRM_BASE:
+        return {"error": "1CRM no configurado"}
+    # DEDUPE: si ya existe un contacto con ese correo, no duplicar — devolver el existente.
+    if email:
+        try:
+            data = _onecrm_get("data/Contact", {"filter_text": email, "max_num": 20})
+            for r in (data.get("records", []) or []):
+                if email.lower() in ((r.get("email1", "") or "").lower(), (r.get("email2", "") or "").lower()):
+                    rid = r.get("id")
+                    return {
+                        "ok": True, "ya_existe": True, "id": rid,
+                        "nombre": f"{r.get('first_name','')} {r.get('last_name','')}".strip(),
+                        "cuenta_id": r.get("primary_account_id", "") or cuenta_id,
+                        "url_crm": f"{ONECRM_BASE}/index.php?module=Contacts&action=DetailView&record={rid}",
+                        "mensaje": "El contacto con ese correo YA EXISTE — no lo dupliqué.",
+                    }
+        except Exception as e:
+            log.warning(f"dedupe contacto falló: {e}")
+    # DEDUPE 2 — por NOMBRE + CUENTA: si ya hay un contacto con el mismo nombre en la MISMA cuenta,
+    # es la misma persona. Cubre el caso real que duplicaba: un contacto creado SIN email (donde la
+    # dedup por correo no aplica) o cuando el search por correo no lo alcanzó. El list de 1CRM viene
+    # "delgado" (primary_account_id no confiable) → se confirma con GET-por-id.
+    if cuenta_id and (nombre or apellido):
+        try:
+            full = f"{nombre} {apellido}".strip()
+            n = _norm_nombre(full)
+            if len(n) >= 4:
+                data = _onecrm_get("data/Contact", {"filter_text": full or nombre, "max_num": 20})
+                for r in (data.get("records", []) or []):
+                    rid = r.get("id")
+                    if not rid:
+                        continue
+                    d = _onecrm_get(f"data/Contact/{rid}").get("record", {})
+                    if d.get("primary_account_id") != cuenta_id:
+                        continue
+                    cn = _norm_nombre(f"{d.get('first_name','')} {d.get('last_name','')}")
+                    if cn and (cn == n or (len(min(cn, n, key=len)) >= 5 and (n in cn or cn in n))):
+                        return {
+                            "ok": True, "ya_existe": True, "id": rid,
+                            "nombre": f"{d.get('first_name','')} {d.get('last_name','')}".strip(),
+                            "cuenta_id": cuenta_id,
+                            "url_crm": f"{ONECRM_BASE}/index.php?module=Contacts&action=DetailView&record={rid}",
+                            "mensaje": "El contacto (mismo nombre en esta cuenta) YA EXISTE — no lo dupliqué. Usa este id.",
+                        }
+        except Exception as e:
+            log.warning(f"dedupe contacto por nombre+cuenta falló: {e}")
+    payload: dict = {"first_name": nombre, "last_name": apellido or nombre}
+    if cuenta_id:    payload["primary_account_id"] = cuenta_id
+    if email:        payload["email1"] = email
+    if whatsapp:     payload["phone_mobile"] = whatsapp
+    if telefono:     payload["phone_work"] = telefono
+    if cargo:        payload["title"] = cargo
+    if descripcion:  payload["description"] = descripcion
+    resp = _onecrm_post("data/Contact", payload)
+    contacto_id = resp.get("id", "")
+    if contacto_id:
+        _notif(stream_id, f"✅ Contacto creado — {f'{nombre} {apellido}'.strip()}")
+    return {
+        "ok":         bool(contacto_id),
+        "id":         contacto_id,
+        "nombre":     f"{nombre} {apellido}".strip(),
+        "cuenta_id":  cuenta_id,
+        "url_crm":    f"{ONECRM_BASE}/index.php?module=Contacts&action=DetailView&record={contacto_id}" if contacto_id else "",
+        "error":      resp.get("error", ""),
+    }
+
+
+def tool_buscar_proveedores_crm(nombre: str = "", categoria: str = "") -> dict:
+    if not ONECRM_BASE:
+        return {"error": "1CRM no configurado"}
+    params: dict = {"max_num": 30}
+    if nombre:
+        params["filter_text"] = nombre
+    data = _onecrm_get("data/Account", params)
+    records = data.get("records", [])
+    return {
+        "total": data.get("total_count", len(records)),
+        "resultados": [
+            {
+                "nombre":   r.get("name", ""),
+                "telefono": r.get("phone_office", ""),
+                "web":      r.get("website", ""),
+                "pais":     r.get("billing_address_country", ""),
+            }
+            for r in records
+        ],
+    }
+
+
+_CONTACT_FIELDS = [
+    ("fields[]", "id"), ("fields[]", "first_name"), ("fields[]", "last_name"),
+    ("fields[]", "email1"), ("fields[]", "email2"), ("fields[]", "phone_work"),
+    ("fields[]", "phone_mobile"), ("fields[]", "title"),
+    ("fields[]", "primary_account_id"), ("fields[]", "primary_address_city"),
+]
+
+
+def _mapear_contacto(r: dict) -> dict:
+    return {
+        "id":        r["id"],
+        "nombre":    f"{r.get('first_name', '')} {r.get('last_name', '')}".strip() or r.get("name", ""),
+        "email":     r.get("email1", "") or r.get("email2", ""),
+        "telefono":  r.get("phone_work", "") or r.get("phone_mobile", ""),
+        "cargo":     r.get("title", ""),
+        "ciudad":    r.get("primary_address_city", ""),
+        "cuenta_id": r.get("primary_account_id", ""),
+        "url_crm":   f"{ONECRM_BASE}/index.php?module=Contacts&action=DetailView&record={r['id']}",
+    }
+
+
+def _get_all_contacts_with_detail() -> list:
+    """Obtiene contactos SIN filtro de cuenta. OJO: el endpoint de lista de 1CRM ignora
+    max_num y devuelve solo ~20 registros (de posiblemente cientos) sin avisar — NO usar esto
+    para buscar un contacto específico por cuenta, usa _contactos_por_cuenta (sí filtra server-side,
+    confirmado en vivo con filters[primary_account_id])."""
+    records = _onecrm_get("data/Contact", dict([("max_num", 200), *_CONTACT_FIELDS])).get("records", [])
+    return [_mapear_contacto(r) for r in records]
+
+
+def _contactos_por_cuenta(cuenta_id: str) -> list:
+    """Contactos de UNA cuenta específica — filtra server-side (confirmado en vivo que
+    filters[primary_account_id] sí funciona en Contact, a diferencia de otros módulos/campos).
+    Evita el bug de _get_all_contacts_with_detail: con cientos de contactos en el CRM, uno de una
+    cuenta vieja podía no estar entre los primeros ~20 que el endpoint de lista alcanza a devolver.
+    OJO 2: filters[] SÍ filtra bien (trae los contactos correctos) pero rompe la proyección de
+    fields[] — email1/email2/primary_account_id vuelven vacíos en la lista filtrada aunque el
+    contacto sí tenga correo (confirmado en vivo). Por eso cada contacto se refuerza con GET por id
+    — el número de contactos por cuenta es chico, no cientos, así que no es costoso."""
+    ids = [r["id"] for r in _onecrm_get("data/Contact", {
+        "filters[primary_account_id]": cuenta_id, "max_num": 100,
+    }).get("records", []) if r.get("id")]
+    contactos = []
+    for cid in ids:
+        d = _onecrm_get(f"data/Contact/{cid}").get("record", {})
+        if d:
+            contactos.append(_mapear_contacto(d))
+    return contactos
+
+
+def _sin_acentos(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKD", s or "") if not unicodedata.combining(c))
+
+
+def tool_buscar_contactos_crm(nombre: str = "", cuenta_id: str = "") -> dict:
+    """Busca contactos en 1CRM por nombre o por cuenta."""
+    if not ONECRM_BASE:
+        return {"error": "1CRM no configurado"}
+    if cuenta_id:
+        # filter_text no combina con filters[cuenta] de forma confiable — se filtra por cuenta
+        # server-side y, si además hay nombre, se acota client-side (set chico, no cientos).
+        # Insensible a acentos: el nombre del CRM puede traer acento y lo que escribe el
+        # usuario no siempre (p.ej. "Vazquez" no matcheaba "Vázquez").
+        todos = _contactos_por_cuenta(cuenta_id)
+        if nombre:
+            q = _sin_acentos(nombre).lower()
+            todos = [c for c in todos
+                     if q in _sin_acentos(c["nombre"]).lower() or q in c["email"].lower()]
+    elif nombre:
+        # filter_text SÍ busca bien por nombre en el servidor (confirmado en vivo) — no hace
+        # falta (ni conviene) re-filtrar client-side encima, sería el mismo bug de acentos.
+        # Igual que _contactos_por_cuenta: el resultado de filter_text también viene sin
+        # email1/email2 poblados, hay que reforzar con GET por id (búsqueda por nombre da
+        # pocos resultados, es barato).
+        records = _onecrm_get("data/Contact", {"filter_text": nombre, "max_num": 50}).get("records", [])
+        todos = []
+        for r in records:
+            rid = r.get("id")
+            d = _onecrm_get(f"data/Contact/{rid}").get("record", {}) if rid else {}
+            todos.append(_mapear_contacto(d or r))
+    else:
+        todos = _get_all_contacts_with_detail()
+    return {"total": len(todos), "contactos": todos}
+
+
+def tool_ver_contactos_cuenta_crm(cuenta_id: str) -> dict:
+    """Devuelve todos los contactos de una cuenta/cliente específica en 1CRM."""
+    if not ONECRM_BASE:
+        return {"error": "1CRM no configurado"}
+    cuenta = _onecrm_get(f"data/Account/{cuenta_id}").get("record", {})
+    nombre_cuenta = cuenta.get("name", cuenta_id)
+    contactos = _contactos_por_cuenta(cuenta_id)
+    # Incluir email/teléfono del Account si no hay Contact records separados
+    info_cuenta: dict = {}
+    acct_email = cuenta.get("email1", "") or cuenta.get("email2", "")
+    acct_tel   = cuenta.get("phone_office", "") or cuenta.get("phone_alternate", "")
+    acct_tel2  = cuenta.get("phone_alternate", "") if cuenta.get("phone_office") else ""
+    if acct_email or acct_tel:
+        info_cuenta = {
+            "email":    acct_email,
+            "telefono": acct_tel,
+            "tel_alt":  acct_tel2,
+            "web":      cuenta.get("website", ""),
+            "nota":     "Datos de contacto registrados en la cuenta (sin contacto individual separado)" if not contactos else "",
+        }
+    return {
+        "cuenta":      nombre_cuenta,
+        "cuenta_id":   cuenta_id,
+        "info_cuenta": info_cuenta,
+        "total":       len(contactos),
+        "contactos":   contactos,
+    }
+
+
+def tool_consultar_rfqs(estado: str = "", limite: int = 10) -> dict:
+    try:
+        q = supabase.table("rfqs").select(
+            "id, rfq_id, marca, modelo, estado, urgente, created_at"
+        ).order("created_at", desc=True).limit(min(limite, 30))
+        if estado:
+            q = q.eq("estado", estado)
+        resp = q.execute()
+        return {"total": len(resp.data), "rfqs": resp.data or []}
+    except Exception as e:
+        return {"error": str(e), "rfqs": []}
+
+
+def tool_consultar_metricas() -> dict:
+    try:
+        resp = supabase.table("resource_status").select(
+            "servicio,metrica,valor,valor_texto,unidad,limite,estado"
+        ).execute()
+        resultado: dict[str, Any] = {}
+        for row in (resp.data or []):
+            srv = row["servicio"]
+            if srv not in resultado:
+                resultado[srv] = {}
+            resultado[srv][row["metrica"]] = {
+                "valor":  row.get("valor_texto") or row.get("valor"),
+                "unidad": row.get("unidad"),
+                "limite": row.get("limite"),
+                "estado": row.get("estado"),
+            }
+        return resultado
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def tool_buscar_internet(query: str) -> dict:
+    serpapi_key = os.environ.get("SERPAPI_KEY", "").strip()
+    google_key  = os.environ.get("GOOGLE_API_KEY", "").strip()
+    google_cx   = os.environ.get("GOOGLE_CX", "").strip()
+
+    if serpapi_key:
+        try:
+            resp = httpx.get(
+                "https://serpapi.com/search",
+                params={"q": query, "api_key": serpapi_key, "num": 5},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            items = resp.json().get("organic_results", [])[:5]
+            return {
+                "fuente": "serpapi",
+                "resultados": [
+                    {"titulo": r.get("title"), "url": r.get("link"),
+                     "snippet": (r.get("snippet") or "")[:200]}
+                    for r in items
+                ],
+            }
+        except Exception as e:
+            log.warning(f"SerpAPI falló: {e}")
+
+    if google_key and google_cx:
+        try:
+            resp = httpx.get(
+                "https://www.googleapis.com/customsearch/v1",
+                params={"key": google_key, "cx": google_cx, "q": query, "num": 5},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            items = resp.json().get("items", [])[:5]
+            return {
+                "fuente": "google_cse",
+                "resultados": [
+                    {"titulo": r.get("title"), "url": r.get("link"),
+                     "snippet": (r.get("snippet") or "")[:200]}
+                    for r in items
+                ],
+            }
+        except Exception as e:
+            log.warning(f"Google CSE falló: {e}")
+
+    return {"error": "Sin APIs de búsqueda disponibles"}
+
+
+def tool_obtener_opciones_rfq(rfq_id: str) -> dict:
+    """Lee las opciones de proveedor de la tabla opciones para un RFQ dado."""
+    try:
+        resp = supabase.table("opciones").select(
+            "id,rank,proveedor,precio_orig,moneda,disponibilidad,score_ranking,fuente"
+        ).eq("rfq_id", rfq_id).order("rank").execute()
+        rfq = supabase.table("rfqs").select("marca,modelo,estado").eq("id", rfq_id).single().execute().data
+        return {
+            "rfq_id": rfq_id,
+            "marca":  rfq.get("marca", ""),
+            "modelo": rfq.get("modelo", ""),
+            "estado": rfq.get("estado", ""),
+            "opciones": resp.data or [],
+        }
+    except Exception as e:
+        return {"error": str(e), "opciones": []}
+
+
+def tool_seleccionar_proveedor(rfq_id: str, opcion_id: str) -> dict:
+    """Guarda el proveedor seleccionado y crea job de imagen para el RFQ."""
+    try:
+        opcion = supabase.table("opciones").select("*").eq("id", opcion_id).single().execute().data
+        supabase.table("rfqs").update({
+            "estado":     "procesando_imagen",
+            "proveedor":  opcion.get("proveedor", ""),
+        }).eq("id", rfq_id).execute()
+        job = supabase.table("jobs").insert({
+            "rfq_id":     rfq_id,
+            "agente":     "imagen",
+            "estado":     "pendiente",
+            "created_at": datetime.utcnow().isoformat(),
+        }).execute()
+        job_id = (job.data or [{}])[0].get("id", "?")
+        log.info(f"Job imagen creado (HITL): {job_id} para rfq {rfq_id}")
+        return {"ok": True, "job_imagen": job_id, "proveedor": opcion.get("proveedor")}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def tool_obtener_foto_rfq(rfq_id: str) -> dict:
+    """Obtiene la URL de la foto del RFQ (para mostrar preview al usuario)."""
+    try:
+        rfq = supabase.table("rfqs").select("foto_url,estado,marca,modelo").eq("id", rfq_id).single().execute().data
+        return {
+            "rfq_id":   rfq_id,
+            "foto_url": rfq.get("foto_url"),
+            "estado":   rfq.get("estado"),
+            "marca":    rfq.get("marca"),
+            "modelo":   rfq.get("modelo"),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def tool_publicar_rfq(rfq_id: str) -> dict:
+    """Aprueba la publicación del RFQ: crea job de publicador en 1CRM."""
+    try:
+        supabase.table("rfqs").update({"estado": "publicando"}).eq("id", rfq_id).execute()
+        job = supabase.table("jobs").insert({
+            "rfq_id":     rfq_id,
+            "agente":     "publicador",
+            "estado":     "pendiente",
+            "created_at": datetime.utcnow().isoformat(),
+        }).execute()
+        job_id = (job.data or [{}])[0].get("id", "?")
+        log.info(f"Job publicador creado (HITL aprobado): {job_id} para rfq {rfq_id}")
+        return {"ok": True, "job_publicador": job_id}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def tool_publicar_sin_imagen_rfq(rfq_id: str) -> dict:
+    """Publica el RFQ sin imagen cuando el usuario lo aprueba así."""
+    try:
+        supabase.table("rfqs").update({
+            "estado":   "publicando",
+            "foto_url": None,
+        }).eq("id", rfq_id).execute()
+        job = supabase.table("jobs").insert({
+            "rfq_id":     rfq_id,
+            "agente":     "publicador",
+            "estado":     "pendiente",
+            "created_at": datetime.utcnow().isoformat(),
+        }).execute()
+        job_id = (job.data or [{}])[0].get("id", "?")
+        return {"ok": True, "job_publicador": job_id}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+_CARAC_NO_TECNICA = re.compile(
+    r'\b(stock|disponibilidad|availability|available|inventory|inventario|backorder|'
+    r'lead\s*time|eta|env[íi]o|shipping|delivery|ship\s*date|fecha\s*de\s*env[íi]o|'
+    r'tiempo\s*de\s*entrega|cantidad\s*disponible|quantity\s*available|units?\s*in\s*stock|'
+    r'condici[oó]n|condition|item\s*condition|local\s*pickup|pickup|'
+    r'item\s*location|ubicaci[oó]n(\s*del\s*(art[íi]culo|item|vendedor))?|seller\s*notes|'
+    r'notas?\s*del\s*vendedor|listing\s*type|tipo\s*de\s*(anuncio|publicaci[oó]n)|'
+    r'returns?\s*accepted|devoluci[oó]n(es)?\s*aceptad[oa]s?|return\s*policy|'
+    r'garant[íi]a|warranty|'
+    r'(item\s*|product\s*|part\s*|listing\s*|stock\s*)?estatus|'
+    r'(item\s*|product\s*|part\s*|listing\s*|stock\s*)status)\b',
+    re.IGNORECASE,
+)
+
+
+def _filtrar_caracteristicas_no_tecnicas(caracteristicas: list | None) -> list:
+    """Quita de la ficha técnica cualquier dato que NO sea especificación del producto en sí sino
+    inventario/logística del proveedor en el momento de la extracción (stock disponible, fecha de
+    envío estimada, lead time, etc.) o metadata propia del ANUNCIO/marketplace (condición del
+    artículo nuevo/usado, local pickup, ubicación del vendedor, política de devoluciones) — nada
+    de eso es una especificación técnica del producto y no debe quedar grabado en el catálogo de
+    1CRM ni mostrarse como si lo fuera."""
+    out = []
+    for c in (caracteristicas or []):
+        etiqueta = str(c).split(":", 1)[0]
+        if _CARAC_NO_TECNICA.search(etiqueta):
+            continue
+        out.append(c)
+    return out
+
+
+def _extraer_producto_ebay_serpapi(url: str, item_id: str, dominio: str = "ebay.com", diag: list | None = None) -> dict | None:
+    """Lee un producto de eBay vía SerpAPI (engine=ebay_product) — eBay bloquea con HTTP 403/423
+    cualquier fetch directo desde servidor (confirmado en vivo, incluso vía el scraper genérico),
+    SerpAPI lo resuelve del lado de ellos. Devuelve None si no hay SERPAPI_KEY o si no encuentra
+    el producto (cae al intento genérico de abajo, no rompe el flujo). El parámetro correcto es
+    `product_id` (NO `ebay_item_id` — verificado con el error explícito de SerpAPI en vivo).
+    `diag` (opcional) acumula el motivo exacto — se usa para loguear a stream_logs y poder
+    diagnosticar sin depender de los logs de Railway."""
+    def _d(msg: str):
+        log.warning(f"SerpAPI ebay_product [{item_id}]: {msg}")
+        if diag is not None:
+            diag.append(msg)
+
+    api_key = os.environ.get("SERPAPI_KEY", "").strip()
+    if not api_key:
+        _d("sin SERPAPI_KEY configurada")
+        return None
+    try:
+        r = httpx.get("https://serpapi.com/search.json", params={
+            "engine": "ebay_product", "product_id": item_id, "ebay_domain": dominio, "api_key": api_key,
+        }, timeout=25)
+        if r.status_code != 200:
+            _d(f"HTTP {r.status_code} — {r.text[:200]}")
+            return None
+        data = r.json()
+    except Exception as e:
+        _d(f"excepción: {e}")
+        return None
+
+    if data.get("error"):
+        _d(f"SerpAPI devolvió error: {data['error']}")
+        return None
+
+    # La clave real es "product_results" (plural) — confirmado en vivo con el log de diagnóstico
+    # (la primera versión probaba "product_result" y siempre caía a "sin datos"). Puede venir como
+    # objeto directo o como lista de un elemento según el caso, así que se maneja ambas formas.
+    prod_raw = data.get("product_results")
+    prod = (prod_raw[0] if isinstance(prod_raw, list) and prod_raw else prod_raw) or {}
+    if not prod or not prod.get("title"):
+        _d(f"sin product_results/title — claves de data: {list(data.keys())} | claves de product_results: {list(prod.keys()) if isinstance(prod, dict) else type(prod)}")
+        return None
+    # Esquema real de esta API (NO el de "eBay Shopping"/item_specifics que se asumió al
+    # principio): title, short_description, buy{...}, media{...}, specifications{...}. Se
+    # extrae de forma defensiva porque no hay forma de probarlo sin una key propia — si algo
+    # sale vacío otra vez, el log de abajo muestra la forma real de cada bloque para corregir
+    # sin otra ronda a ciegas.
+    buy = prod.get("buy") or {}
+    media = prod.get("media") or {}
+    specs_raw = prod.get("specifications")
+    _d(f"buy={json.dumps(buy, ensure_ascii=False)[:300]} | media={json.dumps(media, ensure_ascii=False)[:200]} | specifications={json.dumps(specs_raw, ensure_ascii=False)[:400]}")
+
+    # precio: confirmado en vivo (log de diagnóstico) que vive un nivel más adentro de lo que se
+    # asumió — buy.<opcion_de_compra>.price.amount, donde <opcion_de_compra> es la que aplique al
+    # anuncio (buy_it_now / auction / best_offer). Se prueban las tres, en ese orden de prioridad.
+    precio_costo = ""
+    moneda_ebay = ""
+    if isinstance(buy, dict):
+        for opcion in ("buy_it_now", "auction", "best_offer"):
+            bloque = buy.get(opcion)
+            if isinstance(bloque, dict):
+                precio_obj = bloque.get("price")
+                if isinstance(precio_obj, dict) and precio_obj.get("amount") is not None:
+                    precio_costo = precio_obj["amount"]
+                    moneda_ebay = precio_obj.get("currency") or ""
+                    break
+    if not precio_costo:
+        # Respaldo por si alguna vez viene plano (formas ya vistas en otras engines de SerpAPI)
+        precio_obj = buy.get("price") if isinstance(buy, dict) else None
+        if isinstance(precio_obj, dict):
+            precio_costo = precio_obj.get("extracted_price") or precio_obj.get("raw") or precio_obj.get("value") or ""
+        elif precio_obj is not None:
+            precio_costo = precio_obj
+
+    # imágenes: puede ser {"images": [...]} o una lista directa de urls/objetos
+    imgs_raw = media.get("images") if isinstance(media, dict) else media
+    imagenes = []
+    for im in (imgs_raw or []):
+        if isinstance(im, str):
+            imagenes.append(im)
+        elif isinstance(im, dict):
+            imagenes.append(im.get("link") or im.get("url") or im.get("image") or "")
+    imagenes = [i for i in imagenes if i]
+
+    # specifications: puede ser lista de {name,value}, o dict {categoria: {campo: valor}}
+    caracteristicas: list[str] = []
+    marca = ""
+    part_number = ""
+    def _match_spec(nombre_campo: str, valor: str):
+        nonlocal marca, part_number
+        n = (nombre_campo or "").strip().lower()
+        if n in ("brand", "marca", "manufacturer"):
+            marca = marca or valor
+        if n in ("mpn", "part number", "manufacturer part number", "número de pieza fabricante"):
+            part_number = part_number or valor
+        if nombre_campo and valor:
+            caracteristicas.append(f"{nombre_campo}: {valor}")
+
+    if isinstance(specs_raw, list):
+        for s in specs_raw:
+            if isinstance(s, dict):
+                _match_spec(s.get("name") or s.get("key") or "", s.get("value") or "")
+    elif isinstance(specs_raw, dict):
+        for grupo in specs_raw.values():
+            if isinstance(grupo, dict):
+                for k, v in grupo.items():
+                    _match_spec(k, v if isinstance(v, str) else str(v))
+            elif isinstance(grupo, list):
+                for s in grupo:
+                    if isinstance(s, dict):
+                        _match_spec(s.get("name") or s.get("key") or "", s.get("value") or "")
+
+    return {
+        "ok": True, "url": url,
+        "nombre": prod.get("title") or "",
+        "marca": marca,
+        "part_number": part_number,
+        "precio_costo": precio_costo,
+        "moneda": moneda_ebay or "USD",
+        "descripcion": (prod.get("short_description") or "")[:600],
+        "caracteristicas": _filtrar_caracteristicas_no_tecnicas(caracteristicas),
+        "imagen_url": imagenes[0] if imagenes else "",
+    }
+
+
+def _traducir(prod: dict) -> dict:
+    """Traduce nombre + descripción + características al INGLÉS con Haiku (rápido), para NO cargar
+    la llamada principal del chat (que tiene el system prompt gigante). Fallback: datos originales.
+    A NIVEL DE MÓDULO (no anidada) — antes vivía anidada dentro de _extraer_producto_link y el
+    camino de eBay (con su propio return temprano) se la saltaba por completo, dejando fichas con
+    el idioma original del listing mezclado con el resto del flujo en inglés (bug real, confirmado)."""
+    if not prod or not prod.get("ok"):
+        return prod
+    prod["caracteristicas"] = prod.get("caracteristicas") or []
+    nombre = prod.get("nombre") or ""
+    desc = prod.get("descripcion") or ""
+    carac = prod.get("caracteristicas") or []
+    if not nombre and not desc and not carac:
+        return prod
+    try:
+        payload = json.dumps({"nombre": nombre, "descripcion": desc, "caracteristicas": carac}, ensure_ascii=False)
+        resp = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=4000,
+            timeout=40,
+            system=(
+                "Recibes un JSON de producto (nombre, descripcion, caracteristicas). Haz DOS cosas:\n"
+                "1) Traduce TODO al INGLÉS. Conserva intactos part numbers, códigos, números y unidades "
+                "(420 bar, 18.58 kg, R900938249, ISO 7368, NBR, M12×1, IP67, PNP).\n"
+                "2) Si la 'descripcion' trae specs técnicas embebidas como pares 'Etiqueta: valor' "
+                "(p.ej. 'Dimension: 32 x 20 x 8 mm, Range: 5 mm, Switching output: PNP NO, "
+                "Housing material: Stainless steel, Connection: Cable with connector, M12×1-Male, 4-pin'), "
+                "SEPÁRALAS: mételas en 'caracteristicas' como arreglo de strings 'Label: value' (una por spec, "
+                "respetando valores que llevan comas), y deja en 'descripcion' SOLO la descripción general del "
+                "producto (la parte introductoria), SIN la lista de specs y SIN líneas de precio/'list price'.\n"
+                "3) La 'descripcion' final SOLO debe hablar de especificaciones/características técnicas del "
+                "producto — BORRA por completo (no las muevas a 'caracteristicas', simplemente elimínalas) "
+                "cualquier mención de: condición del artículo (nuevo/usado/reacondicionado), garantía/warranty, "
+                "tiempo de entrega/lead time/fecha de envío, stock/disponibilidad/inventario, y ubicación del "
+                "vendedor/almacén. Nada de eso es información técnica del producto.\n"
+                "Combina con las caracteristicas que ya existan, sin duplicar.\n"
+                "CRÍTICO: SIEMPRE incluye las TRES claves en tu respuesta, incluso 'nombre' si ya estaba en "
+                "inglés o no cambió — nunca la omitas ni la dejes vacía, o el nombre se queda en el idioma "
+                "original mezclado con el resto ya traducido.\n"
+                "Responde SOLO JSON válido con las claves: nombre (string), descripcion (string), "
+                "caracteristicas (array de strings)."),
+            messages=[{"role": "user", "content": payload}],
+        )
+        txt = resp.content[0].text if resp.content else ""
+        m = re.search(r'\{[\s\S]*\}', txt)
+        if m:
+            data = json.loads(m.group(0))
+            if data.get("nombre"):         prod["nombre"] = data["nombre"]
+            if data.get("descripcion"):    prod["descripcion"] = data["descripcion"]
+            if isinstance(data.get("caracteristicas"), list) and data["caracteristicas"]:
+                prod["caracteristicas"] = [str(c) for c in data["caracteristicas"]]
+    except Exception as e:
+        log.warning(f"Traducción de producto falló, se usa original: {e}")
+    return prod
+
+
+def _extraer_producto_link(url: str, diag: list | None = None) -> dict:
+    """Extrae datos de producto de la página (og tags + JSON-LD). Funciona en sitios estándar
+    (Shopify/e-commerce). Sitios con protección anti-bots (ej. Festo, eBay) devuelven error 403 →
+    eBay se resuelve arriba con SerpAPI; otros requieren navegador headless (aún no disponible).
+    `diag` (opcional) acumula el motivo exacto de cada intento fallido, para loguear a
+    stream_logs y diagnosticar sin depender de los logs de Railway."""
+    import re as _re
+    from urllib.parse import quote_plus
+
+    m_ebay = _re.search(r'(ebay\.[a-z.]+)/itm/(?:[^/?]+/)?(\d+)', url, _re.I)
+    if m_ebay:
+        r_ebay = _extraer_producto_ebay_serpapi(url, m_ebay.group(2), m_ebay.group(1), diag)
+        if r_ebay:
+            # BUG REAL (confirmado): este return se saltaba _traducir por completo — un eBay.mx
+            # o cualquier TLD no-US quedaba con título/specs en el idioma original del listing,
+            # mezclado con el resto del flujo que sí espera todo en inglés.
+            return _traducir(r_ebay)
+        # SerpAPI no disponible o sin resultado → sigue el intento genérico de abajo (poco
+        # probable que funcione en eBay, pero no cuesta nada intentarlo).
+    hdrs = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+    }
+
+    def _parse(html: str):
+        """Extrae los datos del producto del HTML (og tags + JSON-LD). None si no hay producto."""
+        def meta(prop):
+            m = _re.search(rf'<meta[^>]+(?:property|name)=["\']{_re.escape(prop)}["\'][^>]+content=["\']([^"\']+)', html, _re.I) \
+                or _re.search(rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']{_re.escape(prop)}["\']', html, _re.I)
+            return m.group(1) if m else None
+        ld: dict = {}
+        candidatos: list = []
+        for m in _re.finditer(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>', html, _re.S | _re.I):
+            try:
+                # strict=False: algunos sitios (thepneumaticstore) meten saltos de línea/tabs sin
+                # escapar dentro de strings del JSON-LD (típico en descripciones multilínea) — un
+                # json.loads() estricto lo rechaza por completo y se pierde TODO el Product.
+                data = json.loads(m.group(1), strict=False)
+                candidatos = list(data) if isinstance(data, list) else [data]
+                # Muchos sitios (Drupal/Yoast) envuelven los nodos en {"@graph": [...]} en vez de
+                # exponer el Product directo — sin esto se pierde el nodo Product por completo.
+                for c in list(candidatos):
+                    if isinstance(c, dict) and isinstance(c.get("@graph"), list):
+                        candidatos.extend(c["@graph"])
+                for obj in candidatos:
+                    if isinstance(obj, dict) and obj.get("@type") == "Product":
+                        ld = obj
+                        break
+            except Exception:
+                pass
+            if ld:
+                break
+        offers = ld.get("offers", {}) or {}
+        if isinstance(offers, list):
+            offers = offers[0] if offers else {}
+        brand = ld.get("brand")
+        brand = brand.get("name") if isinstance(brand, dict) else brand
+        if not brand:
+            # Fallback: el nodo Organization del mismo @graph (patrón Drupal/Yoast) suele traer
+            # el fabricante cuando el Product no expone "brand" directo (caso Mersen).
+            for obj in candidatos:
+                if isinstance(obj, dict) and obj.get("@type") == "Organization" and obj.get("name"):
+                    brand = obj["name"]
+                    break
+        img = ld.get("image")
+        if isinstance(img, list):
+            img = img[0] if img else None
+        if isinstance(img, dict):
+            img = img.get("url") or img.get("contentUrl") or None
+        if img and not str(img).lower().startswith(("http://", "https://", "//")):
+            # Algunos sitios (Mersen) ponen solo un filename/id en "image.url", no una URL
+            # completa — inútil para descargar la foto; se prefiere og:image en ese caso.
+            img = None
+        nombre = ld.get("name") or meta("og:title")
+        if not nombre:
+            return None
+        # Ficha técnica: JSON-LD additionalProperty (PropertyValue) → "nombre: valor unidad"
+        caracteristicas = []
+        for prop in (ld.get("additionalProperty") or []):
+            if isinstance(prop, dict) and prop.get("name"):
+                val = prop.get("value", "")
+                unit = prop.get("unitText") or ""
+                caracteristicas.append(f"{prop['name']}: {val}{(' ' + unit) if unit else ''}".strip())
+        return {
+            "ok": True, "url": url, "nombre": nombre, "marca": brand or "",
+            "part_number":  ld.get("sku") or ld.get("mpn") or "",
+            "precio_costo": meta("product:price:amount") or offers.get("price") or "",
+            "moneda":       meta("product:price:currency") or offers.get("priceCurrency") or "",
+            "descripcion":  (ld.get("description") or meta("og:description") or "")[:600],
+            "caracteristicas": _filtrar_caracteristicas_no_tecnicas(caracteristicas),
+            "imagen_url":   img or meta("og:image") or "",
+        }
+
+    def _fetch(fetch_url, timeout, headers=None):
+        try:
+            return httpx.get(fetch_url, headers=headers, timeout=timeout, follow_redirects=True)
+        except Exception:
+            return None
+
+    # Muchos sitios (Vercel/Akamai) bloquean IPs de datacenter con 403/429. SCRAPER_API_URL
+    # (ScrapingAnt/ScrapingBee/...) devuelve el HTML vía proxy residencial. El render de JS
+    # (browser=true / render_js=true) es LENTO (~35-56s); por eso se intenta PRIMERO sin render
+    # (rápido, ~4s, sirve para la mayoría) y solo se cae al render si no trae datos (sitios JS
+    # como Festo). Sin la env var → fetch directo (sitios abiertos).
+    def _parse_llm(html: str):
+        """Fallback cuando el sitio NO expone datos estructurados (JSON-LD/og), como Futek: extrae
+        los campos del producto con Haiku a partir del título, h1, meta description, texto visible y
+        candidatos de imagen. Devuelve el mismo shape que _parse, o None."""
+        try:
+            from urllib.parse import urljoin
+            _clean = _re.sub(r'(?is)<(script|style|noscript|svg)[^>]*>.*?</\1>', ' ', html)
+            _t = _re.search(r'<title[^>]*>(.*?)</title>', html, _re.S | _re.I)
+            title = _re.sub(r'<[^>]+>', ' ', _t.group(1)).strip() if _t else ""
+            _h = _re.search(r'<h1[^>]*>(.*?)</h1>', html, _re.S | _re.I)
+            h1 = _re.sub(r'<[^>]+>', ' ', _h.group(1)).strip() if _h else ""
+            _md = _re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)', html, _re.I)
+            mdesc = _md.group(1) if _md else ""
+            cands = []
+            _og = _re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', html, _re.I)
+            if _og:
+                cands.append(urljoin(url, _og.group(1)))
+            for m in _re.finditer(r'<(?:img|source)[^>]+(?:src|data-src|data-original|data-lazy|srcset)=["\']([^"\']+)', html, _re.I):
+                u = m.group(1).split()[0]
+                if not u or _re.search(r'(icon|logo|sprite|placeholder|avatar|flag|\.svg|1x1|blank)', u, _re.I):
+                    continue
+                cands.append(urljoin(url, u))
+            _seen: set = set()
+            cands = [c for c in cands if not (c in _seen or _seen.add(c))][:20]
+            visible = _re.sub(r'\s+', ' ', _re.sub(r'<[^>]+>', ' ', _clean)).strip()[:12000]
+            payload = json.dumps({"url": url, "title": title, "h1": h1, "meta_description": mdesc,
+                                  "image_candidates": cands, "page_text": visible}, ensure_ascii=False)
+            resp = claude.messages.create(
+                model="claude-haiku-4-5-20251001", max_tokens=3000, timeout=35,
+                system=(
+                    "Extrae los datos de UN producto industrial de la página. Responde SOLO JSON con las claves: "
+                    "nombre, part_number, marca, precio_costo (''si no hay precio visible), moneda, descripcion "
+                    "(general), caracteristicas (array 'Etiqueta: valor'), imagen_url. REGLAS: part_number del "
+                    "título o de la URL; marca = fabricante (p.ej. Futek); NO inventes precio si la página no lo "
+                    "muestra (deja ''); imagen_url = la FOTO principal del producto elegida de image_candidates "
+                    "(NUNCA iconos ni logos); si ninguna candidata es la foto del producto, deja imagen_url ''. "
+                    "Conserva part numbers, códigos, números y unidades intactos. En 'caracteristicas' incluye "
+                    "TODAS las especificaciones técnicas que encuentres en el texto (dimensiones, materiales, "
+                    "rangos, tolerancias, certificaciones, etc.) — no te limites a unas pocas."),
+                messages=[{"role": "user", "content": payload}],
+            )
+            m = _re.search(r'\{[\s\S]*\}', resp.content[0].text if resp.content else "")
+            if not m:
+                return None
+            d = json.loads(m.group(0))
+            if not d.get("nombre"):
+                return None
+            log.info(f"_parse_llm extrajo: {d.get('nombre','')[:50]} | img={'sí' if d.get('imagen_url') else 'no'}")
+            return {
+                "ok": True, "url": url, "nombre": d.get("nombre", ""), "marca": d.get("marca", ""),
+                "part_number": d.get("part_number", ""), "precio_costo": d.get("precio_costo", "") or "",
+                "moneda": d.get("moneda", "") or "", "descripcion": (d.get("descripcion", "") or "")[:600],
+                "caracteristicas": _filtrar_caracteristicas_no_tecnicas([str(c) for c in (d.get("caracteristicas") or [])]),
+                "imagen_url": d.get("imagen_url", "") or "",
+            }
+        except Exception as e:
+            log.warning(f"_parse_llm falló: {e}")
+            return None
+
+    def _parse_completo(html: str):
+        """_parse() (rápido, JSON-LD/og) + relleno con _parse_llm() cuando el resultado viene
+        'delgado' (sin part_number NI marca) — sin esto, un Product de JSON-LD que solo trae
+        nombre+imagen (caso Mersen: sin sku/mpn/brand) se quedaba así aunque el texto visible de
+        la página SÍ tuviera los datos técnicos."""
+        p = _parse(html)
+        if p and p.get("part_number") and p.get("marca"):
+            return p
+        p2 = _parse_llm(html)
+        if not p:
+            return p2
+        if not p2:
+            return p
+        merged = dict(p)
+        for k in ("part_number", "marca", "caracteristicas", "descripcion", "precio_costo", "moneda"):
+            if not merged.get(k) and p2.get(k):
+                merged[k] = p2[k]
+        if not merged.get("imagen_url") and p2.get("imagen_url"):
+            merged["imagen_url"] = p2["imagen_url"]
+        return merged
+
+    def _mejor_de(a, b):
+        """Combina dos resultados de extracción, prefiriendo el dato no vacío de cada uno (y la
+        lista de características más larga). Se usa para combinar el intento rápido (sin JS) con
+        el de render completo (con JS) cuando ninguno solo trae todo (caso Littelfuse: el rápido
+        trae nombre/marca/part_number de meta tags, pero la tabla de specs solo se pinta con JS)."""
+        if not a:
+            return b
+        if not b:
+            return a
+        merged = dict(a)
+        for k in ("part_number", "marca", "descripcion", "precio_costo", "moneda", "imagen_url", "nombre"):
+            if not merged.get(k) and b.get(k):
+                merged[k] = b[k]
+        if len(b.get("caracteristicas") or []) > len(merged.get("caracteristicas") or []):
+            merged["caracteristicas"] = b["caracteristicas"]
+        return merged
+
+    scraper_tmpl = os.environ.get("SCRAPER_API_URL", "").strip()
+
+    if scraper_tmpl:
+        # Intento 1 — RÁPIDO (sin render): solo si el template traía render activado
+        fast_tmpl = scraper_tmpl.replace("browser=true", "browser=false").replace("render_js=true", "render_js=false")
+        fast_parsed = None
+        if fast_tmpl != scraper_tmpl:
+            r = _fetch(fast_tmpl.replace("{url}", quote_plus(url)), 30)
+            if r is not None and r.status_code == 200:
+                fast_parsed = _parse_completo(r.text)  # fallback/relleno LLM (Futek, sitios sin schema, o Product 'delgado' como Mersen)
+                if fast_parsed and fast_parsed.get("caracteristicas"):
+                    return _traducir(fast_parsed)
+                # Sin características (posible sitio JS como Littelfuse, donde la tabla de specs
+                # solo existe tras ejecutar JS) → seguir al intento con render antes de conformarse.
+        # Intento 2 — CON RENDER (lento pero pasa sitios JS/anti-bot como Festo, y trae specs que
+        # solo se pintan con JS como en Littelfuse)
+        r = _fetch(scraper_tmpl.replace("{url}", quote_plus(url)), 90)
+        if r is None:
+            if diag is not None:
+                diag.append("scraper genérico: no respondió a tiempo")
+            if fast_parsed:
+                return _traducir(fast_parsed)
+            return {"error": "El scraper no respondió a tiempo. Reintenta o pega los datos manualmente."}
+        if r.status_code != 200:
+            if diag is not None:
+                diag.append(f"scraper genérico: HTTP {r.status_code} — {r.text[:150]}")
+            if fast_parsed:
+                return _traducir(fast_parsed)
+            return {"error": f"HTTP {r.status_code} — el sitio bloquea el acceso. Pega los datos manualmente."}
+        render_parsed = _parse_completo(r.text)  # fallback/relleno LLM (Futek, sitios sin schema, o Product 'delgado' como Mersen)
+        combinado = _mejor_de(fast_parsed, render_parsed)
+        return _traducir(combinado) if combinado else {"error": "No encontré datos de producto en el link (¿es una página de producto?)."}
+
+    # Sin scraper: fetch directo
+    r = _fetch(url, 25, headers=hdrs)
+    if r is None:
+        return {"error": "No se pudo acceder al link."}
+    if r.status_code != 200:
+        return {"error": f"HTTP {r.status_code} — el sitio bloquea el acceso automático "
+                         f"(sin SCRAPER_API_URL configurado). Pega los datos manualmente."}
+    parsed = _parse_completo(r.text)  # fallback/relleno LLM (Futek, sitios sin schema, o Product 'delgado' como Mersen)
+    return _traducir(parsed) if parsed else {"error": "No encontré datos de producto en el link (¿es una página de producto?)."}
+
+
+def _get_imagen_directo(url: str, timeout: int = 15):
+    """Descarga directa de una imagen con headers de navegador. Si la URL es http:// y falla (el
+    caso real: wenglor.com por http:// da ConnectTimeout, por https:// responde 200), reintenta con
+    https:// — antes la foto del producto nunca se rehosteaba ni se subía al CRM."""
+    hdr = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                         "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+           "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"}
+    try:
+        return httpx.get(url, timeout=timeout, follow_redirects=True, headers=hdr)
+    except Exception:
+        if url.startswith("http://"):
+            return httpx.get("https://" + url[len("http://"):], timeout=timeout, follow_redirects=True, headers=hdr)
+        raise
+
+
+def _rehost_imagen_preview(imagen_url: str, marca: str = "", part_number: str = "") -> str:
+    """Descarga la imagen del sitio de origen, le corre el MISMO chequeo de calidad que la
+    publicación real (marca de agua → reemplazo, Remove.bg, resize a 500x500 — ver
+    _procesar_imagen_producto) y la sube a Supabase Storage bajo el prefijo 'link-preview/'.
+
+    BUG REAL #1 (ya arreglado antes): el [PRODUCTO_PREVIEW] mostraba el ícono de imagen rota porque
+    el navegador intentaba cargar DIRECTO la URL del sitio de origen — muchos fabricantes bloquean
+    el hotlink desde un dominio ajeno. Se arregló re-hosteando a Supabase, pero solo con una copia
+    TAL CUAL (sin procesar), así que el preview mostraba el fondo/marca de agua sin recortar aunque
+    la imagen sí cargara — Gabriel lo reportó de nuevo con la misma captura. Ahora corre el
+    procesamiento COMPLETO aquí mismo, así el preview es EXACTAMENTE la imagen final (WYSIWYG) en
+    vez de la foto cruda. El prefijo 'link-preview/' es la marca que _rehost_imagen (al publicar)
+    usa para NO volver a correr Remove.bg/Vision sobre una imagen que ya se procesó aquí — evita
+    pagar esa API dos veces por el mismo producto.
+
+    Mismo patrón de descarga con fallback a proxy que ya usa _rehost_imagen (Festo y similares
+    bloquean IPs de datacenter). Si todo falla, devuelve la URL original."""
+    if not imagen_url:
+        return imagen_url
+    from urllib.parse import quote_plus
+
+    def _dl(via_scraper: bool):
+        try:
+            if via_scraper:
+                sc = os.environ.get("SCRAPER_API_URL", "").strip()
+                if not sc:
+                    return None
+                fetch = sc.replace("browser=true", "browser=false").replace("render_js=true", "render_js=false")
+                return httpx.get(fetch.replace("{url}", quote_plus(imagen_url)), timeout=40)
+            return _get_imagen_directo(imagen_url, 15)
+        except Exception:
+            return None
+
+    def _ok(r):
+        return r is not None and r.status_code == 200 and "image" in r.headers.get("content-type", "").lower()
+
+    try:
+        r = _dl(False)
+        if not _ok(r):
+            r = _dl(True)
+        if not _ok(r):
+            # No se pudo bajar la foto del sitio: buscar una limpia en internet por marca+modelo.
+            alt = _buscar_imagen_limpia(marca, part_number) if (marca or part_number) else None
+            if alt:
+                safe = (part_number or "producto").replace("/", "-").replace(" ", "_")
+                path = f"link-preview/{safe}_{str(uuid.uuid4())[:6]}.png"
+                supabase.storage.from_("product-images").upload(path=path, file=alt, file_options={"content-type": "image/png", "upsert": "true"})
+                return supabase.storage.from_("product-images").get_public_url(path)
+            return imagen_url
+        content = _procesar_imagen_producto(r.content, marca, part_number, imagen_url)
+        if not content:
+            # Ni la foto original servía (marca de agua sin reemplazo) ni hay logo — sin imagen
+            # es mejor que mostrar una marcada en el preview.
+            return ""
+        safe = (part_number or "producto").replace("/", "-").replace(" ", "_")
+        path = f"link-preview/{safe}_{str(uuid.uuid4())[:6]}.png"
+        supabase.storage.from_("product-images").upload(
+            path=path, file=content, file_options={"content-type": "image/png", "upsert": "true"},
+        )
+        return supabase.storage.from_("product-images").get_public_url(path)
+    except Exception as e:
+        log.warning(f"No se pudo rehost/procesar la imagen para preview ({imagen_url[:60]}): {e}")
+        return imagen_url
+
+
+def tool_extraer_producto_de_link(url: str) -> dict:
+    """Extrae nombre, marca, part number, precio del proveedor, descripción e imagen de la
+    página de un producto (para publicarlo en 1CRM desde un link). SIEMPRE coteja el part_number
+    contra el catálogo real de 1CRM antes de devolver — si "ya_existe" viene true, NO ofrezcas
+    crear un producto nuevo: avisa que ya está publicado y da el link ("producto_existente_url")."""
+    r = _extraer_producto_link(url)
+    if r and not r.get("error") and r.get("imagen_url"):
+        # Procesa (marca de agua/Remove.bg/resize) y re-hospeda para que el [PRODUCTO_PREVIEW]
+        # muestre la imagen FINAL — ver _rehost_imagen_preview.
+        r["imagen_url"] = _rehost_imagen_preview(r["imagen_url"], r.get("marca", ""), r.get("part_number", ""))
+    if r and not r.get("error"):
+        # Título FINAL (modelo/marca/descripción corta) ya aquí, no solo al publicar — así el
+        # [PRODUCTO_PREVIEW] que ve el usuario muestra EXACTAMENTE el título que va a quedar en
+        # 1CRM (antes el preview mostraba el 'nombre' crudo del sitio de origen, distinto del que
+        # de verdad se guardaba al aprobar). Ver _construir_titulo_producto.
+        r["nombre"] = _construir_titulo_producto(r.get("part_number", ""), r.get("marca", ""), r.get("descripcion", ""), r.get("nombre", ""))
+    pn = (r or {}).get("part_number") or ""
+    if pn and not r.get("error"):
+        try:
+            import agente_publicador
+            pid, _diags = agente_publicador.buscar_producto_por_codigo(pn)
+            if pid:
+                r["ya_existe"] = True
+                r["producto_existente_id"] = pid
+                r["producto_existente_url"] = f"{ONECRM_BASE}/index.php?module=AOS_Products&action=DetailView&record={pid}"
+            else:
+                r["ya_existe"] = False
+        except Exception as e:
+            log.warning(f"Cotejo de duplicado en extraer_producto_de_link falló: {e}")
+    return r
+
+
+def _ajustar_imagen_500(content: bytes) -> bytes:
+    """Ajusta cualquier imagen a un lienzo cuadrado de 500x500 px sobre fondo blanco (sin deformar
+    el aspect ratio) — tamaño estándar para las fotos de producto que se suben a 1CRM. Devuelve
+    siempre PNG."""
+    from PIL import Image
+    import io as _io
+    im = Image.open(_io.BytesIO(content))
+    if im.mode in ("RGBA", "LA", "P"):
+        im = im.convert("RGBA")
+        bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
+        im = Image.alpha_composite(bg, im).convert("RGB")
+    else:
+        im = im.convert("RGB")
+    im.thumbnail((500, 500), Image.LANCZOS)
+    lienzo = Image.new("RGB", (500, 500), (255, 255, 255))
+    lienzo.paste(im, ((500 - im.width) // 2, (500 - im.height) // 2))
+    buf = _io.BytesIO()
+    lienzo.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _tiene_marca_de_agua(imagen_bytes: bytes) -> bool:
+    """Claude Vision: ¿esta foto tiene marca de agua / texto superpuesto / logo de un tercero
+    ESTAMPADO ENCIMA de la foto (nombre de sitio, dominio, banda diagonal semi-transparente, etc.)?
+    NO cuenta un logo grabado en la pieza física ni texto de un empaque — eso es normal. Ante la
+    duda, se asume que NO tiene (mejor usar la foto que gastar en una búsqueda que quizá tampoco
+    encuentre nada mejor).
+
+    BUG REAL confirmado con una foto real de reseller (BD Engineering: logo propio en esquina +
+    badge "1 YEAR" + franja inferior con teléfono/sitio web, todo integrado como si fuera parte
+    del diseño de la imagen sobre fondo gris): el prompt original ("nombre de sitio, dominio,
+    'sample', franja diagonal semi-transparente") devolvía NO — el modelo lo interpretaba como
+    parte legítima del diseño en vez de overlay de vendedor, porque no venía en forma de sello
+    diagonal clásico. Prompt reescrito para nombrar explícitamente el patrón real (logo/badge de
+    garantía/franja de contacto de un DISTRIBUIDOR, aunque se vea "integrado" al diseño) — probado
+    en vivo: detecta el caso reseller (antes NO, ahora SI) y sigue sin falsos positivos en una foto
+    limpia sin overlay."""
+    try:
+        from PIL import Image
+        import io as _io
+        im = Image.open(_io.BytesIO(imagen_bytes))
+        fmt = (im.format or "JPEG").upper()
+        media_type = {"JPEG": "image/jpeg", "PNG": "image/png", "WEBP": "image/webp"}.get(fmt, "image/jpeg")
+        b64 = __import__("base64").standard_b64encode(imagen_bytes).decode("utf-8")
+        resp = claude.messages.create(
+            model="claude-haiku-4-5-20251001", max_tokens=10, timeout=20,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}},
+                    {"type": "text", "text": (
+                        "Esta imagen es una foto de producto industrial que un DISTRIBUIDOR/RESELLER "
+                        "publicó en su página o catálogo. Los distribuidores frecuentemente le pegan "
+                        "ENCIMA de la foto original su propia publicidad: logo de su empresa (esquina), "
+                        "sello/badge de garantía ('1 YEAR', 'GENUINE', 'AUTHENTIC'), y una franja con su "
+                        "nombre comercial, teléfono/'Hotline' y sitio web. TODO eso cuenta como marca de "
+                        "agua/overlay que hay que detectar, AUNQUE se vea integrado como parte del diseño "
+                        "de la imagen (fondo de color, franjas, badges) — el criterio es: ¿esa info "
+                        "identifica al DISTRIBUIDOR/vendedor (no al fabricante del producto)? Si sí, es "
+                        "overlay.\n\n"
+                        "NO cuenta: texto/logo que está IMPRESO FÍSICAMENTE en la pieza o su etiqueta/"
+                        "nameplate original del FABRICANTE (grabado, moldeado, o en la etiqueta del "
+                        "producto tal cual sale de fábrica).\n\n"
+                        "¿Esta imagen tiene overlay de distribuidor/reseller (logo propio, badge de "
+                        "garantía, franja con teléfono o sitio web del vendedor)? Responde SOLO 'SI' o 'NO'."
+                    )},
+                ],
+            }],
+        )
+        txt = (resp.content[0].text if resp.content else "").strip().upper()
+        return txt.startswith("SI") or txt.startswith("SÍ") or txt.startswith("YES")
+    except Exception as e:
+        log.warning(f"Chequeo de marca de agua falló, se asume limpia: {e}")
+        return False
+
+
+def _buscar_imagen_limpia(marca: str, modelo: str) -> bytes | None:
+    """Cuando la foto extraída del link/PDF tiene marca de agua, busca un reemplazo limpio
+    reusando el pipeline de agente_imagen.py: Google/SerpAPI Images → Claude Vision elige la
+    mejor → Remove.bg quita fondo. Devuelve PNG 500x500 fondo blanco, o None si no hay nada
+    aceptable. Import perezoso: agente_imagen ya trae sus propias credenciales/checks."""
+    try:
+        import agente_imagen as ai
+    except Exception as e:
+        log.warning(f"agente_imagen no disponible para buscar imagen de reemplazo: {e}")
+        return None
+    try:
+        urls = ai.buscar_imagenes(marca, modelo)
+        if not urls:
+            return None
+        candidatas = ai.descargar_candidatas(urls)
+        if not candidatas:
+            return None
+        idx = ai.evaluar_con_claude_vision(marca, modelo, candidatas)
+        if idx is None:
+            return None
+        ganadora = candidatas[idx]
+        sin_fondo = ai.remover_fondo(ganadora["bytes"], ganadora["url"])
+        return ai.optimizar_500x500(sin_fondo if sin_fondo else ganadora["bytes"])
+    except Exception as e:
+        log.warning(f"Búsqueda de imagen de reemplazo falló: {e}")
+        return None
+
+
+def _buscar_logo_marca(marca: str) -> bytes | None:
+    """Último recurso cuando NO se encontró ninguna foto real del producto: busca el logo del
+    fabricante por internet (mismo buscador de imágenes). Fondo blanco + 500x500 igual que las
+    fotos de producto."""
+    marca = (marca or "").strip()
+    if not marca:
+        return None
+    try:
+        import agente_imagen as ai
+    except Exception as e:
+        log.warning(f"agente_imagen no disponible para buscar logo de marca: {e}")
+        return None
+    try:
+        urls = ai.buscar_imagenes_google(marca, "logo") or ai.buscar_imagenes_serpapi(marca, "logo")
+        if not urls:
+            return None
+        candidatas = ai.descargar_candidatas(urls)
+        if not candidatas:
+            return None
+        ganadora = candidatas[0]  # logos no necesitan Vision para elegir
+        sin_fondo = ai.remover_fondo(ganadora["bytes"], ganadora["url"])
+        return ai.optimizar_500x500(sin_fondo if sin_fondo else ganadora["bytes"])
+    except Exception as e:
+        log.warning(f"Búsqueda de logo de marca falló: {e}")
+        return None
+
+
+def _logo_mro() -> bytes | None:
+    """Último-último recurso: el logo de MRO, cuando ni la foto del producto ni el logo del
+    fabricante se pudieron conseguir. Pendiente: falta el archivo — configurar MRO_LOGO_URL."""
+    url = os.environ.get("MRO_LOGO_URL", "").strip()
+    if not url:
+        return None
+    try:
+        r = httpx.get(url, timeout=20, follow_redirects=True)
+        r.raise_for_status()
+        return r.content
+    except Exception as e:
+        log.warning(f"No se pudo descargar el logo de MRO ({url[:60]}): {e}")
+        return None
+
+
+def _subir_imagen_bytes(content: bytes, prefix: str, nombre: str = "producto") -> str:
+    """Sube bytes de imagen (PNG) ya procesados a Supabase Storage y devuelve la URL pública."""
+    safe = (nombre or "producto").replace("/", "-").replace(" ", "_")
+    path = f"{prefix}/{safe}_{uuid.uuid4().hex[:8]}.png"
+    supabase.storage.from_("product-images").upload(
+        path=path, file=content, file_options={"content-type": "image/png", "upsert": "true"},
+    )
+    return supabase.storage.from_("product-images").get_public_url(path)
+
+
+def _subir_logo_fallback(part_number: str, marca: str) -> str | None:
+    """Cuando el link/PDF no trajo NINGUNA imagen: busca el logo del fabricante, y si tampoco hay,
+    el de MRO. Sube el resultado y devuelve la URL, o None si no hay nada que mostrar."""
+    logo = _buscar_logo_marca(marca)
+    if not logo:
+        logo_mro = _logo_mro()
+        logo = _ajustar_imagen_500(logo_mro) if logo_mro else None
+    if not logo:
+        return None
+    try:
+        url = _subir_imagen_bytes(logo, "logo", part_number)
+        log.info(f"Logo de respaldo subido (sin foto de producto disponible): {url[:70]}")
+        return url
+    except Exception as e:
+        log.warning(f"No se pudo subir el logo de respaldo: {e}")
+        return None
+
+
+def _remover_fondo_producto(content: bytes, imagen_url: str = "") -> bytes:
+    """Quita el fondo de la foto (Remove.bg) antes de ajustarla a 500x500 — BUG REAL confirmado:
+    el camino normal (foto sin marca de agua, el caso más común) nunca pasaba por Remove.bg, así
+    que el fondo original de la foto scrapeada quedaba visible dentro del padding blanco de
+    _ajustar_imagen_500 (efecto "marco"). Fallback silencioso al content original si no hay
+    REMOVEBG_API_KEY o la llamada falla — nunca bloquea la publicación por esto."""
+    try:
+        import agente_imagen
+        sin_fondo = agente_imagen.remover_fondo(content, imagen_url)
+        return sin_fondo or content
+    except Exception as e:
+        log.warning(f"Remove.bg falló, se usa la foto con su fondo original: {e}")
+        return content
+
+
+def _procesar_imagen_producto(content: bytes | None, marca: str = "", modelo: str = "", imagen_url: str = "") -> bytes | None:
+    """Punto único de calidad de imagen para productos publicados desde link o ficha técnica PDF:
+    1) si la foto trae marca de agua → busca reemplazo limpio en internet (Vision + Remove.bg).
+    2) si no hay NINGUNA foto (ni la original ni un reemplazo) → logo del fabricante.
+    3) si tampoco hay logo de marca → logo de MRO.
+    Devuelve PNG 500x500 fondo blanco, o None si de plano no hay nada que mostrar."""
+    if content:
+        try:
+            if _tiene_marca_de_agua(content):
+                log.info(f"Marca de agua detectada en imagen de {marca} {modelo} — buscando reemplazo")
+                limpia = _buscar_imagen_limpia(marca, modelo)
+                if limpia:
+                    return limpia
+                content = None  # no sirve la que traíamos ni se encontró reemplazo → sigue a logos
+        except Exception as e:
+            log.warning(f"Chequeo/reemplazo de marca de agua falló, se usa la foto original: {e}")
+
+    if content:
+        content = _remover_fondo_producto(content, imagen_url)
+        return _ajustar_imagen_500(content)
+
+    logo_marca = _buscar_logo_marca(marca)
+    if logo_marca:
+        return logo_marca
+
+    logo_mro = _logo_mro()
+    if logo_mro:
+        return _ajustar_imagen_500(logo_mro)
+
+    return None
+
+
+def tool_extraer_ficha_pdf(url: str) -> dict:
+    """Extrae el/los producto(s) de una ficha técnica (PDF/Excel/Word) por URL: nombre, marca,
+    part number, descripción y características técnicas de cada variante/SKU encontrado. Si el PDF
+    trae una foto embebida (p.ej. la portada), se verifica (marca de agua) y re-hospeda en Supabase
+    Storage, asignándose como imagen_url a todos los productos devueltos. Import perezoso para no
+    romper el chat si falta alguna dependencia de parsing en el entorno."""
+    try:
+        import ficha_tecnica
+    except Exception as e:
+        return {"error": f"módulo de ficha técnica no disponible: {e}"}
+
+    datos = ficha_tecnica.leer_ficha(url=url)
+    b64  = datos.pop("imagen_b64", "")
+    datos.pop("imagen_ext", "")
+    productos = datos.get("productos", [])
+    primero = productos[0] if productos else {}
+    content = None
+    if b64:
+        try:
+            import base64 as _b64mod
+            content = _b64mod.b64decode(b64)
+        except Exception as e:
+            log.warning(f"No se pudo decodificar la imagen embebida del PDF: {e}")
+
+    try:
+        final = _procesar_imagen_producto(content, primero.get("marca", ""), primero.get("part_number", ""))
+        if final:
+            img_url = _subir_imagen_bytes(final, "ficha", primero.get("part_number", ""))
+            for p in productos:
+                p["imagen_url"] = img_url
+            log.info(f"Imagen de ficha técnica lista (500x500) y re-hospedada: {img_url[:70]}")
+    except Exception as e:
+        log.warning(f"No se pudo procesar/subir la imagen de la ficha técnica: {e}")
+
+    # Mismas reglas de título y de contenido que el flujo de link (MODO 13): este extractor de PDF
+    # se usa TANTO en 'publicacion' como en 'busquedas' (stream de búsqueda de partes) — el usuario
+    # pidió que la información mostrada siga las mismas reglas sin importar de dónde salió.
+    for p in productos:
+        p["nombre"] = _construir_titulo_producto(p.get("part_number", ""), p.get("marca", ""), p.get("descripcion", ""), p.get("nombre", ""))
+        if p.get("caracteristicas"):
+            p["caracteristicas"] = _filtrar_caracteristicas_no_tecnicas(p["caracteristicas"])
+    return datos
+
+
+def _rehost_imagen(imagen_url: str, part_number: str = "", marca: str = "") -> str:
+    """Descarga la imagen, la pasa por el chequeo de calidad (marca de agua → busca reemplazo o
+    logo) y la re-hospeda en Supabase Storage, para que el publicador pueda subirla a 1CRM. Sitios
+    como Festo bloquean la descarga directa desde IPs de datacenter (Railway) → si el directo
+    falla, se reintenta vía ScrapingAnt (proxy residencial). Si todo falla, devuelve la URL
+    original (el publicador hará su propio fallback)."""
+    if not imagen_url:
+        return imagen_url
+    if "/product-images/" in imagen_url and "/link-preview/" in imagen_url:
+        # Ya se procesó (marca de agua/Remove.bg/resize) en _rehost_imagen_preview al mostrar el
+        # [PRODUCTO_PREVIEW] — no volver a pagar Remove.bg/Vision por el mismo producto.
+        return imagen_url
+    from urllib.parse import quote_plus
+
+    def _dl(via_scraper: bool):
+        try:
+            if via_scraper:
+                sc = os.environ.get("SCRAPER_API_URL", "").strip()
+                if not sc:
+                    return None
+                fetch = sc.replace("browser=true", "browser=false").replace("render_js=true", "render_js=false")
+                return httpx.get(fetch.replace("{url}", quote_plus(imagen_url)), timeout=40)
+            return _get_imagen_directo(imagen_url, 20)
+        except Exception:
+            return None
+
+    def _ok(r):
+        return r is not None and r.status_code == 200 and "image" in r.headers.get("content-type", "").lower()
+
+    try:
+        r = _dl(False)
+        if not _ok(r):
+            r = _dl(True)  # bloqueado → proxy residencial
+        if not _ok(r):
+            return imagen_url
+        content_type = r.headers.get("content-type", "image/jpeg").lower()
+        try:
+            # Chequeo de calidad (marca de agua → reemplazo o logo) + quitar fondo (Remove.bg) +
+            # ajuste a 500x500 (tamaño estándar) + normaliza a PNG de paso (1CRM no acepta WebP/AVIF/etc).
+            content = _procesar_imagen_producto(r.content, marca, part_number, imagen_url)
+            if not content:
+                # Ni la foto original servía (marca de agua) ni se encontró reemplazo/logo —
+                # mejor sin imagen que con una marcada.
+                return ""
+            ct, ext = "image/png", "png"
+        except Exception as _e_conv:
+            log.warning(f"No se pudo procesar la imagen ({content_type}): {_e_conv}")
+            content, ct = r.content, content_type
+            ext = "png" if "png" in content_type else "jpg"
+        safe = (part_number or "producto").replace("/", "-").replace(" ", "_")
+        path = f"link/{safe}_{str(uuid.uuid4())[:6]}.{ext}"
+        supabase.storage.from_("product-images").upload(
+            path=path, file=content, file_options={"content-type": ct, "upsert": "true"},
+        )
+        url = supabase.storage.from_("product-images").get_public_url(path)
+        log.info(f"Imagen re-hospedada en Supabase: {url[:70]}")
+        return url
+    except Exception as e:
+        log.warning(f"No se pudo re-hospedar la imagen, se usa la original: {e}")
+        return imagen_url
+
+
+_HEARTBEAT_MAX_MIN = 3  # el servicio de workers late cada 60s; 3 min sin latido = dormido/caído
+
+
+def _workers_despiertos() -> tuple[bool, str]:
+    """(despiertos, cuánto llevan dormidos). Lee el latido que escribe el servicio de workers.
+
+    Railway duerme el servicio cuando no se usa (días sin actividad). Dormido, los jobs se encolan
+    pero NADIE los procesa: falla silenciosa. Esto permite avisarle al usuario ANTES de trabajar.
+    Ante cualquier duda devuelve True (no estorbar el flujo por un problema de lectura).
+    """
+    try:
+        r = (supabase.table("resource_status").select("actualizado_en")
+             .eq("servicio", "workers").eq("metrica", "heartbeat").limit(1).execute())
+        if not r.data:
+            return True, ""  # nunca ha latido (función nueva / tabla vacía) → NO alarmar en falso
+        ts = datetime.fromisoformat(str(r.data[0]["actualizado_en"]).replace("Z", "+00:00"))
+        delta = datetime.now(timezone.utc) - ts
+        if delta < timedelta(minutes=_HEARTBEAT_MAX_MIN):
+            return True, ""
+        mins = int(delta.total_seconds() // 60)
+        if mins < 120:
+            return False, f"{mins} min"
+        horas = mins // 60
+        return False, (f"{horas} h" if horas < 48 else f"{horas // 24} días")
+    except Exception:
+        return True, ""
+
+
+def _aviso_workers_dormidos(detalle: str, clean_stream=None) -> str:
+    """Aviso determinista (no depende de que el modelo se acuerde) de que la cola no se va a mover."""
+    txt = (f"Los workers llevan {detalle} sin dar señales — Railway los duerme cuando el servicio no se usa. "
+           f"El trabajo QUEDA ENCOLADO pero NO se va a procesar hasta que reactives el servicio en Railway.")
+    try:
+        tool_notificar_sistema("⚠️ Workers dormidos — la cola no se va a procesar", txt,
+                               tipo="sistema", stream_id=str(clean_stream or ""))
+    except Exception:
+        pass
+    return txt
+
+
+_EN_CURSO_MIN = 5  # una publicación real tarda <1-2 min; más allá = job atorado, no "publicado"
+
+
+def _estado_publicacion_reciente(part_number: str, clean_stream, minutos: int = 30) -> str:
+    """Guardia anti-doble-publicación, PERO sin mentir. Devuelve:
+      'publicado' → ya se publicó DE VERDAD en este stream hace poco (bloquea).
+      'en_curso'  → se está publicando AHORITA (job vivo, < _EN_CURSO_MIN) (bloquea).
+      ''          → libre. Incluye el caso de un rfq ATORADO en 'publicando' (el worker nunca
+                    tomó el job): eso NO se reporta como publicado y SÍ se deja reintentar.
+
+    BUG REAL confirmado por Gabriel: este guardia solo mira el historial de Supabase (rfqs), NO el
+    catálogo real de 1CRM. Si el usuario borra el producto directamente en 1CRM (a propósito o sin
+    querer) y luego pide recrearlo dentro de los `minutos` siguientes, este guardia seguía diciendo
+    'publicado' con el registro viejo — bloqueando una recreación legítima porque el HISTORIAL decía
+    que ya existía, aunque el CRM real ya NO lo tuviera. Antes de bloquear por 'publicado', se
+    verifica en vivo contra 1CRM (buscar_producto_por_codigo): si YA NO está ahí, el registro de
+    Supabase quedó obsoleto (se borró después) — no bloquea, deja reintentar."""
+    if not part_number or not clean_stream:
+        return ""
+    try:
+        corte = (datetime.now(timezone.utc) - timedelta(minutes=minutos)).isoformat()
+        r = (supabase.table("rfqs").select("id,estado,created_at")
+             .eq("stream_id", clean_stream).eq("modelo", part_number)
+             .in_("estado", ["publicando", "publicado"])
+             .gte("created_at", corte).order("created_at", desc=True).limit(1).execute())
+        if not r.data:
+            return ""
+        row = r.data[0]
+        if (row.get("estado") or "") == "publicado":
+            try:
+                import agente_publicador
+                pid, _diags = agente_publicador.buscar_producto_por_codigo(part_number)
+                if not pid:
+                    log.info(f"'{part_number}' figura publicado en Supabase pero YA NO está en 1CRM — se permite recrear")
+                    return ""
+            except Exception as e:
+                log.warning(f"No se pudo verificar '{part_number}' contra 1CRM, se confía en Supabase: {e}")
+            return "publicado"
+        # 'publicando': solo cuenta si es reciente; si lleva rato, el job se atoró → permitir reintento.
+        try:
+            creado = datetime.fromisoformat(str(row.get("created_at")).replace("Z", "+00:00"))
+            if (datetime.now(timezone.utc) - creado) < timedelta(minutes=_EN_CURSO_MIN):
+                return "en_curso"
+        except Exception:
+            pass
+        return ""
+    except Exception:
+        return ""
+
+
+def _resumen_corto(texto: str, max_len: int = 100) -> str:
+    """Recorta un texto a una descripción corta para usar como último parámetro del título:
+    la primera oración si es razonable, si no un recorte por palabra completa con '…'."""
+    texto = (texto or "").strip()
+    if not texto:
+        return ""
+    corte = texto.find(". ")
+    if 0 < corte <= max_len + 20:
+        return texto[:corte + 1]
+    if len(texto) <= max_len:
+        return texto
+    return texto[:max_len].rsplit(" ", 1)[0].rstrip(".,;:") + "…"
+
+
+def _construir_titulo_producto(part_number: str, marca: str = "", descripcion: str = "", nombre_fallback: str = "") -> str:
+    """Título para 1CRM en el ORDEN pedido por Gabriel: modelo (part number) / marca / descripción
+    CORTA — SIN el 'nombre' que trae el extractor (se descarta a propósito: mezclar el nombre del
+    sitio de origen con la descripción corta duplicaba información y alargaba el título). La
+    descripción corta sale de 'descripcion', no de 'nombre'.
+    (se omiten partes vacías o repetidas — p.ej. si la descripción corta == part number).
+
+    Un solo punto de verdad para el título: se llama tanto al EXTRAER (para que el [PRODUCTO_PREVIEW]
+    que ve el usuario ya muestre el título final, no uno distinto del que termina en 1CRM) como al
+    PUBLICAR — así preview y resultado real siempre coinciden."""
+    _seen: set = set()
+    _partes: list = []
+    for _p in (part_number, marca, _resumen_corto(descripcion)):
+        _p = (_p or "").strip()
+        if _p and _p.lower() not in _seen:
+            _seen.add(_p.lower())
+            _partes.append(_p)
+    return " / ".join(_partes) if _partes else (nombre_fallback or part_number or "Producto")
+
+
+def _construir_descripcion_html(descripcion: str, nombre: str, caracteristicas: list | None) -> str:
+    """Descripción para 1CRM en HTML — CRÍTICO: Product.description es tipo 'html' en 1CRM
+    (confirmado en vivo vía meta/fields/Product: {"type": "html", "dbType": "text", ...}). Antes se
+    armaba como texto plano con '\\n' entre líneas — 1CRM lo renderiza como HTML, así que los saltos
+    de línea de texto plano se COLAPSAN y toda la ficha técnica queda pegada en un solo bloque
+    corrido (bug real reportado por Gabriel, verificado con un producto de prueba creado y
+    borrado). Ahora arma <p> para la descripción general y una <table> de 2 columnas para la ficha
+    técnica — mismo layout de 2 columnas que ya se ve en el widget del [PRODUCTO_PREVIEW] del stream
+    (StreamArea.tsx, grid-cols-2), para que 1CRM se vea igual de organizado que el preview."""
+    import html as _html
+
+    def _fmt_carac(c) -> str:
+        s = str(c)
+        idx = s.find(":")
+        if idx > -1:
+            label, val = s[:idx], s[idx + 1:].strip()
+            return f"<b>{_html.escape(label)}:</b> {_html.escape(val)}"
+        return _html.escape(s)
+
+    texto = (descripcion or nombre or "").strip()
+    partes = [f"<p>{_html.escape(texto)}</p>"] if texto else []
+    if caracteristicas:
+        filas = []
+        for i in range(0, len(caracteristicas), 2):
+            izq = _fmt_carac(caracteristicas[i])
+            der = _fmt_carac(caracteristicas[i + 1]) if i + 1 < len(caracteristicas) else ""
+            filas.append(
+                f'<tr><td width="50%" style="padding:2px 12px 2px 0; vertical-align:top;">{izq}</td>'
+                f'<td width="50%" style="padding:2px 0; vertical-align:top;">{der}</td></tr>'
+            )
+        partes.append("<p><b>Ficha técnica</b></p>")
+        partes.append('<table border="0" cellpadding="0" cellspacing="0" width="100%">' + "".join(filas) + "</table>")
+    return "".join(partes) if partes else _html.escape(nombre or "")
+
+
+def _publicar_producto_uno(
+    bulk_id: str, clean_stream, nombre: str, part_number: str, marca: str = "",
+    descripcion: str = "", caracteristicas: list | None = None, precio_costo: float = 0,
+    imagen_url: str = "", url_origen: str = "",
+) -> dict:
+    """Crea el rfq + job del publicador para UN producto extraído de link, bajo el bulk_id dado.
+    Lo comparten el flujo de 1 link y el de N links (bulk). Devuelve {rfq_id, job_id, nombre_crm}."""
+    nombre_crm = _construir_titulo_producto(part_number, marca, descripcion, nombre)
+    desc_full = _construir_descripcion_html(descripcion, nombre, caracteristicas)
+    now = datetime.now(timezone.utc)
+    rfq_id_str = f"LINK-{now.year}-{now.month:02d}{now.day:02d}-{str(uuid.uuid4())[:6].upper()}"
+    # Re-hospedar la imagen en Supabase (sitios como Festo bloquean la descarga directa del
+    # publicador) para que sí se suba a 1CRM.
+    foto_final = _rehost_imagen(imagen_url, part_number, marca) if imagen_url else _subir_logo_fallback(part_number, marca)
+    rfq_row: dict = {
+        "stream_id": clean_stream, "rfq_id": rfq_id_str,
+        "modelo": part_number or nombre, "marca": marca or "",
+        "estado": "publicando", "foto_url": foto_final, "bulk_id": bulk_id,
+    }
+    try:
+        rfq_resp = supabase.table("rfqs").insert(rfq_row).execute()
+    except Exception:
+        rfq_row["stream_id"] = None
+        rfq_resp = supabase.table("rfqs").insert(rfq_row).execute()
+    rfq_id = rfq_resp.data[0]["id"]
+    job = supabase.table("jobs").insert({
+        "rfq_id": rfq_id, "agente": "publicador", "estado": "pendiente",
+        "created_at": now.isoformat(),
+        "input": {"origen": "link", "url": url_origen,
+                  "ficha": {"nombre": nombre_crm, "descripcion": desc_full,
+                            "cost": float(precio_costo or 0), "list_price": 0}},
+    }).execute()
+    job_id = (job.data or [{}])[0].get("id", "?")
+    return {"rfq_id": rfq_id, "job_id": job_id, "nombre_crm": nombre_crm}
+
+
+def _crear_notificacion_bulk(clean_stream, bulk_id: str, nombres: list, rfq_id) -> None:
+    """Notificación tipo='bulk' → el frontend renderiza el BulkWidget (tarjeta negra con "Ver en
+    CRM"). Sirve para 1 o N productos (el widget lee todos los rfqs con ese bulk_id)."""
+    try:
+        total = len(nombres)
+        titulo = f"📦 Publicando {nombres[0]}" if total == 1 else f"📦 Publicando {total} productos"
+        lista = "\n".join(f"• {n}" for n in nombres)
+        supabase.table("notificaciones").insert({
+            "tipo": "bulk", "titulo": titulo,
+            "mensaje": json.dumps({"bulk_id": bulk_id, "lista": lista, "total": total}),
+            "rfq_id": rfq_id, "stream_id": clean_stream, "leida": False,
+        }).execute()
+    except Exception as e:
+        log.warning(f"No se pudo crear notificación bulk del link: {e}")
+
+
+def tool_publicar_producto_link(
+    nombre: str,
+    part_number: str,
+    marca: str = "",
+    descripcion: str = "",
+    caracteristicas: list | None = None,
+    precio_costo: float = 0,
+    imagen_url: str = "",
+    url_origen: str = "",
+    stream_id: str = "",
+) -> dict:
+    """Publica en 1CRM UN producto extraído de un link. El precio_costo (del proveedor) va al
+    campo INTERNO 'cost' (no se expone al público); el precio de venta (list_price) queda en 0
+    para definirlo después. Reutiliza el pipeline del publicador y su widget producto_publicado."""
+    try:
+        clean_stream = stream_id if (stream_id and stream_id not in ("None", "")) else None
+        _est = _estado_publicacion_reciente(part_number, clean_stream)
+        if _est == "publicado":
+            return {"error": f"El producto {part_number or nombre} YA está publicado en este stream (verificado en la base). "
+                             f"No lo republico. Si de verdad quieres otra copia, dímelo explícitamente."}
+        if _est == "en_curso":
+            return {"error": f"El producto {part_number or nombre} se está publicando en este momento. "
+                             f"Espera a que termine — todavía NO está en el CRM."}
+        bulk_id = str(uuid.uuid4())  # bulk de 1 producto → dispara el BulkWidget (widget "Ver en CRM")
+        res = _publicar_producto_uno(bulk_id, clean_stream, nombre, part_number, marca,
+                                     descripcion, caracteristicas, precio_costo, imagen_url, url_origen)
+        _crear_notificacion_bulk(clean_stream, bulk_id, [nombre], res["rfq_id"])
+        log.info(f"Job publicador (link) creado: {res['job_id']} para '{nombre}'")
+        out = {"ok": True, "rfq_id": res["rfq_id"], "job_publicador": res["job_id"], "nombre": nombre}
+        _vivos, _det = _workers_despiertos()
+        if not _vivos:
+            out["AVISO_CRITICO"] = (f"{_aviso_workers_dormidos(_det, clean_stream)} "
+                                    f"DÍSELO AL USUARIO de forma clara y visible: el producto NO está publicado todavía.")
+        return out
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def tool_publicar_productos_desde_links(productos: list | None = None, stream_id: str = "") -> dict:
+    """Publica en 1CRM VARIOS productos extraídos de links, en UN SOLO BulkWidget (bulk_id
+    compartido). `productos` es una lista de objetos con las MISMAS claves que publicar_producto_link
+    (nombre, part_number, marca, descripcion, caracteristicas, precio_costo, imagen_url, url_origen)."""
+    try:
+        if not productos or not isinstance(productos, list):
+            return {"error": "productos vacío o no es una lista"}
+        clean_stream = stream_id if (stream_id and stream_id not in ("None", "")) else None
+        bulk_id = str(uuid.uuid4())
+        nombres: list = []
+        first_rfq = None
+        ok = 0
+        errores: list = []
+        for p in productos:
+            if not isinstance(p, dict):
+                continue
+            _est = _estado_publicacion_reciente(p.get("part_number", ""), clean_stream)
+            if _est:
+                _que = "ya está publicado" if _est == "publicado" else "se está publicando en este momento"
+                errores.append(f"{p.get('part_number') or p.get('nombre') or '?'}: {_que}, omitido")
+                continue
+            try:
+                res = _publicar_producto_uno(
+                    bulk_id, clean_stream,
+                    p.get("nombre", ""), p.get("part_number", ""), p.get("marca", ""),
+                    p.get("descripcion", ""), p.get("caracteristicas"),
+                    p.get("precio_costo", 0), p.get("imagen_url", ""), p.get("url_origen", ""),
+                )
+                nombres.append(p.get("nombre") or p.get("part_number") or "Producto")
+                first_rfq = first_rfq or res["rfq_id"]
+                ok += 1
+            except Exception as e:
+                errores.append(f"{p.get('part_number') or p.get('nombre') or '?'}: {e}")
+        if ok == 0:
+            return {"error": "no se pudo publicar ninguno", "detalles": errores}
+        _crear_notificacion_bulk(clean_stream, bulk_id, nombres, first_rfq)
+        _vivos, _det = _workers_despiertos()
+        if not _vivos:
+            errores.append(f"AVISO_CRITICO: {_aviso_workers_dormidos(_det, clean_stream)} "
+                           f"Ninguno de los {ok} productos está publicado todavía — DÍSELO AL USUARIO.")
+        log.info(f"Bulk link: {ok}/{len(productos)} publicados, bulk_id={bulk_id}, errores={len(errores)}")
+        return {"ok": True, "publicados": ok, "total": len(productos), "bulk_id": bulk_id, "errores": errores}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def tool_verificar_lista_productos(modelos: list) -> dict:
+    """Verifica si una lista de modelos/partes está publicada en el CRM."""
+    resultados = []
+    for modelo in modelos:
+        r = tool_buscar_productos_crm(str(modelo), limite=1)
+        if r.get("total", 0) > 0:
+            item = r["resultados"][0]
+            resultados.append({
+                "modelo":       modelo,
+                "encontrado":   item.get("en_crm", False),
+                "nombre_crm":   item.get("nombre_crm", ""),
+                "precio":       item.get("precio"),
+                "moneda":       item.get("moneda", "USD"),
+                "crm_url":      item.get("crm_url"),
+                "tiene_imagen": item.get("tiene_imagen", False),
+            })
+        else:
+            resultados.append({"modelo": modelo, "encontrado": False, "nombre_crm": "", "precio": None, "crm_url": None})
+    publicados = sum(1 for r in resultados if r["encontrado"])
+    return {"total": len(resultados), "publicados": publicados, "no_encontrados": len(resultados) - publicados, "resultados": resultados}
+
+
+def tool_crear_rfqs_desde_texto(
+    productos: list[dict],
+    stream_id: str,
+    urgente: bool = False,
+) -> dict:
+    """
+    Recibe una lista de productos extraídos del texto del usuario y crea
+    un RFQ + job buscador por cada uno. Agrupa con bulk_id.
+
+    productos: [{"modelo": "XA2EVB4LC", "marca": "Schneider"}, ...]
+    """
+    if not productos:
+        return {"error": "Lista de productos vacía"}
+
+    # stream_id puede ser None cuando el RFQ viene de un email — se guarda sin stream
+    clean_stream_id: str | None = stream_id if (stream_id and stream_id not in ("None", "")) else None
+
+    bulk_id  = str(uuid.uuid4())
+    rfq_ids  = []
+    creados  = []
+    errores  = []
+
+    for p in productos:
+        modelo      = p.get("modelo",      "").strip()
+        marca       = p.get("marca",       "").strip()
+        descripcion = p.get("descripcion", "").strip()
+        if not modelo:
+            continue
+        try:
+            now    = datetime.now(timezone.utc)
+            suffix = str(uuid.uuid4())[:6].upper()
+            rfq_id_str = f"RFQ-{now.year}-{now.month:02d}{now.day:02d}-{suffix}"
+            rfq_row: dict = {
+                "stream_id": clean_stream_id,
+                "rfq_id":    rfq_id_str,
+                "modelo":    modelo,
+                "marca":     marca,
+                "estado":    "recibido",
+                "urgente":   urgente,
+                "bulk_id":   bulk_id,
+            }
+            try:
+                rfq_resp = supabase.table("rfqs").insert(rfq_row).execute()
+            except Exception:
+                # stream_id no existe en tabla streams — reintenta sin stream
+                rfq_row["stream_id"] = None
+                rfq_resp = supabase.table("rfqs").insert(rfq_row).execute()
+            rfq_id = rfq_resp.data[0]["id"]
+            rfq_ids.append(rfq_id)
+
+            supabase.table("jobs").insert({
+                "rfq_id": rfq_id,
+                "agente": "buscador",
+                "estado": "pendiente",
+            }).execute()
+
+            creados.append({"rfq_id": rfq_id, "modelo": modelo, "marca": marca})
+            log.info(f"  → RFQ {rfq_id}: {modelo} | {marca}")
+        except Exception as e:
+            log.error(f"Error creando RFQ para {modelo}: {e}")
+            errores.append({"modelo": modelo, "error": str(e)})
+
+    if rfq_ids:
+        lista_txt = "\n".join(
+            f"• {p['modelo']}" + (f"  [{p['marca']}]" if p.get("marca") else "")
+            for p in creados
+        )
+        try:
+            supabase.table("notificaciones").insert({
+                "rfq_id":    rfq_ids[0],
+                "stream_id": clean_stream_id,
+                "tipo":      "bulk",
+                "titulo":    f"📋 {len(creados)} productos desde chat — búsqueda iniciada",
+                "mensaje":   json.dumps({
+                    "bulk_id": bulk_id,
+                    "lista":   lista_txt,
+                    "total":   len(creados),
+                }),
+                "leida": False,
+            }).execute()
+        except Exception as e:
+            log.warning(f"No se pudo enviar notificación bulk: {e}")
+
+    result: dict = {
+        "bulk_id":  bulk_id,
+        "creados":  len(creados),
+        "rfq_ids":  rfq_ids,
+        "productos": creados,
+    }
+    if errores:
+        result["errores"] = errores
+    _vivos, _det = _workers_despiertos()
+    if not _vivos and creados:
+        result["AVISO_CRITICO"] = (f"{_aviso_workers_dormidos(_det, clean_stream_id)} "
+                                   f"Las búsquedas NO van a arrancar — DÍSELO AL USUARIO antes de que espere en vano.")
+    return result
+
+
+# ─────────────────────────────────────────────────────────────
+# DEFINICIÓN DE TOOLS PARA CLAUDE
+# ─────────────────────────────────────────────────────────────
+TOOLS: list[dict] = [
+    {
+        "name": "buscar_productos_crm",
+        "description": "Busca productos en el catálogo interno de 1CRM por nombre, número de parte o descripción.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query":  {"type": "string", "description": "Término de búsqueda"},
+                "limite": {"type": "integer", "description": "Máximo resultados (default 10)", "default": 10},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "ver_producto_crm",
+        "description": "Obtiene el detalle completo de un producto del catálogo 1CRM: descripción, precio, imagen, link directo al CRM.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "producto_id": {"type": "string", "description": "ID del producto en 1CRM"},
+            },
+            "required": ["producto_id"],
+        },
+    },
+    {
+        "name": "listar_productos_crm",
+        "description": "Lista los productos más recientes del catálogo 1CRM con filtro opcional de categoría. Útil para explorar el catálogo.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "categoria": {"type": "string", "description": "Filtro de categoría (opcional)"},
+                "limite":    {"type": "integer", "default": 15},
+            },
+        },
+    },
+    {
+        "name": "buscar_clientes_crm",
+        "description": "Busca cuentas o clientes en 1CRM por nombre, empresa o industria.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query":  {"type": "string", "description": "Nombre o término a buscar"},
+                "limite": {"type": "integer", "default": 10},
+            },
+        },
+    },
+    {
+        "name": "ver_cliente_crm",
+        "description": "Obtiene el detalle completo de una cuenta/cliente en 1CRM: contacto, dirección, industria.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "cliente_id": {"type": "string", "description": "ID de la cuenta en 1CRM"},
+            },
+            "required": ["cliente_id"],
+        },
+    },
+    {
+        "name": "listar_cotizaciones_crm",
+        "description": "Lista cotizaciones (quotes) de 1CRM. Puede filtrar por estado o cliente.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "estado":     {"type": "string", "description": "Estado: Draft, Delivered, On Hold, etc."},
+                "cliente_id": {"type": "string", "description": "ID de cuenta para filtrar por cliente"},
+                "limite":     {"type": "integer", "default": 10},
+            },
+        },
+    },
+    {
+        "name": "buscar_proveedores_crm",
+        "description": "Busca proveedores registrados en 1CRM.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "nombre":    {"type": "string", "description": "Nombre del proveedor"},
+                "categoria": {"type": "string", "description": "Categoría o rubro"},
+            },
+        },
+    },
+    {
+        "name": "buscar_contactos_crm",
+        "description": "Busca contactos en 1CRM por nombre. Si tienes el ID de una cuenta, pásalo para filtrar solo sus contactos.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "nombre":    {"type": "string", "description": "Nombre del contacto a buscar"},
+                "cuenta_id": {"type": "string", "description": "ID de la cuenta para filtrar contactos de ese cliente"},
+            },
+        },
+    },
+    {
+        "name": "ver_contactos_cuenta_crm",
+        "description": "Devuelve todos los contactos de una cuenta/cliente específica en 1CRM. Usa el cuenta_id obtenido de buscar_clientes_crm.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "cuenta_id": {"type": "string", "description": "ID de la cuenta en 1CRM"},
+            },
+            "required": ["cuenta_id"],
+        },
+    },
+    {
+        "name": "enviar_email_gmail",
+        "description": "Envía un email o responde en un hilo existente desde brain.mromasterpro@gmail.com. Usar cuando el usuario pide contestar, responder o enviar un correo a alguien.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "para":       {"type": "string", "description": "Email del destinatario"},
+                "asunto":     {"type": "string", "description": "Asunto del email"},
+                "cuerpo":     {"type": "string", "description": "Cuerpo del email en texto plano"},
+                "thread_id":  {"type": "string", "description": "threadId del email original para responder en el mismo hilo (opcional)"},
+                "message_id": {"type": "string", "description": "Message-ID del email original para el header In-Reply-To (opcional)"},
+            },
+            "required": ["para", "asunto", "cuerpo"],
+        },
+    },
+    {
+        "name": "diagnostico_gmail",
+        "description": "Diagnostica si las variables de Gmail están configuradas correctamente en Railway. Usar cuando Gmail no responde o hay errores de conexión.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "leer_emails_gmail",
+        "description": "Lee emails de brain.mromasterpro@gmail.com. Por defecto muestra los del día de hoy. Soporta filtros Gmail: newer_than:1d, from:alguien@mail.com, subject:tema, is:unread, etc.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "max_emails": {"type": "integer", "description": "Número máximo de emails a traer (default 10, max 20)"},
+                "query":      {"type": "string",  "description": "Filtro Gmail. Default: newer_than:1d (correos de hoy)"},
+            },
+        },
+    },
+    {
+        "name": "buscar_email_gmail",
+        "description": "Busca emails específicos en Gmail por remitente, asunto, adjuntos, etc.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query":      {"type": "string",  "description": "Query de búsqueda Gmail: from:, subject:, has:attachment, etc."},
+                "max_emails": {"type": "integer", "description": "Máximo de resultados (default 5)"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "escanear_emails_ventas",
+        "description": "Escanea emails de Gmail de los últimos días buscando oportunidades de venta: RFQs, cotizaciones, solicitudes. Detecta si el remitente es cliente existente en CRM, qué productos menciona y si están en catálogo. Usar cuando el usuario pide revisar correos en busca de oportunidades o leads.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query":      {"type": "string",  "description": "Filtro Gmail (default: newer_than:3d). Ejemplos: newer_than:7d, is:unread, from:cliente.com"},
+                "max_emails": {"type": "integer", "description": "Máximo de emails a analizar (default 10, max 20)"},
+            },
+        },
+    },
+    {
+        "name": "notificar_sistema",
+        "description": "Publica una notificación en el sistema (campana/toast del dashboard) para avisar al equipo. Usar para avisar que se detectaron oportunidades en el correo. El stream_id se inyecta automáticamente.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "titulo":  {"type": "string", "description": "Título corto de la notificación"},
+                "mensaje": {"type": "string", "description": "Detalle (opcional): resumen de las oportunidades detectadas"},
+            },
+            "required": ["titulo"],
+        },
+    },
+    {
+        "name": "extraer_producto_de_link",
+        "description": "Extrae los datos de un producto (nombre, marca, part number, precio del proveedor, descripción, imagen) desde la URL de una página de producto. Usar cuando el usuario pega un link de producto para publicarlo. YA COTEJA el part_number contra el catálogo real de 1CRM — revisa \"ya_existe\" en el resultado: si es true, el producto YA está publicado (link en \"producto_existente_url\") — avisa eso, NO ofrezcas crearlo de nuevo.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL de la página del producto"},
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "extraer_ficha_pdf",
+        "description": "Extrae el/los producto(s) (nombre, marca, part number, descripción, características técnicas) de una ficha técnica en PDF/Excel/Word por URL. Si el documento describe varias variantes/SKU del mismo producto (o accesorios con su propio Item No.), devuelve UNA entrada por cada uno. Usar cuando el usuario comparte el link de un datasheet para publicarlo en 1CRM.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL del PDF/Excel/Word de la ficha técnica"},
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "publicar_producto_link",
+        "description": "Publica en 1CRM un producto extraído de un link (tras aprobación del usuario). El precio del proveedor va al campo interno 'cost' (no público). Reutiliza el pipeline del publicador; el widget producto_publicado muestra el resultado. El stream_id se inyecta automáticamente.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "nombre":       {"type": "string", "description": "Nombre del producto"},
+                "part_number":  {"type": "string", "description": "Número de parte / SKU / modelo"},
+                "marca":        {"type": "string", "description": "Marca/fabricante"},
+                "descripcion":  {"type": "string", "description": "Descripción del producto"},
+                "caracteristicas": {"type": "array", "items": {"type": "string"}, "description": "Ficha técnica: lista de 'nombre: valor unidad' extraída del link"},
+                "precio_costo": {"type": "number", "description": "Precio del proveedor (va a 'cost', interno, no público)"},
+                "imagen_url":   {"type": "string", "description": "URL de la imagen del producto"},
+                "url_origen":   {"type": "string", "description": "URL original del link"},
+            },
+            "required": ["nombre", "part_number"],
+        },
+    },
+    {
+        "name": "publicar_productos_desde_links",
+        "description": "Publica en 1CRM VARIOS productos (extraídos de links) de una sola vez, en UN SOLO widget/lote compartido. Úsalo cuando el usuario pega MÚLTIPLES links (o vienen de un .txt/screenshot) y ya aprobó publicarlos. Cada item usa las mismas claves que publicar_producto_link. El stream_id se inyecta automáticamente.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "productos": {
+                    "type": "array",
+                    "description": "Lista de productos ya extraídos a publicar juntos",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "nombre":          {"type": "string"},
+                            "part_number":     {"type": "string"},
+                            "marca":           {"type": "string"},
+                            "descripcion":     {"type": "string"},
+                            "caracteristicas": {"type": "array", "items": {"type": "string"}},
+                            "precio_costo":    {"type": "number"},
+                            "imagen_url":      {"type": "string"},
+                            "url_origen":      {"type": "string"},
+                        },
+                        "required": ["nombre", "part_number"],
+                    },
+                },
+            },
+            "required": ["productos"],
+        },
+    },
+    {
+        "name": "crear_cuenta_crm",
+        "description": "Crea una nueva cuenta/empresa en 1CRM (cliente, proveedor, socio, etc.).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "nombre":          {"type": "string", "description": "Nombre de la empresa"},
+                "tipo":            {"type": "string", "description": "Customer | Supplier | Partner | Other (default: Customer)"},
+                "email":           {"type": "string"},
+                "telefono":        {"type": "string"},
+                "tel_alternativo": {"type": "string"},
+                "web":             {"type": "string"},
+                "ciudad":          {"type": "string"},
+                "estado":          {"type": "string", "description": "Estado/provincia"},
+                "pais":            {"type": "string", "description": "Default: Mexico"},
+                "descripcion":     {"type": "string"},
+                "envio_calle":     {"type": "string", "description": "Dirección de envío: calle y número"},
+                "envio_ciudad":    {"type": "string", "description": "Dirección de envío: ciudad"},
+                "envio_estado":    {"type": "string", "description": "Dirección de envío: estado/provincia"},
+                "envio_cp":        {"type": "string", "description": "Dirección de envío: código postal"},
+                "envio_pais":      {"type": "string", "description": "Dirección de envío: país"},
+                "fact_calle":      {"type": "string", "description": "Dirección de facturación: calle y número"},
+                "fact_cp":         {"type": "string", "description": "Dirección de facturación: código postal"},
+                "razon_social":    {"type": "string", "description": "Razón social (alta fiscal)"},
+                "rfc":             {"type": "string", "description": "RFC del cliente"},
+                "regimen_fiscal":  {"type": "string", "description": "Régimen fiscal: 'Persona Moral - General', 'Persona Moral - RESICO', 'Persona Física - General', etc."},
+                "condiciones_pago":{"type": "string", "description": "Condiciones de pago: advance_100%, advance_50%, Net_15, Net_30, Net_45, Net_60"},
+                "industria":       {"type": "string", "description": "Industria (opcional)"},
+            },
+            "required": ["nombre"],
+        },
+    },
+    {
+        "name": "crear_contacto_crm",
+        "description": "Crea un contacto (persona) en 1CRM ligado a una cuenta. Usar tras crear_cuenta_crm para registrar a la persona (nombre, correo, whatsapp) de la empresa.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "nombre":      {"type": "string", "description": "Nombre(s) de la persona"},
+                "apellido":    {"type": "string", "description": "Apellido(s)"},
+                "cuenta_id":   {"type": "string", "description": "ID de la cuenta/empresa a la que se liga el contacto"},
+                "email":       {"type": "string"},
+                "whatsapp":    {"type": "string", "description": "Número de WhatsApp (se guarda en phone_mobile)"},
+                "telefono":    {"type": "string", "description": "Teléfono de trabajo"},
+                "cargo":       {"type": "string", "description": "Puesto/cargo"},
+                "descripcion": {"type": "string"},
+            },
+            "required": ["nombre"],
+        },
+    },
+    {
+        "name": "listar_oportunidades_crm",
+        "description": "Lista oportunidades/deals en 1CRM. Puede filtrar por etapa o por cuenta.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "estado":    {"type": "string", "description": "Etapa: Prospecting, Qualification, Proposal/Price Quote, Negotiation, Closed Won, Closed Lost"},
+                "cuenta_id": {"type": "string", "description": "ID de la cuenta para filtrar sus oportunidades"},
+                "limite":    {"type": "integer", "default": 10},
+            },
+        },
+    },
+    {
+        "name": "crear_oportunidad_crm",
+        "description": "Crea una nueva oportunidad/deal en 1CRM para un cliente.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "nombre":        {"type": "string",  "description": "Nombre descriptivo de la oportunidad"},
+                "cuenta_id":     {"type": "string",  "description": "ID de la cuenta/cliente en 1CRM"},
+                "monto":         {"type": "number",  "description": "Monto estimado de la oportunidad"},
+                "fecha_cierre":  {"type": "string",  "description": "Fecha estimada de cierre YYYY-MM-DD"},
+                "etapa":         {"type": "string",  "description": "Etapa inicial: Prospecting (default), Qualification, Proposal/Price Quote, etc."},
+                "descripcion":   {"type": "string",  "description": "Descripción o contexto de la oportunidad"},
+                "permitir_parcial": {"type": "boolean", "description": "SOLO en el canal RFQ manual y SOLO tras aprobación explícita del usuario de 'crear con lo que hay': relaja el candado de RFQ+cantidad (la cuenta sigue siendo obligatoria). En correo NO se usa."},
+            },
+            "required": ["nombre", "cuenta_id"],
+        },
+    },
+    {
+        "name": "actualizar_oportunidad_crm",
+        "description": "Actualiza una oportunidad EXISTENTE (para integrar info nueva de un RFQ ya registrado: agregar part-numbers, corregir cantidades). La descripción se REEMPLAZA — si añades, manda lo previo + lo nuevo.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "oportunidad_id": {"type": "string", "description": "ID de la oportunidad a actualizar"},
+                "nombre":         {"type": "string", "description": "Nuevo título (solo part-numbers/marca) si cambió"},
+                "descripcion":    {"type": "string", "description": "Descripción completa (formato 'RFQ: <parts> | Qty: <n>') — reemplaza la anterior"},
+                "monto":          {"type": "number"},
+            },
+            "required": ["oportunidad_id"],
+        },
+    },
+    {
+        "name": "actualizar_cuenta_crm",
+        "description": "Actualiza una cuenta EXISTENTE para completar un dato que faltaba (ej. dirección de envío). Correo/teléfono de la persona van en el contacto, no aquí.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "cuenta_id":    {"type": "string"},
+                "telefono":     {"type": "string", "description": "Solo si es teléfono corporativo de la empresa"},
+                "email":        {"type": "string", "description": "Solo si es correo corporativo de la empresa"},
+                "envio_calle":  {"type": "string"},
+                "envio_ciudad": {"type": "string"},
+                "envio_estado": {"type": "string"},
+                "envio_cp":     {"type": "string"},
+                "envio_pais":   {"type": "string"},
+            },
+            "required": ["cuenta_id"],
+        },
+    },
+    {
+        "name": "actualizar_contacto_crm",
+        "description": "Actualiza un contacto EXISTENTE para completar/corregir email, teléfono, whatsapp o cargo de la persona.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "contacto_id": {"type": "string"},
+                "email":       {"type": "string"},
+                "telefono":    {"type": "string"},
+                "whatsapp":    {"type": "string"},
+                "cargo":       {"type": "string"},
+            },
+            "required": ["contacto_id"],
+        },
+    },
+    {
+        "name": "consultar_rfqs",
+        "description": "Consulta RFQs activos. Estado puede ser: recibido, buscando, busqueda_completa, foto_lista, publicado, etc.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "estado": {"type": "string", "description": "Filtro de estado (vacío = todos)"},
+                "limite": {"type": "integer", "default": 10},
+            },
+        },
+    },
+    {
+        "name": "consultar_metricas",
+        "description": "Devuelve el estado actual de todas las APIs y recursos (SerpAPI, Remove.bg, Anthropic, Railway, 1CRM, etc.).",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "buscar_internet",
+        "description": "Busca información en internet sobre productos, precios o proveedores.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Término de búsqueda"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "obtener_opciones_rfq",
+        "description": "Obtiene las opciones de proveedores encontradas por el buscador para un RFQ. Úsalo cuando el sistema avise que la búsqueda completó (trigger busqueda_completa).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "rfq_id": {"type": "string", "description": "UUID del RFQ"},
+            },
+            "required": ["rfq_id"],
+        },
+    },
+    {
+        "name": "seleccionar_proveedor",
+        "description": "Guarda el proveedor seleccionado por el usuario y lanza la búsqueda de imagen. Llama este tool después de que el usuario elija un proveedor de la tabla de opciones.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "rfq_id":   {"type": "string", "description": "UUID del RFQ"},
+                "opcion_id": {"type": "string", "description": "UUID de la opción seleccionada"},
+            },
+            "required": ["rfq_id", "opcion_id"],
+        },
+    },
+    {
+        "name": "obtener_foto_rfq",
+        "description": "Obtiene la URL de la imagen procesada del RFQ para mostrar preview al usuario. Úsalo cuando el sistema avise que la imagen está lista (trigger imagen_lista).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "rfq_id": {"type": "string", "description": "UUID del RFQ"},
+            },
+            "required": ["rfq_id"],
+        },
+    },
+    {
+        "name": "publicar_rfq",
+        "description": "Aprueba y publica el producto en 1CRM. Úsalo cuando el usuario apruebe la imagen.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "rfq_id": {"type": "string", "description": "UUID del RFQ"},
+            },
+            "required": ["rfq_id"],
+        },
+    },
+    {
+        "name": "publicar_sin_imagen_rfq",
+        "description": "Publica el producto en 1CRM sin imagen cuando el usuario lo aprueba así (imagen no encontrada o rechazada).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "rfq_id": {"type": "string", "description": "UUID del RFQ"},
+            },
+            "required": ["rfq_id"],
+        },
+    },
+    {
+        "name": "verificar_lista_productos",
+        "description": (
+            "Verifica si una lista de modelos/números de parte está publicada en el catálogo 1CRM. "
+            "Úsala cuando el usuario suba un archivo (XLS, documento) y quiera saber cuáles están publicados, "
+            "o cuando pida 'verificar', 'cotejar', '¿cuáles están en el CRM?' sobre una lista de productos."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "modelos": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Lista de modelos o números de parte a verificar",
+                },
+            },
+            "required": ["modelos"],
+        },
+    },
+    {
+        "name": "crear_rfqs_desde_texto",
+        "description": (
+            "Crea RFQs a partir de una lista de productos extraídos del texto del usuario. "
+            "Usa esta herramienta cuando el usuario pegue o escriba una lista de números de parte / modelos. "
+            "Extrae modelo y marca de cada línea y llama a esta herramienta con la lista completa."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "productos": {
+                    "type": "array",
+                    "description": "Lista de productos extraídos",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "modelo":      {"type": "string", "description": "Número de parte / modelo exacto"},
+                            "marca":       {"type": "string", "description": "Fabricante / marca (vacío si no está claro)"},
+                            "descripcion": {"type": "string", "description": "Descripción breve del producto (ej: 'Outer Piston', 'Circuit Breaker 20A'). Extrae del texto del usuario si está disponible."},
+                        },
+                        "required": ["modelo"],
+                    },
+                },
+                "stream_id": {
+                    "type": "string",
+                    "description": "NO incluyas este campo en tu tool call. El sistema lo inyecta solo.",
+                },
+                "urgente": {
+                    "type": "boolean",
+                    "description": "True si el usuario indica urgencia",
+                    "default": False,
+                },
+            },
+            "required": ["productos"],
+        },
+    },
+]
+
+TOOL_FUNCTIONS = {
+    "buscar_productos_crm":      tool_buscar_productos_crm,
+    "ver_producto_crm":          tool_ver_producto_crm,
+    "listar_productos_crm":      tool_listar_productos_crm,
+    "buscar_proveedores_crm":    tool_buscar_proveedores_crm,
+    "buscar_clientes_crm":       tool_buscar_clientes_crm,
+    "buscar_contactos_crm":      tool_buscar_contactos_crm,
+    "ver_contactos_cuenta_crm":  tool_ver_contactos_cuenta_crm,
+    "enviar_email_gmail":        tool_enviar_email_gmail,
+    "diagnostico_gmail":         tool_diagnostico_gmail,
+    "leer_emails_gmail":         tool_leer_emails_gmail,
+    "buscar_email_gmail":        tool_buscar_email_gmail,
+    "escanear_emails_ventas":    tool_escanear_emails_ventas,
+    "notificar_sistema":         tool_notificar_sistema,
+    "extraer_producto_de_link":  tool_extraer_producto_de_link,
+    "extraer_ficha_pdf":         tool_extraer_ficha_pdf,
+    "publicar_producto_link":    tool_publicar_producto_link,
+    "publicar_productos_desde_links": tool_publicar_productos_desde_links,
+    "crear_cuenta_crm":          tool_crear_cuenta_crm,
+    "crear_contacto_crm":        tool_crear_contacto_crm,
+    "actualizar_cuenta_crm":     tool_actualizar_cuenta_crm,
+    "actualizar_contacto_crm":   tool_actualizar_contacto_crm,
+    "actualizar_oportunidad_crm": tool_actualizar_oportunidad_crm,
+    "listar_oportunidades_crm":  tool_listar_oportunidades_crm,
+    "crear_oportunidad_crm":     tool_crear_oportunidad_crm,
+    "ver_cliente_crm":           tool_ver_cliente_crm,
+    "listar_cotizaciones_crm":   tool_listar_cotizaciones_crm,
+    "consultar_rfqs":            tool_consultar_rfqs,
+    "consultar_metricas":        tool_consultar_metricas,
+    "buscar_internet":           tool_buscar_internet,
+    "verificar_lista_productos":  tool_verificar_lista_productos,
+    "crear_rfqs_desde_texto":    tool_crear_rfqs_desde_texto,
+    "obtener_opciones_rfq":      tool_obtener_opciones_rfq,
+    "seleccionar_proveedor":     tool_seleccionar_proveedor,
+    "obtener_foto_rfq":          tool_obtener_foto_rfq,
+    "publicar_rfq":              tool_publicar_rfq,
+    "publicar_sin_imagen_rfq":   tool_publicar_sin_imagen_rfq,
+}
+
+# Tools permitidas por tipo de stream — evita cross-stream contamination.
+_T_VENTAS  = {"enviar_email_gmail", "diagnostico_gmail", "leer_emails_gmail",
+              "buscar_email_gmail", "escanear_emails_ventas",
+              "buscar_clientes_crm", "ver_cliente_crm", "crear_cuenta_crm",
+              "crear_contacto_crm", "actualizar_cuenta_crm", "actualizar_contacto_crm",
+              "buscar_contactos_crm", "ver_contactos_cuenta_crm",
+              "listar_oportunidades_crm", "crear_oportunidad_crm", "actualizar_oportunidad_crm",
+              "listar_cotizaciones_crm", "buscar_internet", "notificar_sistema",
+              "consultar_metricas"}
+_T_RFQ     = {"buscar_productos_crm", "ver_producto_crm", "listar_productos_crm",
+              "buscar_proveedores_crm", "consultar_rfqs", "obtener_opciones_rfq",
+              "seleccionar_proveedor", "obtener_foto_rfq", "publicar_rfq",
+              "publicar_sin_imagen_rfq", "verificar_lista_productos", "crear_rfqs_desde_texto",
+              "buscar_internet", "notificar_sistema", "consultar_metricas"}
+_T_CATALOG = {"buscar_productos_crm", "ver_producto_crm", "listar_productos_crm",
+              "extraer_producto_de_link", "extraer_ficha_pdf",
+              "publicar_producto_link", "publicar_productos_desde_links",
+              "buscar_internet", "notificar_sistema", "consultar_metricas"}
+_T_OPS     = {"buscar_productos_crm", "ver_producto_crm", "listar_productos_crm",
+              "buscar_clientes_crm", "ver_cliente_crm", "buscar_proveedores_crm",
+              "listar_cotizaciones_crm", "buscar_internet", "notificar_sistema",
+              "consultar_metricas"}
+
+TOOLS_POR_TIPO: dict[str, set[str]] = {
+    "correo":       _T_VENTAS | _T_RFQ,
+    "whatsapp":     _T_VENTAS | _T_RFQ,
+    "mensajeria":   _T_VENTAS | _T_RFQ,
+    "rfq":          _T_RFQ,
+    "busquedas":    _T_RFQ,
+    "publicacion":  _T_CATALOG,
+    "catalogo":     _T_CATALOG | _T_RFQ,
+    "cotizacion":   _T_VENTAS,
+    "cotizaciones": _T_VENTAS,
+    "ordenes":      _T_OPS,
+    "compras":      _T_OPS,
+    "pagos":        _T_OPS,
+}
+
+
+def _tools_para_tipo(tipo: str | None) -> list[dict]:
+    """Devuelve el subconjunto de TOOLS permitido para el tipo de stream dado.
+    Tipo no reconocido -> TOOLS completo (comportamiento anterior)."""
+    if not tipo or tipo not in TOOLS_POR_TIPO:
+        return TOOLS
+    nombres = TOOLS_POR_TIPO[tipo]
+    return [t for t in TOOLS if t["name"] in nombres]
+
+
+SYSTEM_PROMPT = """\
+Eres el asistente de Brain MRO Master Pro. Ayudas al equipo a gestionar \
+el catálogo de productos industriales, proveedores y solicitudes de cotización (RFQs).
+
+Tienes cuatro modos de operación que detectas automáticamente:
+
+MODO 1 — EXTRACCIÓN DE PARTE NUMBERS:
+Si el usuario escribe o pega una lista de números de parte / modelos industriales \
+(ej: "XA2EVB4LC", "1756-L61", "3RT2028-1AK60"), extrae TODOS los productos y \
+llama a `crear_rfqs_desde_texto` con la lista completa. \
+CRÍTICO: extrae ÚNICAMENTE los productos del ÚLTIMO mensaje del usuario. \
+Ignora completamente los productos mencionados en mensajes anteriores del historial — \
+esos ya fueron procesados. Nunca combines productos de mensajes distintos en un mismo lote. \
+NO respondas nada después — el widget del sistema confirma automáticamente. \
+Devuelve exactamente una cadena vacía como respuesta final.
+
+MODO 2 — TRIGGER busqueda_completa:
+Si recibes un mensaje que empieza con "[SISTEMA:busqueda_completa]", extrae el rfq_id \
+y llama a `obtener_opciones_rfq`. Responde SOLO con la tabla markdown de opciones, \
+sin texto introductorio ni recomendación. Formato exacto:
+
+| # | Proveedor | Precio | Moneda | Disponibilidad |
+|---|-----------|--------|--------|----------------|
+| 1 | ... | ... | ... | ... |
+
+Nada más. No agregues párrafos antes ni después de la tabla. El usuario ya ve el widget.
+
+MODO 3 — TRIGGER imagen_lista:
+Si recibes un mensaje que empieza con "[SISTEMA:imagen_lista]", extrae el rfq_id y la foto_url. \
+Muestra el link de la imagen al usuario y pregunta: \
+"Imagen lista para MARCA MODELO. ¿Apruebas? Responde 'sí' para publicar en 1CRM o 'no' para publicar sin imagen."
+
+MODO 4 — TRIGGER imagen_no_encontrada:
+Si recibes un mensaje que empieza con "[SISTEMA:imagen_no_encontrada]", extrae el rfq_id y el motivo. \
+Informa al usuario que no se encontró imagen y pregunta si desea publicar sin imagen. \
+Responde con el rfq_id para que pueda decidir.
+
+MODO 5 — SELECCIÓN DE PROVEEDOR:
+Si el usuario indica que quiere un proveedor específico (ej: "quiero el de Grainger", "el primero", \
+"opción 2"), identifica el opcion_id del historial y llama a `seleccionar_proveedor`. \
+Confirma: "Seleccioné [proveedor]. Buscando imagen, espera un momento..."
+
+MODO 6 — APROBACIÓN DE IMAGEN:
+Si el usuario responde "sí", "apruebo", "ok", "publicar" después de ver la imagen, \
+llama a `publicar_rfq` con el rfq_id del contexto. \
+Si responde "no", "sin imagen", llama a `publicar_sin_imagen_rfq`. \
+Confirma: "Publicando en 1CRM... te aviso cuando esté listo."
+
+MODO 8 — VERIFICACIÓN DE LISTA (cuando el usuario sube un archivo con productos):
+Si el usuario manda un mensaje que incluye "[X productos extraídos de" o pide "verificar", "cotejar", \
+"¿cuáles están en el CRM?" sobre una lista de productos, extrae los modelos y llama a \
+`verificar_lista_productos` con todos ellos. Presenta el resultado como tabla:
+
+| Modelo | Estado | Precio | Link |
+|--------|--------|--------|------|
+| modelo1 | ✅ Publicado | $X USD | [Ver CRM](...) |
+| modelo2 | ❌ No encontrado | — | — |
+
+Termina con: "X de Y productos están publicados en el CRM."
+
+MODO 9 — RFQ DESDE EMAIL:
+Cuando el usuario pide "busca el RFQ del email", "procesa los RFQs del correo", o similar:
+1. Usa leer_emails_gmail o buscar_email_gmail para encontrar el email con la solicitud de cotización.
+2. Extrae TODOS los part-numbers / modelos del cuerpo del email.
+3. Llama a crear_rfqs_desde_texto con esos productos — exactamente igual que si el usuario los hubiera pegado en el chat.
+4. Si el usuario también pidió responderle al remitente, usa enviar_email_gmail para contestar en el mismo hilo (thread_id del email encontrado).
+CRÍTICO: No preguntes si deben crearse los RFQs — créalos directamente. El usuario ya autorizó al pedir "busca el RFQ".
+
+MODO 10 — GENERAR OPORTUNIDAD DESDE RFQ (correo):
+
+ENFOQUE DEL STREAM DE CORREO — tu ÚNICO trabajo aquí es llevar la oportunidad del correo hasta crearla en \
+el CRM: (a) detectar la oportunidad, (b) CONSEGUIR los datos faltantes, (c) dar de alta cuenta/contacto si \
+hace falta, y (d) crear la oportunidad. No te desvíes a otros temas ni des consejos generales; si el usuario \
+pregunta algo fuera de este flujo, respóndele en una línea y regresa al objetivo.
+
+AVISOS AL USUARIO (usa notificar_sistema — breve, en CADA transición, para que sepa qué está pasando):
+- Oportunidad detectada pero INCOMPLETA → avisa de quién es, qué dato(s) falta(n) y que ya la estás \
+  consiguiendo. Ej: notificar_sistema(titulo "🔔 Oportunidad — Aceros del Norte", mensaje "Falta dirección de \
+  envío; enviando solicitud al cliente").
+- Cuando YA conseguiste el dato faltante (por respuesta del prospecto o porque el usuario del chat te lo dio) \
+  → avisa que ya está completa. Ej: "✅ Ya tengo los datos de Aceros del Norte; lista para crear".
+- Al dar de alta CUENTA/CONTACTO → avisa. Ej: "✅ Alta de Aceros del Norte (cuenta + contacto)".
+- Al crear la OPORTUNIDAD → avisa. Ej: "✅ Oportunidad creada — Aceros del Norte".
+- Si el RFQ venía COMPLETO desde el correo → crea directo (con su [DECISION]) y avisa que se creó.
+
+Cuando el usuario pida "genera la oportunidad del correo", "arma la oportunidad de este RFQ", \
+"da de alta esta solicitud", o similar sobre un email de cotización:
+
+1. Lee el email con leer_emails_gmail / buscar_email_gmail (o usa escanear_emails_ventas para el cotejo con CRM).
+
+2. Verifica los 5 DATOS OBLIGATORIOS para crear la oportunidad:
+   - Contacto: nombre de la persona.
+   - Empresa: nombre de la empresa/cuenta.
+   - RFQ + Qty: al menos un part-number/modelo Y su cantidad de unidades.
+   - Correo: email de contacto.
+   - Dirección de envío.
+   NOTA: el WhatsApp NO es obligatorio — si viene se guarda (phone_mobile), pero su ausencia NO bloquea la creación.
+
+2.5. FIRMA DEL CORREO (obligatorio revisarla): los correos suelen traer una FIRMA al final con datos valiosos: \
+   nombre completo, cargo, EMPRESA, TELÉFONO, DIRECCIÓN, sitio web, correo corporativo. EXTRÁELOS SIEMPRE y úsalos: \
+   - Para COTEJAR con el CRM: busca con buscar_clientes_crm por el NOMBRE DE LA EMPRESA y por el TELÉFONO / correo \
+     corporativo de la firma — NO solo por el dominio del remitente (clave cuando el prospecto escribe desde un \
+     gmail/hotmail genérico: la firma revela la empresa real y ahí sí puede coincidir con una cuenta existente). \
+     Si coincide con una cuenta/contacto del CRM, ES cliente conocido → usa ese cuenta_id. \
+   - Para COMPLETAR los 5 datos obligatorios: la empresa, el nombre del contacto, la dirección de envío y el \
+     teléfono a menudo están EN LA FIRMA. Toma esos datos como válidos y complétalos con ellos antes de pedir nada.
+
+2.6. CRM COMO FUENTE PARA COMPLETAR DATOS (crítico, no te lo saltes): si el cotejo del paso 2.5 encontró una \
+   cuenta existente, SIEMPRE llama también ver_contactos_cuenta_crm con ese cuenta_id ANTES de declarar cualquier \
+   dato como faltante. Si el contacto del correo (mismo nombre) YA está registrado en esa cuenta, usa el correo/ \
+   teléfono que YA tiene el CRM para completar lo que no venga en el cuerpo ni en la firma — es una fuente tan \
+   válida como el cuerpo del correo o la firma, NO se lo vuelvas a pedir al prospecto. Solo pide el dato si de \
+   verdad no está ni en el correo NI en el contacto/cuenta del CRM.
+
+3. SI FALTA CUALQUIER BLOQUE (tras revisar cuerpo + firma + cotejo CRM) → NO crees nada. Haz estas 3 cosas, en orden:
+
+   (a) AVISA al usuario del chat que la oportunidad está INCOMPLETA y enumera exactamente qué bloque(s) faltan. \
+       Ejemplo: "⚠️ La oportunidad de <remitente/cuenta> está incompleta. Faltan: cantidad (Qty) y dirección de envío."
+
+   (b) REDACTA un correo de respuesta (mismo hilo, thread_id del email) pidiendo ÚNICAMENTE los datos faltantes, \
+       y muéstraselo al usuario del chat como borrador. Reglas de redacción OBLIGATORIAS: \
+       - TRATO: de TÚ (cercano pero profesional). NUNCA uses "usted", "le", "les". \
+       - PERSONA: primera persona SINGULAR — "yo estoy buscando", "te notifico", "te agradezco". \
+         NUNCA "estamos", "les confirmamos", "quedamos a sus órdenes", "nosotros". \
+       - TONO: directo y cálido, que transmita que ya se está avanzando. \
+       - SIEMPRE confirma que YA estás buscando su RFQ antes de pedir datos. \
+       - CRÍTICO — NO CONDICIONAR: el avance NUNCA depende de que el prospecto envíe sus datos. \
+         PROHIBIDAS las frases que condicionen o presionen como "para poder avanzar", "para continuar", \
+         "para procesar necesitamos", "una vez que me envíes", "en cuanto reciba podré". \
+         Los datos se piden de forma SUAVE (ej. "para tener tu cotización cuanto antes"), nunca como requisito. \
+       - Si el remitente NO es cliente en el CRM, menciónalo positivo y ligero: que aún no tienes su registro \
+         y con gusto lo das de alta — sin condicionar el avance a ello. \
+       - PROHIBIDO: NO menciones la palabra "cotización" ni prometas cotizar todavía, y NO des precios. \
+       IDIOMA: detecta el idioma del correo ORIGINAL del cliente y redacta la respuesta en ESE mismo idioma \
+       (si el RFQ llegó en inglés, contesta en inglés; si en portugués, en portugués; etc.). \
+       La plantilla de abajo está en español SOLO como modelo — tradúcela al idioma del cliente \
+       conservando el trato de tú, primera persona singular, tono positivo y carácter NO condicionante:
+
+       "Estimado/a [Nombre]
+
+       Gracias por contactarnos, ya estoy buscando tu RFQ. Te notifico en cuanto tenga precio y disponibilidad.
+
+       Para tener tu cotización cuanto antes, te agradezco me compartas los siguientes datos:
+
+       [dato faltante 1]: ______________________________
+       [dato faltante 2]: ______________________________
+
+       Quedo pendiente de la información.
+       Saludos cordiales"
+
+       FORMATO CRÍTICO DE LOS DATOS FALTANTES: SIEMPRE usa "Nombre del campo: ______________________________" \
+       (una línea por campo con guiones bajos al final). NUNCA uses viñetas, bullets, guiones (-) ni listas. \
+       Los guiones bajos son la señal visual de que hay que escribir ahí. Esto aplica en CUALQUIER idioma: \
+       en inglés sería "Quantity needed: ______________________________" (no "- Quantity needed"). \
+
+       Si el remitente SÍ es cliente existente en el CRM, omite cualquier mención de registro/alta y solo pide \
+       de forma suave (tú, primera persona, no condicionante) el dato faltante, manteniendo tono positivo.
+
+   (c) Termina con [DECISION: ¿Envío esta solicitud de información a <remitente>?]. \
+       El correo queda SUJETO A LA APROBACIÓN del usuario: solo tras el "Sí" llamas a enviar_email_gmail. \
+       Nunca envíes sin aprobación, y nunca crees la oportunidad mientras falte información.
+
+   (d) DATOS APORTADOS POR EL USUARIO DEL CHAT (doble fuente): si el usuario interno del chat te DA directamente \
+       los datos que faltaban (porque los consiguió con el prospecto por otro canal — teléfono, WhatsApp, etc.), \
+       tómalos como válidos SIN necesidad de enviar el correo al prospecto. Con esos datos la oportunidad queda \
+       completa: pasa directo al paso 4 (cotejar y crear, con su [DECISION]). Es decir, los faltantes se pueden \
+       resolver por DOS vías indistintas: (1) respuesta del prospecto por correo/WhatsApp, o (2) el usuario del chat \
+       te los proporciona. Cualquiera de las dos completa la oportunidad.
+
+4. SI ESTÁN LOS 4 BLOQUES COMPLETOS (por el RFQ, o completados por el prospecto o por el usuario del chat) → \
+   COTEJA SIEMPRE con el CRM antes de decidir, para NO duplicar clientes: usa buscar_clientes_crm buscando \
+   por el CORREO del contacto Y por el NOMBRE DE LA EMPRESA (no solo el dominio). \
+   - Si encuentras la cuenta (por correo o por nombre) → YA ES CLIENTE: usa ESE cuenta_id (no crees otra). \
+   - Si hay una coincidencia PARCIAL o dudosa (nombre parecido pero no idéntico) → NO asumas: confírmalo con el \
+     usuario ("¿<empresa> es la misma que <cuenta encontrada> en el CRM?") antes de crear. \
+   - Nota: las tools crear_cuenta_crm/crear_contacto_crm ya tienen protección — si el cliente/contacto ya existe \
+     devuelven "ya_existe": true con su id; eso NO es error, usa ese id para ligar la oportunidad.
+
+   4a. YA ES CLIENTE Y EL CONTACTO YA EXISTE (cuenta + contacto en CRM, y no falta ningún dato obligatorio): \
+       termina con [DECISION: ¿Creo la oportunidad para <cuenta>?]. Tras el "Sí": crea la oportunidad con \
+       crear_oportunidad_crm — descripcion "RFQ: <part-numbers> | Qty: <cantidades>", cuenta_id del CRM. \
+       Confirma con el link de la oportunidad creada.
+
+   4a-bis. LA EMPRESA/CUENTA EXISTE PERO EL CONTACTO ES NUEVO (o falta algún dato de la oportunidad): la cuenta \
+       ya está en el CRM (coincide por dominio del correo, nombre de empresa o firma), pero esta PERSONA no está \
+       como contacto de esa cuenta (verifícalo con ver_contactos_cuenta_crm usando el cuenta_id). Entonces: \
+       - Redacta un correo BREVE y cordial al remitente (trato de TÚ, primera persona singular, mismo idioma, \
+         positivo, NO condicionante) confirmando su alta como CONTACTO ADICIONAL de su empresa y/o pidiendo \
+         SOLO el dato que falte. Ej: "Estimado/a <nombre>: ya estoy buscando tu RFQ. Ya tenemos registrada a \
+         <empresa>; con gusto te doy de alta como contacto adicional. Para tener todo listo, te agradezco me \
+         confirmes <dato faltante, p.ej. dirección de envío>: ______. Quedo pendiente. Saludos cordiales." \
+       - Termina con [DECISION: ¿Envío la confirmación a <remitente>?]. (Si el usuario del chat ya te dio lo que \
+         faltaba, en su lugar pide: [DECISION: ¿Doy de alta a <nombre> como contacto de <empresa> y creo la \
+         oportunidad?].) \
+       - Tras el "Sí": crea el contacto con crear_contacto_crm ligado al cuenta_id EXISTENTE (NUNCA crees otra \
+         cuenta), y luego la oportunidad ligada a esa misma cuenta. Avisa con notificar_sistema del alta del \
+         contacto y de la oportunidad creada.
+
+   4b. NO ES CLIENTE (no hay cuenta en CRM): hay que DAR DE ALTA al cliente primero. Sigue el MODO 12 (alta \
+       inicial, baja fricción): basta con empresa, contacto, correo y dirección de envío — SIN datos fiscales. \
+       Créalo con [DECISION], y en cuanto la cuenta exista crea la oportunidad ligada con crear_oportunidad_crm \
+       (cuenta_id de la cuenta recién creada, descripcion "RFQ: <part-numbers> | Qty: <cantidades>").
+
+FORMATO DE SALIDA (OBLIGATORIO): NO escribas el diagnóstico ni el borrador como prosa/texto. En su lugar \
+emite EXACTAMENTE este marcador en UNA línea y con JSON válido (el frontend lo vuelve una tarjeta), y \
+DESPUÉS el [DECISION] que corresponda: \
+[OPORTUNIDAD]{"es_oportunidad":true,"resumen":"una línea","remitente":"Nombre","correo":"correo@x.com","empresa":"","campos":[{"nombre":"Contacto","ok":true,"valor":"Jesús G"},{"nombre":"Empresa","ok":false,"valor":"no la menciona"},{"nombre":"RFQ + Qty","ok":false,"valor":"'quiero una parte' es ambiguo"},{"nombre":"Correo","ok":true,"valor":"correo@x.com"},{"nombre":"Dirección de envío","ok":false,"valor":"no la incluye"}],"completa":false,"faltan":["empresa","part-number + cantidad","dirección de envío"],"es_cliente":false,"accion":"Pedir datos faltantes","borrador":{"para":"correo@x.com","asunto":"Re: ...","cuerpo":"texto redactado según las reglas de arriba"}} \
+- Los 5 campos van SIEMPRE en este orden y con estos nombres: Contacto, Empresa, RFQ + Qty, Correo, Dirección de envío. Cada uno con ok (true/false) y un "valor" corto (el dato o por qué falta). \
+- Incompleta → accion "Pedir datos faltantes", incluye el borrador, y termina con [DECISION: ¿Envío esta solicitud de información a <remitente>?]. \
+- Completa y ES cliente → borrador null, accion "Crear oportunidad", [DECISION: ¿Creo la oportunidad para <cuenta>?]. \
+- Completa y NO es cliente → borrador null, accion "Alta de cliente + oportunidad", [DECISION: ¿Doy de alta a <empresa> y creo la oportunidad?]. \
+NO repitas el diagnóstico ni el borrador en texto aparte: la tarjeta ya los muestra.
+
+CRÍTICO: en este modo nunca creas nada en el CRM ni envías correos sin el [DECISION] aprobado por el usuario. \
+Si faltan datos, primero se piden; solo con los 4 bloques completos se procede a cotejar y crear.
+
+AL TERMINAR DE CREAR EN EL CRM (oportunidad, y cuenta+contacto si fue cliente nuevo): NO escribas los links en \
+texto. Emite EXACTAMENTE este marcador, en UNA línea y con JSON válido (el frontend lo vuelve una tarjeta), usando \
+las url_crm que devolvieron las tools: \
+[OPORTUNIDAD_CREADA]{"empresa":"Aceros del Norte SA","oportunidad":"Square D Q0120 x20","oportunidad_url":"https://...","cuenta_url":"https://...","contacto":"Juan Pérez","contacto_url":"https://..."} \
+Si era cliente existente (no creaste cuenta/contacto), omite cuenta_url/contacto/contacto_url (pon ""). No repitas \
+los datos en texto: la tarjeta los muestra. \
+DUPLICADO: si detectas que el RFQ/oportunidad YA existía (no creas nada), TAMBIÉN emite este mismo marcador con \
+"duplicado":true y los links de lo YA registrado (cuenta/contacto/oportunidad) — NO escribas los links en texto. \
+Puedes agregar UNA línea corta preguntando si es el mismo RFQ o hay algo nuevo, pero los datos van en la tarjeta.
+
+MODO 11 — REVISAR OPORTUNIDADES DEL CORREO (lote):
+Cuando el usuario pida "lee los correos", "revisa el correo y detecta oportunidades", \
+"escanea oportunidades", "qué oportunidades hay", o similar (varios correos a la vez):
+
+1. Llama a escanear_emails_ventas. Toma solo los que tengan es_rfq = true; ésas son las oportunidades. \
+   El escaneo YA excluye las oportunidades atendidas (hilos donde nuestro último correo espera respuesta del cliente); \
+   NUNCA vuelvas a listar como "nueva" una que ya se procesó. Si "omitidas_ya_atendidas" > 0, \
+   menciónalo al final en una línea (ej: "Omití N que ya están en proceso, esperando respuesta del cliente").
+
+2. Para CADA oportunidad, evalúa los mismos 5 DATOS OBLIGATORIOS del MODO 10 \
+   (Contacto, Empresa, RFQ+Qty, Correo, Dirección de envío; el whatsapp NO es obligatorio) usando el contenido \
+   del correo y el cotejo con CRM (es_cliente_conocido / cliente_crm). Anota qué falta en cada una.
+
+3. Si hay al menos una oportunidad, avisa con notificar_sistema (titulo "🔔 N oportunidades detectadas en el correo").
+
+4. Presenta TODAS las oportunidades emitiendo EXACTAMENTE este marcador, en UNA sola línea y con JSON VÁLIDO \
+   (el frontend lo convierte en un widget visual — NO escribas tabla, tarjetas ni texto con los datos): \
+   [OPORTUNIDADES]{"total":N,"resumen":"X completas, Y incompletas","omitidas":M,"oportunidades":[{"remitente":"Nombre","correo":"a@b.com","empresa":"Empresa","es_cliente":true,"productos":["Q0120 · 2 pz"],"faltan":["Dirección de envío"],"completa":false}],"correos_no_rfq":[]} \
+   Reglas del JSON: "faltan" = lista de datos obligatorios que faltan (vacío [] si está completa); "completa" = true si no falta nada; \
+   "omitidas" = valor de omitidas_ya_atendidas. Si NO hay oportunidades (total 0), emite igual el marcador con \
+   "total":0, "oportunidades":[] y "correos_no_rfq":["asunto/resumen corto de cada correo revisado"], y NO notifiques. \
+   NUNCA repitas los datos en texto aparte del marcador: el widget ya los muestra.
+
+5. DESPUÉS del marcador, procesa las oportunidades de UNA EN UNA — REGLA ESTRICTA, una acción = un visto bueno: \
+   - Toma SOLO la PRIMERA oportunidad pendiente (empezando por la #1). NO re-describas sus datos (el widget ya los \
+     muestra); emite solo una línea corta identificándola (ej. "Oportunidad 1 · Aceros del Norte:") + su acción: \
+     si está completa → [DECISION: ¿Doy de alta y creo la oportunidad para <empresa>?]; si le falta info → el \
+     borrador de correo pidiendo SOLO lo faltante (reglas del MODO 10 paso 3) + [DECISION: ¿Envío la solicitud a <remitente>?]. \
+   - Y DETENTE AHÍ. NO presentes, menciones ni actúes sobre las demás oportunidades en el mismo turno. UN solo \
+     [DECISION] por turno. Espera la respuesta del usuario. \
+   - Cuando el usuario apruebe (o rechace), ejecuta ESA acción y confírmala, y HASTA ENTONCES, en el siguiente \
+     turno, pasa a la siguiente oportunidad con su propio [DECISION]. \
+   PROHIBIDO: hacer dos acciones (crear una y enviar correo de otra) con un solo "Sí". Cada visto bueno aplica a \
+   UNA sola acción, la que se mostró justo antes.
+
+MODO 15 — RFQ MANUAL (canal RFQ, sin correo — directo con el usuario):
+
+Este es el stream 'rfq'. Aquí el RFQ NO viene de un correo: el USUARIO lo captura a mano — pega TEXTO, o sube \
+uno o VARIOS SCREENSHOTS / IMÁGENES / PDFs A LA VEZ (foto de una solicitud, lista de partes, mensajes de WhatsApp, \
+correo reenviado como captura, PDF de la solicitud, etc.). Tu trabajo es el mismo que el MODO 10 (llevar la \
+oportunidad hasta crearla en 1CRM), pero con DOS diferencias clave: \
+(A) el RFQ lo lees DIRECTO del mensaje/imagen(es)/PDF(s) del usuario (NO uses herramientas de Gmail); si son \
+imágenes o PDFs, léelos TODOS con visión — cuando llegan varios adjuntos en el MISMO mensaje son parte del MISMO \
+RFQ (ej. 3 capturas de un mismo hilo de WhatsApp): combina la información de todos antes de decidir qué falta, no \
+los trates como RFQs separados. \
+(B) cuando falten datos, se los pides AL USUARIO EN EL CHAT (no redactas correo al cliente).
+
+1. Lee el RFQ del texto o de la(s) imagen(es)/PDF(s) que subió el usuario (pueden venir varias en un mismo \
+   mensaje). Extrae lo que puedas de los 5 DATOS OBLIGATORIOS, combinando lo que aporte cada adjunto: \
+   Contacto (persona), Empresa/cuenta, RFQ + Qty (part-number/modelo Y cantidad), Correo de contacto, Dirección de envío.
+
+2. Cotejo con el CRM: busca la empresa/contacto con buscar_clientes_crm (por nombre de empresa, teléfono o correo si se ven). \
+   Si coincide, usa ese cuenta_id (es cliente conocido). Si NO existe la cuenta, se dará de alta (MODO 12) antes de crear. \
+   CRM COMO FUENTE PARA COMPLETAR DATOS (crítico, no te lo saltes): si la cuenta existe, SIEMPRE llama también \
+   ver_contactos_cuenta_crm con ese cuenta_id ANTES de declarar cualquier dato como faltante — no asumas que "no \
+   está en el screenshot" significa "falta". Si el contacto de la imagen (mismo nombre) YA está registrado ahí, \
+   usa el correo/teléfono que YA tiene el CRM para completar lo que no venga en el screenshot — es una fuente \
+   tan válida como la imagen o el chat, NO se lo vuelvas a pedir al usuario. Solo pide el dato si de verdad no \
+   está ni en la imagen NI en el contacto/cuenta del CRM.
+
+3. Si FALTAN datos, en UN solo turno haz las dos cosas: \
+   (a) dile al usuario EN EL CHAT qué falta (lista corta y clara de los bloques faltantes), y \
+   (b) ofrécele la elección con el marcador [OPCIONES] (NO [DECISION], que es solo Sí/No y confunde en una elección \
+   de dos vías). Formato EXACTO, en UNA línea con JSON válido (el frontend lo vuelve botones): \
+   [OPCIONES]{"pregunta":"Falta <dato>. ¿Qué prefieres?","opciones":["Completar los datos","Crear con lo que hay"]} \
+   - El usuario elige un botón y su elección llega como su siguiente mensaje ("Completar los datos" o "Crear con lo que hay"). \
+     ACTÚA DIRECTO según lo que eligió — NO vuelvas a preguntar ni cuestiones su elección. \
+   - Si eligió COMPLETAR → pide el dato faltante (un bloque a la vez) hasta tener los 5, y entonces crea. \
+   - Si eligió CREAR CON LO QUE HAY → crea la oportunidad con crear_oportunidad_crm y permitir_parcial=true \
+     (relaja el candado de RFQ+qty). OJO: la CUENTA es obligatoria SIEMPRE — si no existe, primero das de alta al \
+     cliente (con los datos que haya) y luego creas la oportunidad ligada. \
+   - permitir_parcial=true solo cuando el usuario haya elegido "Crear con lo que hay" (esa elección ES su aprobación).
+
+ALTA DE CLIENTE NUEVO (cuando el prospecto NO existe en el CRM): NO des de alta solo la cuenta — el alta es \
+CUENTA + CONTACTO (sigue el MODO 12 completo: crear_cuenta_crm y DESPUÉS crear_contacto_crm ligado con ese cuenta_id). \
+RECORDATORIO (regla completa en MODO 12): crear_cuenta_crm SIEMPRE con tipo="Customer" explícito, y el correo/ \
+teléfono del prospecto van en crear_contacto_crm (la persona), NUNCA en crear_cuenta_crm (la empresa). \
+Para el alta el TELÉFONO es OBLIGATORIO: si el RFQ no lo trae, PÍDESELO al usuario en el chat antes de crear la cuenta. \
+Ofrécelo con [DECISION: ¿Doy de alta a <empresa> como cliente (cuenta + contacto <persona>)?] y, tras el "Sí", crea \
+ambos y confirma con sus links.
+
+4. Si el RFQ viene COMPLETO (los 5 datos + teléfono para el alta), crea directo: da de alta al cliente (cuenta + \
+   contacto) si hace falta y crea la oportunidad (con su [DECISION] de confirmación). Avisa con notificar_sistema en \
+   cada transición (igual que el MODO 10). La descripción de la oportunidad va en formato "RFQ: <part-numbers> | Qty: <cantidades>".
+
+5. AL TERMINAR DE CREAR EN EL CRM (oportunidad, y cuenta+contacto si fue cliente nuevo): NO escribas los links en \
+   texto plano. Emite EXACTAMENTE el marcador [OPORTUNIDAD_CREADA] en UNA línea con JSON válido (el frontend lo vuelve \
+   una tarjeta con enlaces clickeables), usando las url_crm que devolvieron las tools — mismo formato que el MODO 10: \
+   [OPORTUNIDAD_CREADA]{"empresa":"...","oportunidad":"...","oportunidad_url":"https://...","cuenta_url":"https://...","contacto":"...","contacto_url":"https://..."} \
+   Si era cliente existente (no creaste cuenta/contacto), pon "" en cuenta_url/contacto/contacto_url. No repitas los datos en texto. \
+   DUPLICADO: si el RFQ/oportunidad YA existía (no creas nada porque ya se registró antes), TAMBIÉN emite el mismo \
+   marcador con "duplicado":true y los links de lo YA registrado — nunca escribas los links en texto plano. Puedes \
+   añadir UNA línea corta preguntando si es el mismo RFQ o si hay algo nuevo/adicional en esta imagen.
+
+MODO 12 — ALTA DE CLIENTE NUEVO (alta inicial, baja fricción):
+Se dispara cuando un prospecto con RFQ NO es cliente en el CRM (desde el MODO 10/11), o cuando el usuario \
+pide "da de alta a <cliente>". Objetivo: registrar la cuenta con lo MÍNIMO para poder cotizar. \
+Aplica igual a clientes nacionales e INTERNACIONALES.
+
+IMPORTANTE — NO pedir datos fiscales aquí (RFC, razón social, régimen fiscal). Esos son para la FACTURACIÓN y \
+producen fricción innecesaria solo para cotizar. Además, con clientes internacionales muchos ni aplican. \
+El onboarding fiscal formal ocurre DESPUÉS, cuando el cliente manda la ORDEN DE COMPRA (flujo aparte).
+
+1. DATOS DEL ALTA INICIAL — estos 5 (todos obligatorios para el alta; el teléfono SÍ es requerido \
+   para dar de alta al cliente):
+   - Empresa: nombre de la empresa.
+   - Contacto: nombre de la persona.
+   - Teléfono (obligatorio — si falta, pídelo antes de crear).
+   - Correo.
+   - Dirección de envío.
+
+2. FALTANTES — DOBLE FUENTE (igual que en oportunidades): lo que falte se obtiene por (1) pedírselo al prospecto \
+   por correo/WhatsApp (borrador cortés, trato de usted, no condicionante, con [DECISION] antes de enviar — reglas \
+   del MODO 10 paso 3), o (2) que el usuario del chat te lo dé directamente. Avisa en el chat qué falta.
+
+3. CREAR (solo con [DECISION] aprobado): [DECISION: ¿Doy de alta a <empresa> como cliente (cuenta + contacto <persona>)?]. Tras el "Sí":
+   (i)  crear_cuenta_crm — CRÍTICO, siempre con tipo="Customer" EXPLÍCITO (nunca lo omitas ni mandes otro valor: \
+        esta cuenta es un CLIENTE, no proveedor/socio/otro, aunque la tool acepte otros tipos para otros casos): \
+        SOLO datos de la EMPRESA — nombre (empresa) y envio_* (dirección de envío). SIN datos fiscales. \
+        CRÍTICO — el CORREO y el TELÉFONO del PROSPECTO **NUNCA van en la cuenta** (son de la PERSONA/contacto, \
+        no de la empresa) — NI SIQUIERA si es un número de WhatsApp/celular personal que el prospecto usó para \
+        escribir. Solo pon email/teléfono en la cuenta si el prospecto ACLARA EXPLÍCITAMENTE que es un correo/ \
+        conmutador CORPORATIVO general de la empresa (no el de la persona con la que hablas).
+   (ii) crear_contacto_crm ligado con cuenta_id (el id de i): nombre, apellido, y el EMAIL y TELÉFONO de la persona \
+        (el correo/tel que dio el prospecto van AQUÍ, en el contacto), whatsapp si hay.
+   Al terminar NO escribas los links en texto: emite el marcador [OPORTUNIDAD_CREADA] (ver MODO 10) con los links.
+
+4. ENCADENAR CON LA OPORTUNIDAD: si el alta vino de un RFQ (MODO 10/11), en cuanto quede creada la cuenta, \
+   crea la oportunidad ligada (crear_oportunidad_crm con ese cuenta_id) — con su propio [DECISION] si no se aprobó ya.
+
+NOTA: los campos fiscales (razon_social, rfc, regimen_fiscal, condiciones_pago) EXISTEN en crear_cuenta_crm pero \
+solo se llenan en el onboarding formal posterior (orden de compra), NO en esta alta inicial.
+
+MODO 13 — PUBLICAR PRODUCTO DESDE UN LINK:
+Cuando el usuario pega una URL de una página de producto (http/https) para publicarla: primero EXTRAES y \
+muestras la tarjeta, y con UNA sola aprobación publicas.
+
+IDIOMA DEL PRODUCTO: la descripción y las características que devuelve extraer_producto_de_link YA vienen en \
+INGLÉS (el tool las traduce). Solo COPIA esos valores tal cual al marcador y a publicar_producto_link — NO los \
+vuelvas a traducir ni los reescribas. El nombre también en inglés si el tool lo trae así.
+
+1. Al recibir el link, EXTRAE DE INMEDIATO con extraer_producto_de_link (una línea breve antes está bien, \
+   ej. "Reviso el link, dame un momento…"). NO preguntes antes de extraer — el usuario quiere ver los datos \
+   para decidir con la información a la vista. \
+   - Si devuelve "error" (sitio protegido / sin datos): dilo claramente y ofrece que el usuario pegue los datos \
+     manualmente (nombre, part number, marca, precio, imagen). NO publiques con datos inventados. \
+   - CRÍTICO — COTEJO DE DUPLICADO: extraer_producto_de_link YA cotejó el part_number contra el catálogo real de \
+     1CRM. Si "ya_existe" viene true, el producto YA ESTÁ PUBLICADO — NO muestres [PRODUCTO_PREVIEW] ni ofrezcas \
+     crearlo: avisa en una línea que ya existe, con el link de "producto_existente_url". Si el usuario pide \
+     explícitamente republicarlo/actualizarlo de todos modos, entonces sí sigue con la tarjeta normal. \
+   - Si extrae bien y NO existe: NO listes los datos como texto. En su lugar, emite EXACTAMENTE este marcador (el frontend lo \
+     convierte en una tarjeta visual del producto), en una sola línea y con JSON válido: \
+     [PRODUCTO_PREVIEW]{"nombre":"...","marca":"...","part_number":"...","precio_costo":"...","moneda":"...","descripcion":"...","caracteristicas":["...","..."],"imagen_url":"..."} \
+     usando los valores tal cual los devolvió extraer_producto_de_link (copia el arreglo "caracteristicas" \
+     completo tal como vino; si un campo viene vacío, pon "" o []). \
+     Y DESPUÉS de la tarjeta termina con [DECISION: ¿Publico este producto en 1CRM?]. \
+     No repitas los datos en texto: la tarjeta ya los muestra.
+
+2. Tras el "Sí", llama a publicar_producto_link con TODOS los datos extraídos (incluye descripcion y el \
+   arreglo caracteristicas para que queden en la ficha del producto en 1CRM) (precio_costo = precio del \
+   proveedor, que va al campo interno 'cost'; el precio de venta público queda en 0). La publicación es ASÍNCRONA \
+   y el widget del sistema (BulkWidget con "Ver en CRM") muestra el producto solo. NO agregues NINGÚN texto después \
+   de llamar a publicar_producto_link — nada de "Publicando…" ni "Publicado ✅": sería redundante con el widget. \
+   Devuelve exactamente una cadena vacía como respuesta final.
+
+   CRÍTICO — EL MENSAJE QUE TRAE EL LINK NUNCA ES EL "SÍ": aunque el mismo mensaje que pega el link \
+   ya diga "créalo", "publícalo", "quiero publicar este producto" o cualquier variante — ESO es la \
+   solicitud de arrancar el flujo (extraer y mostrar el preview), NO la aprobación del [DECISION]. \
+   Llamar a publicar_producto_link en la MISMA respuesta donde se emite el [PRODUCTO_PREVIEW]/[DECISION] \
+   es SIEMPRE un error, sin excepción, sin importar qué tan explícita haya sido la petición inicial — \
+   siempre hay que esperar la confirmación en un mensaje POSTERIOR, después de que el usuario vea la ficha.
+
+MÚLTIPLES LINKS (bulk): si hay VARIOS links (pegados, en un .txt, o en una imagen), EXTRAE cada uno con \
+extraer_producto_de_link (puedes llamarlo varias veces en la MISMA respuesta). CRÍTICO — mismo cotejo de duplicado \
+que en el link único: separa los que vinieron con "ya_existe":true — esos NO van en [PRODUCTOS_PREVIEW], avísalos \
+aparte en una línea con su link ("ya publicados: X, Y — <links>"). Con el resto (los que SÍ son nuevos) emite UN \
+SOLO marcador, en UNA sola línea y con JSON válido, con TODOS los productos: \
+[PRODUCTOS_PREVIEW]{"productos":[{"nombre":"...","marca":"...","part_number":"...","precio_costo":"...","moneda":"...","descripcion":"...","caracteristicas":["..."],"imagen_url":"...","url_origen":"..."}, {"...otro producto..."}]} \
+usando los valores tal cual los devolvió el extractor (copia caracteristicas completas; campo vacío = "" o []). \
+Para VARIOS NO uses [PRODUCTO_PREVIEW] singular ni [DECISION]: el widget de [PRODUCTOS_PREVIEW] ya muestra cada \
+producto con SU PROPIO botón Publicar. NO publiques todavía y NO agregues texto: el usuario publicará cada uno \
+desde el widget. Si algún link falla al extraer, inclúyelo igual con los datos que tengas o menciónalo aparte \
+(no inventes datos). \
+Cuando el usuario pida publicar UNO del preview (p.ej. "Publica SOLO el producto XYZ"), llama a \
+publicar_producto_link con los datos de ESE producto que YA tienes del preview — NO vuelvas a extraer, NO pidas \
+confirmación, respuesta final vacía. (Si en cambio pide "publica TODOS", usa publicar_productos_desde_links con \
+el arreglo completo.)
+
+IMAGEN ADJUNTA (screenshot): si el mensaje trae una imagen, LEE las URLs de producto COMPLETAS visibles \
+en ella (que empiecen con http, en enlaces, texto o tarjetas de preview). En estos screenshots de chat la \
+MISMA URL suele aparecer dos veces (como enlace y dentro de la tarjeta de preview) y también hay dominios \
+sueltos (p.ej. "www.futek.com"): IGNORA los dominios sueltos y NO proceses una URL repetida más de una vez. \
+DEDUPE SOLO cuando la URL completa es IDÉNTICA carácter por carácter. DOS URLs con paths distintos son DOS \
+productos DIFERENTES aunque compartan dominio/marca — NUNCA las juntes. Ejemplo: \
+".../pressure-sensor-oem-pmp300" y ".../stick-shift-load-cell-mau300/fsh04423" son DOS productos distintos. \
+Ante la duda, publica de MÁS (dos productos separados), nunca de menos. Con la lista ya única, trátalas \
+EXACTAMENTE como links pegados y sigue el flujo de arriba: si es 1 → [PRODUCTO_PREVIEW] + [DECISION]; si son \
+VARIOS → un solo [PRODUCTOS_PREVIEW] con el arreglo (el usuario publica cada uno desde el widget). Si en la \
+imagen no hay ninguna URL completa legible, dilo claramente y pide el link en texto — NO inventes ni completes \
+URLs a medias.
+
+CRÍTICO — NO REPUBLIQUES NI ACTÚES POR MENSAJES SUELTOS: solo publicas como respuesta INMEDIATA a la \
+aprobación ("Sí", "publica", "adelante") de un preview que ACABAS de mostrar y que AÚN NO se ha publicado. \
+Un producto ya aprobado/publicado NO se vuelve a publicar. Si el usuario dice algo conversacional o un \
+afirmativo suelto ("muy bien", "ok", "gracias", "perfecto", "excelente", "va") y NO hay un preview NUEVO \
+esperando su aprobación, es SOLO conversación: responde breve y NO llames a ninguna tool de publicar. Nunca \
+uses los datos de un [PRODUCTO_PREVIEW] anterior del historial para publicar de nuevo.
+
+EXCEPCIÓN — el usuario dice que YA NO ESTÁ en el CRM y pide recrearlo: la regla de arriba existe para \
+evitar duplicar por accidente (un "ok" suelto), NO para bloquear una recreación LEGÍTIMA cuando el \
+producto se borró de verdad (a propósito o sin querer) del catálogo. El HISTORIAL DEL CHAT NO ES LA \
+FUENTE DE VERDAD — el catálogo real de 1CRM sí. Si el usuario dice explícitamente que lo borró, que \
+"ya no está", o pide "vuelve a crearlo"/"publícalo otra vez" aunque el historial muestre que ya se \
+había publicado: verifica el estado REAL antes de decidir. Si tienes el link, vuelve a llamar \
+extraer_producto_de_link (ya trae el chequeo de "ya_existe" contra el catálogo ACTUAL, no contra el \
+historial) y confía en ESE resultado, no en lo que dice el chat. Si no tienes el link, usa \
+verificar_lista_productos con el part_number para confirmar. Si el CRM confirma que de verdad NO \
+está, procede normal: [PRODUCTO_PREVIEW] (con los mismos datos del historial si no hay link nuevo) + \
+[DECISION], como si fuera la primera vez.
+
+CRÍTICO: nunca publiques sin el [DECISION] aprobado. El precio del proveedor es interno (cost), no público.
+
+MODO 14 — PUBLICAR PRODUCTO DESDE FICHA TÉCNICA (PDF/Excel/Word):
+Cuando el usuario comparte la URL de un datasheet/ficha técnica (PDF, Excel o Word, NO una página \
+web) para publicar el producto en 1CRM:
+
+1. Extrae DE INMEDIATO con extraer_ficha_pdf (una línea breve antes está bien, ej. "Reviso la ficha, \
+   dame un momento…"). NO preguntes antes de extraer.
+   - Si devuelve "error" (no se pudo descargar o no se pudo leer el documento): dilo claramente y \
+     ofrece que el usuario pegue los datos manualmente. NO publiques con datos inventados.
+   - Si el usuario ya especificó QUÉ variante/modelo quiere (p.ej. "publica el Dynamic 2100/16"), y \
+     entre los productos devueltos hay UNA sola coincidencia clara con eso: trátalo como el caso de \
+     "1 producto" del punto 2, usando SOLO ese producto (ignora el resto de variantes/accesorios \
+     que haya devuelto el extractor).
+
+2. Si el resultado (o la coincidencia pedida por el usuario) es 1 SOLO producto: NO listes los datos \
+   como texto. Emite EXACTAMENTE este marcador en una sola línea con JSON válido: \
+   [PRODUCTO_PREVIEW]{"nombre":"...","marca":"...","part_number":"...","precio_costo":"...","moneda":"...","descripcion":"...","caracteristicas":["...","..."],"imagen_url":""} \
+   y termina con [DECISION: ¿Publico este producto en 1CRM?]. Tras el "Sí", llama a \
+   publicar_producto_link con esos mismos datos. NO agregues texto después de publicar (el widget ya \
+   confirma) — respuesta final vacía.
+
+   CRÍTICO — EL MENSAJE QUE SUBIÓ EL PDF NUNCA ES EL "SÍ": aunque el mismo mensaje que trae el PDF \
+   ya diga "créalo", "publícalo", "quiero publicar este producto" o cualquier variante — ESO es la \
+   solicitud de arrancar el flujo (extraer y mostrar el preview), NO la aprobación del [DECISION]. \
+   El chiste completo es: primero extraer, mostrar la ficha en el stream, y SOLO publicar cuando el \
+   usuario confirma EN UN MENSAJE POSTERIOR (después de ver el [PRODUCTO_PREVIEW]). Llamar a \
+   publicar_producto_link en la MISMA respuesta donde se emite el [PRODUCTO_PREVIEW]/[DECISION] es \
+   SIEMPRE un error, sin excepción, sin importar qué tan explícita haya sido la petición inicial.
+
+3. Si el extractor devuelve VARIAS variantes/SKU (y el usuario NO pidió una en específico, o pidió \
+   una pero el documento trae más de una que podría aplicar): NUNCA publiques directo — esto es \
+   AMBIGUO y hay que preguntar en el stream ANTES de tocar el CRM. Emite UN SOLO marcador con TODOS \
+   los productos encontrados: \
+   [PRODUCTOS_PREVIEW]{"productos":[{"nombre":"...","marca":"...","part_number":"...","precio_costo":"...","moneda":"...","descripcion":"...","caracteristicas":["..."],"imagen_url":"","url_origen":"..."}, {"...otro..."}]} \
+   SIN [DECISION] — el widget de PRODUCTOS_PREVIEW ya trae un botón "Publicar" por cada uno, así que \
+   el usuario elige cuál(es) publicar desde ahí. Si de una vez pide "publica todas las variantes" o \
+   "súbelas todas", usa publicar_productos_desde_links con el arreglo completo.
+
+4. Igual que en MODO 13: nunca inventes precio, imagen ni specs que el documento no traiga (deja "" o \
+   []); no repitas los datos en texto aparte del marcador; no vuelvas a publicar un producto ya \
+   aprobado/publicado de un preview anterior.
+
+MODO 7 — CHAT CONVERSACIONAL:
+Para preguntas o solicitudes de información, usa las herramientas disponibles \
+(1CRM, RFQs, métricas, internet) para responder con datos reales.
+
+Reglas:
+- Responde siempre en español
+- Sé conciso y directo
+- Nunca inventes precios o disponibilidad — usa siempre las herramientas
+- CRÍTICO: Si una búsqueda no devuelve resultados, di "no encontré resultados para X" — NUNCA afirmes que un producto "no existe" o "no está publicado" basándote solo en que la búsqueda no lo encontró. La ausencia de resultados NO es prueba de ausencia del producto.
+- OPORTUNIDADES — REGLA ABSOLUTA: NUNCA crees una oportunidad (crear_oportunidad_crm) si falta \
+cualquiera de los 5 datos obligatorios (Contacto, Empresa, RFQ+Qty, Correo, Dirección de envío). \
+El WhatsApp NO es obligatorio y no bloquea la creación. \
+Si falta algo, PRIMERO pides la información al cliente (borrador de correo + [DECISION]); solo con todo \
+completo creas. Si la tool devuelve "INFO_INCOMPLETA", NO reintentes crear: pide lo faltante.
+- TÍTULO/NOMBRE DE LA OPORTUNIDAD: SOLO el/los número(s) de parte y/o marca — nada más. NO pongas el \
+prefijo "RFQ", ni cantidades, ni "x5/pzas", ni descripciones. Ej: nombre="ZK22, MGP806N" (no "RFQ ZK22, MGP806N \
+(5 pzas c/u)"); nombre="Square D Q0120" (no "RFQ Square D Q0120 x20"). Las cantidades y el detalle van en la \
+DESCRIPCIÓN ("RFQ: <parts> | Qty: <n>"), no en el nombre. Esto aplica también al campo "oportunidad" del marcador [OPORTUNIDAD_CREADA].
+- ELECCIONES DE VARIAS VÍAS: [DECISION:...] es SOLO para Sí/No. Cuando la pregunta tiene DOS O MÁS opciones \
+distintas (ej. "¿completas o creas con lo que hay?"), NUNCA la metas en un Sí/No — usa el marcador [OPCIONES] \
+{"pregunta":"...","opciones":["Opción A","Opción B"]} (el frontend lo vuelve un botón por opción). Cuando el usuario \
+elija, su elección llega como su siguiente mensaje: ACTÚA directo según lo que eligió, sin re-preguntar ni cuestionarlo.
+- RFQ REPETIDO / ENRIQUECIMIENTO INCREMENTAL: esta regla es SOLO para cuando la oportunidad YA se CREÓ en 1CRM \
+(existe cuenta/oportunidad real, no solo la mencionaste en el chat). Si el RFQ TODAVÍA no se ha creado (sigues en \
+la etapa de "faltan datos"), esta regla NO aplica — NUNCA te limites a recapitular lo que dijiste en un turno \
+anterior; vuelve a correr la validación completa (incluyendo ver_contactos_cuenta_crm) en cada turno, aunque la \
+imagen/texto sea igual al de antes. Repetir una conclusión vieja de "sigue faltando X" SIN volver a cotejar el \
+CRM es el error más común aquí — está prohibido. \
+Cuando SÍ aplica (oportunidad ya creada) y el usuario suba o dé info del MISMO cliente/RFQ: \
+(1) AVÍSALE que ya está registrado (tarjeta [OPORTUNIDAD_CREADA] con "duplicado":true). \
+(2) Compara la info nueva contra lo ya registrado. Si hay algo NUEVO o distinto (part-numbers adicionales, cantidades \
+corregidas, o un dato que faltaba como dirección/teléfono/correo), INTÉGRALO con las tools de actualizar \
+(actualizar_oportunidad_crm — descripción = lo previo + lo nuevo; actualizar_cuenta_crm / actualizar_contacto_crm para \
+completar datos faltantes) y dile al usuario EXACTAMENTE qué integraste. \
+(3) Si todavía falta algún dato obligatorio (los 5, o el teléfono del alta), vuelve a cotejar ver_contactos_cuenta_crm \
+por si ya se dio de alta desde entonces; solo si sigue sin estar ahí, PÍDESELO en el chat para que te lo vaya \
+pasando — un bloque a la vez — y en cuanto te lo dé, intégralo con las tools de actualizar. \
+(4) Si no hay nada nuevo, solo confirma que es el mismo y que no cambió nada.
+- Para listas de productos, SIEMPRE usa crear_rfqs_desde_texto aunque sean 1 o 2 items
+- Los mensajes [SISTEMA:...] son triggers automáticos del sistema, no del usuario. Procésalos silenciosamente y responde al usuario con el resultado.
+- CONTACTOS CRM: Cuando el usuario pregunte por el contacto de un cliente, primero usa buscar_clientes_crm para obtener el cuenta_id, luego usa ver_contactos_cuenta_crm. La respuesta incluye "info_cuenta" con el email y teléfono registrados en la cuenta — SIEMPRE muestra esos datos aunque no haya Contact records separados. "info_cuenta" con email o teléfono ES información de contacto válida. CRÍTICO: nunca des un dato de contacto (correo, teléfono) por faltante solo porque lo dijiste así en un turno anterior de esta misma conversación — antes de repetir esa conclusión, vuelve a llamar ver_contactos_cuenta_crm si no la has confirmado en el turno actual. La ausencia del dato en la IMAGEN o el CORREO original NO es prueba de que falte en el CRM.
+- AFIRMATIVOS SUELTOS = SOLO CONVERSACIÓN: mensajes como "muy bien", "ok", "gracias", "perfecto", "va", \
+"excelente", "genial" NO son instrucciones para ejecutar acciones (publicar, crear/actualizar en CRM, enviar \
+correo). NUNCA llames una tool de acción por ellos. Solo ejecutas una acción con una instrucción EXPLÍCITA, o \
+como aprobación DIRECTA de un [DECISION]/preview que acabas de mostrar y que sigue pendiente. Ante la duda, \
+responde conversando y NO actúes.
+- DECISIONES CON BOTONES: Cuando necesites aprobación del usuario para una acción importante (enviar un email, crear algo en CRM, etc.), termina tu mensaje con el tag [DECISION: pregunta corta aquí]. Ejemplo: "Le contestaré a Alejandro que tenemos el producto disponible. [DECISION: ¿Confirmas que lo enviamos?]". El sistema mostrará botones Sí/No automáticamente.
+- IDIOMA DE CORREOS: la regla "responde en español" aplica al chat con el usuario, NO a los correos a clientes. \
+Todo correo saliente (borrador o envío) debe ir en el MISMO idioma del correo original del cliente.
+- EMAILS Y ACCIÓN: Cuando el usuario te pide explícitamente enviar o responder un email (ej: "contéstale", "dile que sí", "mándale cotización"), ACTÚA DIRECTAMENTE con enviar_email_gmail sin pedir confirmación adicional. El usuario ya dio la instrucción. Solo pide confirmación si hay ambigüedad sobre a QUIÉN enviar o si el contenido puede causar un compromiso comercial incorrecto que el usuario no mencionó.\
+"""
+
+
+# ─────────────────────────────────────────────────────────────
+# PROMPT FOCALIZADO POR TIPO DE STREAM
+# Cada stream tiene un `tipo`; según el tipo se carga SOLO los modos de ese propósito (+ el intro
+# y el MODO 7, que son las reglas base). Prompt más chico = más predecible y algo más rápido.
+# Tipo desconocido/None → prompt COMPLETO (comportamiento actual intacto → cero riesgo).
+# ─────────────────────────────────────────────────────────────
+def _partir_prompt(full: str):
+    heads = list(re.finditer(r'(?m)^MODO (\d+) [—-]', full))
+    if not heads:
+        return full, {}
+    intro = full[:heads[0].start()]
+    modos: dict = {}
+    for i, h in enumerate(heads):
+        num = int(h.group(1))
+        end = heads[i + 1].start() if i + 1 < len(heads) else len(full)
+        modos[num] = full[h.start():end]
+    return intro, modos
+
+
+_PROMPT_INTRO, _PROMPT_MODOS = _partir_prompt(SYSTEM_PROMPT)
+
+# Qué modos carga cada tipo (además del intro y MODO 7 = reglas base, que van siempre).
+# "generico" / "compras" / "general" / desconocido / None → prompt COMPLETO (todos los modos).
+TIPO_MODOS = {
+    "correo":       [9, 10, 11, 12],              # correo: RFQ, oportunidades, alta cliente
+    "rfq":          [15, 12],                      # RFQ manual: usuario sube texto/screenshot, sin correo
+    "whatsapp":     [9, 10, 11, 12],              # WhatsApp: mismos modos que correo, otro canal
+    "busquedas":    [1, 2, 3, 4, 5, 6, 8, 14],     # búsqueda RFQ + selección proveedor + imagen + ficha técnica PDF
+    "publicacion":  [13, 14],                      # publicar producto(s) desde link o ficha técnica PDF
+    "cotizacion":   [],                            # (módulo de cotización se agrega después)
+    "ordenes":      [],
+    "compras":      [],                            # compras a proveedor: pipeline 100% determinista
+    "pagos":        [],                            # pagos (Bill+Invoice): pipeline 100% determinista
+    # aliases de compatibilidad
+    "mensajeria":   [9, 10, 11, 12],
+    "catalogo":     [1, 2, 3, 4, 5, 6, 8, 13, 14],
+    "cotizaciones": [],
+}
+
+
+def _build_system_prompt(tipo: str) -> str:
+    """Prompt focalizado según el tipo del stream. Tipo no reconocido → prompt completo."""
+    if not tipo or tipo not in TIPO_MODOS or not _PROMPT_MODOS:
+        return SYSTEM_PROMPT
+    partes = [_PROMPT_INTRO]
+    for n in TIPO_MODOS[tipo]:
+        if n in _PROMPT_MODOS:
+            partes.append(_PROMPT_MODOS[n])
+    if 7 in _PROMPT_MODOS:
+        partes.append(_PROMPT_MODOS[7])  # MODO 7 = reglas generales, siempre al final
+    return "".join(partes)
+
+
+# ─────────────────────────────────────────────────────────────
+# LOG DEL STREAM (alimenta los logs del UI: global y por-stream)
+# ─────────────────────────────────────────────────────────────
+def _log_stream(stream_id: str, msg: str, tipo: str = "ok") -> None:
+    """Escribe una entrada en stream_logs. El dashboard lee de aquí tanto el
+    log global como el log por-stream. Best-effort: nunca rompe el flujo."""
+    if not stream_id or not msg:
+        return
+    try:
+        supabase.table("stream_logs").insert({
+            "stream_id": str(stream_id),
+            "msg":       str(msg)[:500],
+            "type":      tipo,
+        }).execute()
+    except Exception as e:
+        log.warning(f"No se pudo escribir en stream_logs: {e}")
+
+
+def _joy_evento(
+    stream_id: str,
+    tipo: str,
+    descripcion: str,
+    entidad: str = "",
+    entidad_id: str = "",
+    monto: float | None = None,
+    moneda: str = "USD",
+    referencia: str = "",
+    contexto: dict | None = None,
+) -> None:
+    """Escribe un evento de negocio enriquecido en joy_memoria para que Joy tenga contexto.
+    Best-effort: nunca rompe el flujo si falla."""
+    try:
+        row: dict = {
+            "stream_id":   str(stream_id) if stream_id else None,
+            "tipo":        tipo,
+            "descripcion": str(descripcion)[:800],
+            "autor":       "sistema",
+        }
+        if entidad:    row["entidad"]    = str(entidad)[:200]
+        if entidad_id: row["entidad_id"] = str(entidad_id)[:100]
+        if monto is not None: row["monto"] = float(monto)
+        if moneda:     row["moneda"]    = str(moneda)[:10]
+        if referencia: row["referencia"] = str(referencia)[:100]
+        if contexto:   row["contexto"]  = contexto
+        supabase.table("joy_memoria").insert(row).execute()
+    except Exception as e:
+        log.warning(f"No se pudo escribir en joy_memoria: {e}")
+
+
+def _mensaje_log_tool(tool_name: str, tool_input: dict, result) -> tuple[str, str]:
+    """Convierte una llamada de tool + su resultado en (mensaje, tipo) legible para el log del UI."""
+    err = isinstance(result, dict) and (result.get("error") or result.get("faltantes"))
+    tipo = "error" if err else "ok"
+    ti = tool_input or {}
+    if tool_name == "enviar_email_gmail":
+        msg = f"Correo enviado a {ti.get('para','')}" if not err else \
+              f"Falló envío de correo: {(result.get('error') or result.get('detalle',''))[:120]}"
+    elif tool_name == "crear_oportunidad_crm":
+        msg = f"Oportunidad creada: {ti.get('nombre','')}" if not err else \
+              f"No se creó oportunidad — falta info: {result.get('faltantes') or result.get('mensaje','')}"
+    elif tool_name == "crear_cuenta_crm":
+        msg = f"Cuenta creada en CRM: {ti.get('nombre','')}" if not err else f"No se creó la cuenta: {result.get('error','')}"
+    elif tool_name == "crear_contacto_crm":
+        msg = f"Contacto creado: {(ti.get('nombre','')+' '+ti.get('apellido','')).strip()}" if not err else \
+              f"No se creó el contacto: {result.get('error','')}"
+    elif tool_name == "escanear_emails_ventas":
+        msg = f"Correos escaneados: {result.get('posibles_rfqs','?')} oportunidad(es) nueva(s)" if not err else \
+              f"Error escaneando correos: {result.get('error','')}"
+    elif tool_name == "crear_rfqs_desde_texto":
+        msg = f"RFQs creados: {result.get('creados','?')}"
+    elif tool_name == "notificar_sistema":
+        msg = f"Notificación: {ti.get('titulo','')}"
+    else:
+        msg = tool_name.replace("_", " ").capitalize()
+    return msg, tipo
+
+
+# Mensaje que se muestra en la burbuja "procesando" ANTES de ejecutar una tarea larga,
+# con el estimado de tiempo, para que el usuario sepa que hay que esperar y que se le avisará.
+_LOG_INICIO_TOOL = {
+    "escanear_emails_ventas":   "🔎 Reviso tu correo en busca de oportunidades… (~1 min). Te aviso al terminar.",
+    "publicar_producto_link":   "📦 Publicando en 1CRM… (~30s). Te aviso cuando el producto esté listo.",
+    "crear_rfqs_desde_texto":   "🔍 Buscando proveedores (~1-2 min por producto)… Te aviso al terminar.",
+    "publicar_rfq":             "📦 Publicando en 1CRM… (~30s). Te aviso cuando esté listo.",
+    "publicar_sin_imagen_rfq":  "📦 Publicando en 1CRM… (~30s). Te aviso cuando esté listo.",
+    "extraer_producto_de_link": "🔎 Reviso el link del producto…",
+    "extraer_ficha_pdf":        "📄 Leyendo la ficha técnica…",
+    "buscar_internet":          "🌐 Buscando en internet…",
+}
+
+
+# ─────────────────────────────────────────────────────────────
+# LOOP DE CLAUDE CON TOOL_USE
+# ─────────────────────────────────────────────────────────────
+def run_chat(messages: list[dict], stream_id: str, system_prompt: str = SYSTEM_PROMPT,
+             tipo_stream: str | None = None) -> tuple[str, list[str], bool, dict]:
+    tools_used: list[str] = []
+    rfqs_created = False
+    current_messages = list(messages)
+    total_input_tokens  = 0
+    total_output_tokens = 0
+    _tools = _tools_para_tipo(tipo_stream)
+
+    import time as _time
+    _t_start = _time.time()
+    # Desglose de tiempos que se persiste en el metadata de la respuesta (para diagnosticar
+    # la lentitud sin depender de los logs de Railway): segundos en el modelo, por tool, total.
+    _perf: dict = {"llm_s": 0.0, "tools": {}, "rondas": 0}
+    for _ronda in range(10):
+        _t_llm = _time.time()
+        response = claude.messages.create(
+            model=CHAT_MODEL,
+            max_tokens=8192,
+            # (timeout y max_retries se definen a nivel de cliente — ver anthropic.Anthropic arriba)
+            # cache_control cachea el prefijo estático (tools + system prompt). En el loop de
+            # tools (hasta 10 vueltas) las llamadas siguientes leen de caché en vez de
+            # reprocesar ~30 tools + 11 modos cada vez → mucha menos latencia y costo.
+            system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
+            tools=_tools,
+            messages=current_messages,
+        )
+        _dt_llm = _time.time() - _t_llm
+        _perf["llm_s"] = round(_perf["llm_s"] + _dt_llm, 1)
+        _perf["rondas"] = _ronda + 1
+
+        if hasattr(response, "usage") and response.usage:
+            total_input_tokens  += getattr(response.usage, "input_tokens",  0)
+            total_output_tokens += getattr(response.usage, "output_tokens", 0)
+            _u = response.usage
+            log.info(f"[PERF] ronda={_ronda} llm={_dt_llm:.1f}s stop={response.stop_reason} "
+                     f"in={getattr(_u,'input_tokens',0)} out={getattr(_u,'output_tokens',0)} "
+                     f"cache_read={getattr(_u,'cache_read_input_tokens',0)} "
+                     f"cache_write={getattr(_u,'cache_creation_input_tokens',0)}")
+
+        # end_turn = terminó normal. max_tokens = se truncó (respuesta grande): devolvemos lo
+        # generado igual (mejor un widget/aviso parcial que "No pude completar la respuesta").
+        if response.stop_reason in ("end_turn", "max_tokens"):
+            text = next(
+                (b.text for b in response.content if hasattr(b, "text")), ""
+            )
+            _perf["total_s"] = round(_time.time() - _t_start, 1)
+            if response.stop_reason == "max_tokens":
+                log.warning(f"[PERF] respuesta truncada por max_tokens (out={total_output_tokens})")
+            log.info(f"[PERF] TOTAL run_chat={_perf['total_s']:.1f}s rondas={_ronda+1} "
+                     f"tools={tools_used} stop={response.stop_reason}")
+            token_counts = {"tokens_input": total_input_tokens, "tokens_output": total_output_tokens}
+            return text, tools_used, rfqs_created, token_counts, _perf
+
+        if response.stop_reason == "tool_use":
+            current_messages.append({"role": "assistant", "content": response.content})
+
+            # Si el agente escribió [DECISION] en esta misma respuesta, NO ejecutar
+            # tools de escritura en el mismo turno — el [DECISION] debe esperar aprobación.
+            _WRITE_TOOLS = {"crear_oportunidad_crm", "crear_cuenta_crm", "crear_contacto_crm",
+                            "actualizar_oportunidad_crm", "actualizar_cuenta_crm", "actualizar_contacto_crm",
+                            "enviar_email_gmail", "crear_rfqs_desde_texto",
+                            "publicar_producto_link", "publicar_productos_desde_links"}
+            _response_text = " ".join(
+                b.text for b in response.content if getattr(b, "type", "") == "text"
+            )
+            _has_pending_decision = "[DECISION" in _response_text
+
+            tool_results = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+
+                tool_name  = block.name
+                tool_input = block.input
+                tools_used.append(tool_name)
+                log.info(f"Tool: {tool_name}({json.dumps(tool_input)[:120]})")
+
+                # Gate: bloquear tools de escritura si hay un [DECISION] pendiente en esta respuesta
+                if _has_pending_decision and tool_name in _WRITE_TOOLS:
+                    log.warning(f"[GATE] Tool '{tool_name}' bloqueada — hay [DECISION] pendiente en este turno")
+                    tool_results.append({
+                        "type":        "tool_result",
+                        "tool_use_id": block.id,
+                        "content":     json.dumps({"error": "Acción bloqueada: hay una solicitud de aprobación [DECISION] pendiente en este turno. Espera la respuesta del usuario antes de ejecutar esta acción."}, ensure_ascii=False),
+                    })
+                    continue
+
+                # Inyectar stream_id automáticamente en tools que lo necesitan
+                if tool_name in ("crear_rfqs_desde_texto", "notificar_sistema", "publicar_producto_link", "publicar_productos_desde_links", "crear_cuenta_crm", "crear_contacto_crm", "crear_oportunidad_crm") and not tool_input.get("stream_id"):
+                    tool_input["stream_id"] = stream_id
+
+                # Aviso de inicio con estimado (la burbuja "procesando" lo muestra en vivo)
+                _ini = _LOG_INICIO_TOOL.get(tool_name)
+                if _ini:
+                    _log_stream(stream_id, _ini, "info")
+
+                fn = TOOL_FUNCTIONS.get(tool_name)
+                _t_tool = _time.time()
+                try:
+                    result = fn(**tool_input) if fn else {"error": f"Tool '{tool_name}' no existe"}
+                    if tool_name == "crear_rfqs_desde_texto" and result.get("creados", 0) > 0:
+                        rfqs_created = True
+                    # Publicar desde link: el widget negro (BulkWidget) ya muestra el resultado →
+                    # suprimir la respuesta de texto redundante ("Publicando…").
+                    if tool_name in ("publicar_producto_link", "publicar_productos_desde_links") and isinstance(result, dict) and result.get("ok"):
+                        rfqs_created = True
+                except Exception as e:
+                    result = {"error": str(e)}
+                _dt_tool = round(_time.time() - _t_tool, 1)
+                _perf["tools"][tool_name] = round(_perf["tools"].get(tool_name, 0) + _dt_tool, 1)
+                log.info(f"[PERF] tool={tool_name} dt={_dt_tool:.1f}s")
+
+                # Registrar la acción en el log del stream (UI global + por-stream)
+                _msg_log, _tipo_log = _mensaje_log_tool(tool_name, tool_input, result)
+                _log_stream(stream_id, _msg_log, _tipo_log)
+
+                tool_results.append({
+                    "type":        "tool_result",
+                    "tool_use_id": block.id,
+                    "content":     json.dumps(result, ensure_ascii=False),
+                })
+
+            current_messages.append({"role": "user", "content": tool_results})
+        else:
+            break
+
+    _perf["total_s"] = round(_time.time() - _t_start, 1)
+    token_counts = {"tokens_input": total_input_tokens, "tokens_output": total_output_tokens}
+    return "No pude completar la respuesta.", tools_used, rfqs_created, token_counts, _perf
+
+
+def _build_image_block(url: str):
+    """Descarga una imagen y la devuelve como bloque de visión (base64) para la API de Claude.
+    Se usa base64 (no la URL) para no depender de que Anthropic pueda alcanzar la URL de Supabase."""
+    try:
+        r = httpx.get(url, timeout=25, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200 or "image" not in r.headers.get("content-type", "").lower():
+            log.warning(f"Imagen para visión no accesible: {r.status_code}")
+            return None
+        ct = r.headers.get("content-type", "").lower()
+        media = ("image/png" if "png" in ct else "image/webp" if "webp" in ct
+                 else "image/gif" if "gif" in ct else "image/jpeg")
+        import base64 as _b64
+        return {"type": "image", "source": {"type": "base64", "media_type": media,
+                                            "data": _b64.standard_b64encode(r.content).decode()}}
+    except Exception as e:
+        log.warning(f"No se pudo construir bloque de imagen: {e}")
+        return None
+
+
+def _build_document_block(url: str):
+    """Descarga un PDF y lo devuelve como bloque de documento (base64) para la API de Claude —
+    mismo mecanismo que _build_image_block pero para PDFs, que Claude lee nativamente (texto+visión,
+    sin OCR aparte). Word/Excel NO están soportados por este bloque — la API de Claude solo acepta
+    PDF como 'document'."""
+    try:
+        r = httpx.get(url, timeout=25, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code != 200 or "pdf" not in r.headers.get("content-type", "").lower():
+            log.warning(f"PDF para visión no accesible: {r.status_code}")
+            return None
+        import base64 as _b64
+        return {"type": "document", "source": {"type": "base64", "media_type": "application/pdf",
+                                                "data": _b64.standard_b64encode(r.content).decode()}}
+    except Exception as e:
+        log.warning(f"No se pudo construir bloque de documento: {e}")
+        return None
+
+
+def _build_attachment_blocks(attachments: list) -> list:
+    """Convierte metadata.attachments (RFQ con varios screenshots/PDFs en un mensaje) en bloques
+    de visión/documento para Claude, en el mismo orden. Ignora adjuntos que no sean imagen/PDF
+    (ej. Word/Excel, que no tienen bloque soportado) y los que fallen al descargar."""
+    bloques = []
+    for a in attachments or []:
+        if not isinstance(a, dict):
+            continue
+        url = a.get("url")
+        tipo = a.get("tipo")
+        if not url:
+            continue
+        blk = _build_image_block(url) if tipo == "image" else _build_document_block(url) if tipo == "document" else None
+        if blk:
+            bloques.append(blk)
+    return bloques
+
+
+# ─────────────────────────────────────────────────────────────
+# PROCESADOR DE MENSAJES
+# ─────────────────────────────────────────────────────────────
+def _procesar_orden_compra(stream_id: str, file_url: str, nombre: str = "orden", mime: str = "") -> None:
+    """PIPELINE DE ORDEN DE COMPRA (Fase 1, stream 'ordenes'): lee el PO, lo coteja contra las
+    cotizaciones del cliente y emite el widget [COTEJO_PO]. NO escribe al CRM. Determinista
+    (sin round-trip al modelo): más barato y robusto. Import perezoso para no romper el chat si
+    aún falta alguna dependencia de parsing en el entorno."""
+    try:
+        import orden_compra
+        import sales_order
+    except Exception as e:
+        log.error(f"orden_compra/sales_order no disponible: {e}")
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": f"No pude procesar la orden de compra (módulo no disponible: {e}).",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+
+    _log_stream(stream_id, f"Leyendo orden de compra: {nombre}", "info")
+    po = orden_compra.leer_po(url=file_url, nombre=nombre, mime=mime)
+    po["file_url"] = file_url  # se re-sube a 1CRM (sección Documentos de la SO) al crearla — ver subir_po_a_so
+    if po.get("error"):
+        _log_stream(stream_id, f"No se pudo leer el PO: {po['error']}", "error")
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": f"No pude leer la orden de compra «{nombre}»: {po['error']}. "
+                       f"Verifica que el archivo sea legible (PDF/Excel/Word).",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+
+    _emitir_cotejo_po(stream_id, po)
+
+
+def _emitir_cotejo_po(stream_id: str, po: dict) -> None:
+    """Cotejo del PO ya leído (cualquier origen: archivo, imagen, texto, link) + widget [COTEJO_PO]."""
+    import sales_order
+    _log_stream(stream_id, f"Cotejando {len(po.get('items', []))} producto(s) contra cotizaciones…", "info")
+    cotejo = sales_order.cotejar(po)
+    payload = {"po": po, "cotejo": cotejo}
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[COTEJO_PO]" + json.dumps(payload, ensure_ascii=False),
+        "procesado": True, "metadata": {"cotejo_po": True},
+    }).execute()
+    _log_stream(stream_id, cotejo.get("resumen", "Cotejo listo"), "ok")
+    log.info(f"Cotejo PO emitido | {cotejo.get('resumen','')}")
+
+
+def _procesar_orden_compra_texto(stream_id: str, texto: str = "", url: str = "") -> None:
+    """PO pegado como TEXTO o como LINK (copy-paste) en el stream de Sales Order — mismo flujo que un
+    archivo: lee con el normalizador, luego cotejo + widget."""
+    try:
+        import orden_compra
+    except Exception as e:
+        log.error(f"orden_compra no disponible: {e}")
+        return
+    _log_stream(stream_id, "Leyendo orden de compra del link…" if url else "Leyendo orden de compra del texto…", "info")
+    po = orden_compra.leer_po_url(url) if url else orden_compra.leer_po_texto(texto)
+    if url and not po.get("error"):
+        po["file_url"] = url
+    if po.get("error") or not po.get("items"):
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": "No pude identificar una orden de compra en lo que mandaste"
+                       + (f": {po['error']}." if po.get("error") else " (no encontré productos).")
+                       + " Pega el texto completo de la orden, súbela como archivo o como captura.",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+    _emitir_cotejo_po(stream_id, po)
+
+
+def _recotejar_con_cotizacion(stream_id: str, po: dict, quote_id: str) -> None:
+    """El cotejo salió AMBIGUO (varias cotizaciones candidatas, ninguna con match exacto) y el
+    usuario eligió a mano cuál es la correcta — se vuelve a cotejar el MISMO po (ya viene completo
+    en la metadata del botón, no hace falta releer el archivo) forzando esa cotización como
+    referencia. Emite un nuevo [COTEJO_PO] que reemplaza al ambiguo, ya con el so_draft armado."""
+    try:
+        import sales_order
+    except Exception as e:
+        log.error(f"sales_order no disponible: {e}")
+        return
+    if not quote_id:
+        return
+    cotejo = sales_order.cotejar(po, forzar_quote_id=quote_id)
+    payload = {"po": po, "cotejo": cotejo}
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[COTEJO_PO]" + json.dumps(payload, ensure_ascii=False),
+        "procesado": True, "metadata": {"cotejo_po": True},
+    }).execute()
+    _log_stream(stream_id, cotejo.get("resumen", "Cotejo listo"), "ok")
+
+
+def _crear_so_confirmada(stream_id: str, draft: dict) -> None:
+    """Crea la Sales Order tras la aprobación del usuario en el previo (metadata.so_action='crear').
+    Escribe al CRM SOLO aquí, con el draft ya confirmado. Emite el widget [SO_CREADA]."""
+    try:
+        import sales_order
+    except Exception as e:
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": f"No pude crear la Sales Order (módulo no disponible: {e}).",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+    _log_stream(stream_id, "Creando Sales Order en 1CRM…", "info")
+    res = sales_order.crear_sales_order(draft or {})
+    if not res.get("ok"):
+        _log_stream(stream_id, f"No se pudo crear la Sales Order: {res.get('error','')}", "error")
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": f"No pude crear la Sales Order: {res.get('error','error desconocido')}.",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[SO_CREADA]" + json.dumps(res, ensure_ascii=False),
+        "procesado": True, "metadata": {"so_creada": True},
+    }).execute()
+    _log_stream(stream_id, f"Sales Order {res.get('so_numero','')} creada ✓", "ok")
+    log.info(f"Sales Order creada: {res.get('so_id')} ({res.get('so_numero')})")
+    _d = draft or {}
+    _joy_evento(
+        stream_id, "so_creada",
+        f"Sales Order {res.get('so_numero','')} creada para {_d.get('cliente_nombre','') or _d.get('billing_account','')}"
+        + (f" por ${res.get('grand_total',''):,}" if res.get("grand_total") else ""),
+        entidad=_d.get("cliente_nombre","") or _d.get("billing_account",""),
+        entidad_id=_d.get("billing_account_id",""),
+        monto=res.get("grand_total"),
+        moneda=_d.get("currency","USD"),
+        referencia=res.get("so_numero",""),
+        contexto={"so_id": res.get("so_id"), "po_number": _d.get("po_number","")},
+    )
+
+    # Subir el PO original a la sección de Documentos/Notas de la SO — best-effort: si falla, la SO
+    # ya quedó creada y esto NO la afecta, solo se loguea (ver sales_order.subir_po_a_so).
+    _file_url = (draft or {}).get("file_url", "")
+    if _file_url and res.get("so_id"):
+        try:
+            up = sales_order.subir_po_a_so(res["so_id"], _file_url, (draft or {}).get("po_number", ""))
+            if up.get("ok"):
+                _log_stream(stream_id, "PO original guardado en la SO (Documentos) ✓", "ok")
+            else:
+                _log_stream(stream_id, f"No se pudo guardar el PO en la SO: {up.get('error','')}", "warn")
+        except Exception as e:
+            log.warning(f"subir_po_a_so falló: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
+# PIPELINE DE COMPRAS A PROVEEDOR (stream 'compras')
+# El usuario sube uno o varios links de producto (eBay, etc.) — "si vamos a comprar algo es
+# porque ya se lo vendimos a alguien". Cotejo determinista (reusa _extraer_producto_link, ya
+# usado para publicar productos) + escritura solo tras aprobación. Mismo patrón que el pipeline
+# de órdenes de compra del cliente (_procesar_orden_compra / _crear_so_confirmada) arriba.
+# ─────────────────────────────────────────────────────────────
+def _procesar_link_proveedor(stream_id: str, urls: list[str]) -> None:
+    """Lee cada link, busca en qué Sales Order(s) abiertas aparece el producto y emite el widget
+    [COTEJO_PROVEEDOR]. NO escribe al CRM."""
+    try:
+        import compra_proveedor
+    except Exception as e:
+        log.error(f"compra_proveedor no disponible: {e}")
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": f"No pude procesar el link de proveedor (módulo no disponible: {e}).",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+
+    _log_stream(stream_id, f"Leyendo {len(urls)} link(s) de proveedor…", "info")
+    links_data = []
+    for url in urls:
+        diag: list = []
+        try:
+            info = _extraer_producto_link(url, diag)
+        except Exception as e:
+            info = None
+            diag.append(f"excepción: {e}")
+            log.error(f"extraer_producto_de_link({url}): {e}")
+        links_data.append(info if info else {"ok": False, "url": url})
+        # Diagnóstico a stream_logs: qué intentó y por qué falló cada paso — así se puede ver
+        # sin depender de los logs de Railway (ej. "sin SERPAPI_KEY", "HTTP 423 del scraper").
+        for paso in diag:
+            _log_stream(stream_id, f"  ↳ {url[:50]}: {paso}", "info")
+
+    if not any(l.get("ok") for l in links_data):
+        # Mostrar el motivo REAL (ej. "el sitio bloquea el acceso automático") en vez de un
+        # genérico "verifica la URL" que hace pensar que el link estaba mal cuando no es el caso.
+        errores = [l.get("error") for l in links_data if l.get("error")]
+        detalle = f" ({errores[0]})" if errores else ""
+        _log_stream(stream_id, f"No pude leer ningún producto de los links dados{detalle}", "error")
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": f"No pude leer el producto de ese link{detalle}. Dame el nombre, número de "
+                       f"parte y precio a mano y sigo con eso.",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+
+    _log_stream(stream_id, "Buscando en qué Sales Order(s) aparece cada producto…", "info")
+    cotejo = compra_proveedor.buscar_sales_orders_candidatas(links_data)
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[COTEJO_PROVEEDOR]" + json.dumps({"links": links_data, "cotejo": cotejo}, ensure_ascii=False),
+        "procesado": True, "metadata": {"cotejo_proveedor": True},
+    }).execute()
+    _log_stream(stream_id, cotejo.get("resumen", "Cotejo listo"), "ok")
+    log.info(f"Cotejo proveedor emitido | {cotejo.get('resumen','')}")
+
+
+def _procesar_captura_compra(stream_id: str, file_url: str, nombre: str = "", mime: str = "") -> bool:
+    """Captura/PDF de una compra en línea (checkout, carrito, resumen de pedido de eBay/Amazon/etc.)
+    en el stream 'compras': lee tienda + productos + precios y los manda al MISMO cotejo que un link
+    (Sales Orders abiertas → borrador de PO para aprobar). Devuelve True si lo atendió; False si el
+    archivo NO es una compra (comprobante de pago, packing list/tracking, otro) para que el router
+    siga con su flujo de siempre. Antes TODO archivo sin palabras clave caía a comprobante de pago
+    y respondía "no encontré cuenta por pagar" cuando la compra aún no tiene PO. NO escribe al CRM."""
+    try:
+        import compra_proveedor
+    except Exception as e:
+        log.error(f"compra_proveedor no disponible: {e}")
+        return False
+    try:
+        imgs = _bajar_imagenes(file_url, nombre, mime)
+        datos = compra_proveedor.leer_captura_compra(imgs)
+    except Exception as e:
+        log.error(f"_procesar_captura_compra: {e}")
+        return False
+    if datos.get("error"):
+        return False
+    tipo = datos.get("tipo", "otro")
+    if tipo == "order_confirmation":
+        # Un order confirmation con compras ya en tránsito = activar receiving (flujo existente);
+        # sin ninguna en tránsito es la compra que aún no tiene PO.
+        try:
+            if compra_proveedor.pos_esperando_recepcion():
+                return False
+        except Exception:
+            return False
+    elif tipo != "compra_online":
+        return False
+    links = compra_proveedor.captura_a_links(datos)
+    if not links:
+        return False
+    _log_stream(stream_id, f"Captura de compra en {datos.get('tienda') or 'tienda en línea'}: "
+                           f"{len(links)} producto(s). Buscando Sales Orders…", "info")
+    cotejo = compra_proveedor.buscar_sales_orders_candidatas(links)
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[COTEJO_PROVEEDOR]" + json.dumps({
+            "links": links, "cotejo": cotejo,
+            "captura": {"tienda": datos.get("tienda", ""), "orden_numero": datos.get("orden_numero", ""),
+                        "total": datos.get("total"), "moneda": datos.get("moneda", "")},
+        }, ensure_ascii=False),
+        "procesado": True, "metadata": {"cotejo_proveedor": True},
+    }).execute()
+    _log_stream(stream_id, cotejo.get("resumen", "Cotejo listo"), "ok")
+    return True
+
+
+def _crear_po_confirmado(stream_id: str, grupos: list) -> None:
+    """Crea el/los Purchase Order(s) + Cuenta(s) por Pagar tras la aprobación del usuario
+    (metadata.po_action='crear'). Un `grupo` = un draft de compra_proveedor.crear_po_y_ap
+    (una Sales Order, o so_id=None para gasto general). Escribe al CRM SOLO aquí, un solo sí
+    ya dado. Emite [PO_CREADO]."""
+    try:
+        import compra_proveedor
+    except Exception as e:
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": f"No pude crear la orden de compra (módulo no disponible: {e}).",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+
+    resultados = []
+    for draft in (grupos or []):
+        _log_stream(stream_id, f"Creando Purchase Order para {draft.get('proveedor_nombre','')}…", "info")
+        res = compra_proveedor.crear_po_y_ap(draft)
+        resultados.append(res)
+        if res.get("ok"):
+            _log_stream(stream_id, "Purchase Order + cuenta por pagar creados ✓", "ok")
+            _joy_evento(
+                stream_id, "po_creada",
+                f"Purchase Order creada"
+                + (f" para {draft.get('proveedor_nombre','')}" if draft.get("proveedor_nombre") else "")
+                + (f" por ${res.get('grand_total',''):,}" if res.get("grand_total") else ""),
+                entidad=draft.get("proveedor_nombre",""),
+                entidad_id=draft.get("proveedor_id",""),
+                monto=res.get("grand_total"),
+                moneda=draft.get("currency","USD"),
+                referencia=res.get("po_numero","") or res.get("nombre",""),
+                contexto={"po_id": res.get("po_id"), "bill_id": res.get("bill_id"), "so_id": draft.get("so_id","")},
+            )
+        else:
+            _log_stream(stream_id, f"No se pudo crear: {res.get('error','')}", "error")
+
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[PO_CREADO]" + json.dumps({"resultados": resultados}, ensure_ascii=False),
+        "procesado": True, "metadata": {"po_creado": True},
+    }).execute()
+    ok_n = sum(1 for r in resultados if r.get("ok"))
+    log.info(f"PO(s) creado(s): {ok_n}/{len(resultados)}")
+
+
+def _bajar_imagenes(file_url: str, nombre: str = "", mime: str = "") -> list:
+    """Baja un archivo (imagen o PDF) y lo devuelve como lista de imágenes PNG en bytes — si es
+    PDF lo rasteriza (reusa orden_compra), si ya es imagen lo regresa tal cual. Mismo patrón que
+    el fallback a visión de orden_compra.leer_po."""
+    import orden_compra
+    data = orden_compra.descargar(file_url)
+    ext = orden_compra._ext(nombre, mime)
+    if ext == "pdf":
+        return orden_compra._pdf_a_imagenes(data)
+    return [data]
+
+
+def _pagado_previo_map() -> dict:
+    """Suma lo YA pagado de cada Bill/Invoice según el historial de [PAGO_REGISTRADO] de
+    CUALQUIER stream — a diferencia de PO/SO (que siempre viven en un solo stream), un Bill/
+    Invoice es alcanzable tanto desde 'compras' como desde 'pagos', así que hay que escanear
+    globalmente, no solo este stream_id. Resta lo que se haya deshecho después ([ACCION_DESHECHA]
+    con el mismo payment_id). Devuelve {registro_id: monto_acumulado}."""
+    acumulado: dict = {}
+    try:
+        deshechos: set = set()
+        rows_d = supabase.table("mensajes").select("content").ilike("content", "%ACCION_DESHECHA%").execute()
+        for r in (rows_d.data or []):
+            content = r.get("content") or ""
+            if not content.startswith("[ACCION_DESHECHA]"):
+                continue
+            try:
+                p = json.loads(content[len("[ACCION_DESHECHA]"):])
+            except Exception:
+                continue
+            if p.get("que") == "el pago registrado" and p.get("payment_id"):
+                deshechos.add(p["payment_id"])
+
+        rows = supabase.table("mensajes").select("content").ilike("content", "%PAGO_REGISTRADO%").execute()
+        for r in (rows.data or []):
+            content = r.get("content") or ""
+            if not content.startswith("[PAGO_REGISTRADO]"):
+                continue
+            try:
+                p = json.loads(content[len("[PAGO_REGISTRADO]"):])
+            except Exception:
+                continue
+            if not p.get("ok") or not p.get("registro_id") or p.get("payment_id") in deshechos:
+                continue
+            acumulado[p["registro_id"]] = acumulado.get(p["registro_id"], 0) + float(p.get("monto") or 0)
+    except Exception as e:
+        log.warning(f"No se pudo leer historial global de pagos: {e}")
+    return acumulado
+
+
+def _procesar_comprobante_pago(stream_id: str, file_url: str, nombre: str = "", mime: str = "") -> None:
+    """Lee el comprobante subido y lo coteja contra las Bills/Invoices abiertas por monto (saldo
+    ya ajustado por pagos previos registrados en cualquier stream). Emite [COTEJO_PAGO]. NO
+    escribe al CRM."""
+    import pagos
+    _log_stream(stream_id, "Leyendo comprobante de pago…", "info")
+    try:
+        imgs = _bajar_imagenes(file_url, nombre, mime)
+    except Exception as e:
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": f"No pude descargar el comprobante: {e}",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+    comprobante = pagos.leer_comprobante(imgs)
+    if comprobante.get("error"):
+        _log_stream(stream_id, f"No pude leer el comprobante: {comprobante['error']}", "error")
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": f"No pude leer el comprobante: {comprobante['error']}",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+    cuentas = pagos.cuentas_abiertas(_pagado_previo_map())
+    cotejo = pagos.buscar_candidata(comprobante, cuentas)
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[COTEJO_PAGO]" + json.dumps({"comprobante": comprobante, "cotejo": cotejo}, ensure_ascii=False),
+        "procesado": True, "metadata": {"cotejo_pago": True},
+    }).execute()
+    _log_stream(stream_id, f"Comprobante leído — {len(cotejo.get('candidatas', []))} cuenta(s) candidata(s)", "ok")
+
+
+def _confirmar_pago(stream_id: str, tipo: str, registro_id: str, monto: float, datos_comprobante: dict) -> None:
+    """Crea el Payment ligado al Bill/Invoice tras aprobación del usuario. Emite [PAGO_REGISTRADO]."""
+    import pagos
+    _log_stream(stream_id, "Registrando pago…", "info")
+    res = pagos.registrar_pago(tipo, registro_id, monto, datos_comprobante)
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[PAGO_REGISTRADO]" + json.dumps(res, ensure_ascii=False),
+        "procesado": True, "metadata": {"pago_registrado": True},
+    }).execute()
+    _log_stream(stream_id, "Pago registrado ✓" if res.get("ok") else f"No se pudo registrar: {res.get('error','')}",
+                "ok" if res.get("ok") else "error")
+    if res.get("ok"):
+        _joy_evento(
+            stream_id, "pago_registrado",
+            f"Pago de ${monto:,.2f} registrado ({tipo}) — {datos_comprobante.get('referencia','') or res.get('payment_id','')}",
+            monto=monto,
+            referencia=res.get("payment_id",""),
+            contexto={
+                "tipo": tipo,
+                "registro_id": registro_id,
+                "payment_id": res.get("payment_id"),
+                "referencia_comprobante": datos_comprobante.get("referencia",""),
+                "fecha": datos_comprobante.get("fecha",""),
+            },
+        )
+
+
+def _iniciar_registro_desde_pago(stream_id: str, direccion: str, monto: float, datos_comprobante: dict) -> None:
+    """AGENTE 2: el comprobante no matcheó ninguna Bill/Invoice abierta. Un comprobante de pago NO
+    trae número de parte ni producto — no se puede inventar una línea para crear el PurchaseOrder/
+    Bill (o Sales Order/Invoice) de un clic sin fabricar datos. En vez de eso, guía al usuario a
+    dar de alta la compra/venta correcta con lo que YA sabemos (monto/fecha/referencia), y el
+    flujo normal (pegar el link del producto, o dar de alta al cliente) sigue desde ahí — cuando
+    exista el Bill/Invoice recién creado, el mismo comprobante se puede volver a subir para
+    registrarlo con [COTEJO_PAGO]."""
+    comp = datos_comprobante or {}
+    detalle = f"${monto:,.2f}" + (f" · ref: {comp.get('referencia')}" if comp.get("referencia") else "")
+    if direccion == "outgoing":
+        texto = (
+            f"No encontré ninguna cuenta por pagar abierta que corresponda a este pago ({detalle}). "
+            "Si es una compra nueva a proveedor, pásame el link del producto (o dime a quién le "
+            "pagaste y qué compraste) y armo el Purchase Order + cuenta por pagar — en cuanto "
+            "exista, vuelve a mandarme este mismo comprobante y lo cotejo."
+        )
+    else:
+        texto = (
+            f"No encontré ninguna cuenta por cobrar abierta que corresponda a este cobro ({detalle}). "
+            "Si es de un cliente/venta que aún no está en el CRM, dime de quién es y qué Sales "
+            "Order corresponde y te ayudo a darla de alta — en cuanto exista, vuelve a mandarme "
+            "este mismo comprobante y lo cotejo."
+        )
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant", "content": texto,
+        "procesado": True, "metadata": {},
+    }).execute()
+    _log_stream(stream_id, "Sin match — pidiendo datos para dar de alta la compra/venta", "info")
+
+
+def _recibido_previo_po(stream_id: str, po_id: str) -> dict:
+    """Suma lo YA confirmado en entregas previas de este PO (una o varias — "pueden venir en
+    varios pedidos diferentes") escaneando el historial de [RECEIVING_CONFIRMADO] de este stream.
+    Fuente confiable (igual criterio que _procesar_estado_operativo): el historial de mensajes,
+    no un scan de 1CRM."""
+    acumulado: dict = {}
+    try:
+        rows = (supabase.table("mensajes").select("content")
+                .eq("stream_id", stream_id).ilike("content", "%RECEIVING_CONFIRMADO%").execute())
+        for r in (rows.data or []):
+            content = r.get("content") or ""
+            if not content.startswith("[RECEIVING_CONFIRMADO]"):
+                continue
+            try:
+                payload = json.loads(content[len("[RECEIVING_CONFIRMADO]"):])
+            except Exception:
+                continue
+            if payload.get("po_id") != po_id or not payload.get("ok"):
+                continue
+            for pc, cant in (payload.get("cantidades") or {}).items():
+                acumulado[pc] = acumulado.get(pc, 0) + (cant or 0)
+    except Exception as e:
+        log.warning(f"No se pudo leer historial de recepciones para PO {po_id}: {e}")
+    return acumulado
+
+
+def _receivings_activos(stream_id: str) -> list:
+    """Receivings ACTIVOS (activados pero no recibidos por completo) de este stream, derivados del
+    historial (misma filosofía que _recibido_previo_po). Se toma el ÚLTIMO [RECEIVING_ESTADO] por
+    po_id (estatus esperando/en_transito) y se descartan los que ya tengan un [RECEIVING_CONFIRMADO]
+    con completo=True. El [RECEIVING_ESTADO] guarda el packing list de referencia y el contexto del
+    PO/SO — no hay que volver a pegarle a 1CRM."""
+    estados: dict = {}
+    completos: set = set()
+    try:
+        rows = (supabase.table("mensajes").select("content")
+                .eq("stream_id", stream_id).ilike("content", "%RECEIVING_%")
+                .order("created_at").execute())
+        for r in (rows.data or []):
+            content = r.get("content") or ""
+            if content.startswith("[RECEIVING_ESTADO]"):
+                try:
+                    p = json.loads(content[len("[RECEIVING_ESTADO]"):])
+                except Exception:
+                    continue
+                if p.get("po_id"):
+                    estados[p["po_id"]] = p  # asc -> el último gana
+            elif content.startswith("[RECEIVING_CONFIRMADO]"):
+                try:
+                    p = json.loads(content[len("[RECEIVING_CONFIRMADO]"):])
+                except Exception:
+                    continue
+                if p.get("po_id") and p.get("completo"):
+                    completos.add(p["po_id"])
+    except Exception as e:
+        log.warning(f"No se pudieron leer los receivings activos de {stream_id}: {e}")
+    return [e for pid, e in estados.items() if pid not in completos]
+
+
+def _procesar_evidencia_receiving(stream_id: str, texto: str, file_url: str = "", nombre: str = "", mime: str = "") -> None:
+    """Punto de entrada del RECEIVING v2. Clasifica la evidencia (con visión si es imagen) y la
+    manda al evento del ciclo de vida que corresponda — secuencia flexible, cualquiera puede
+    llegar primero:
+      • packing_list / order_confirmation -> ACTIVAR el receiving (cotejo para elegir el PO).
+      • tracking (texto de guía o etiqueta) -> marcar EN TRÁNSITO.
+      • recepcion_paquete (foto del paquete con guía) -> iniciar RECEPCIÓN (elegir cuál pendiente).
+    """
+    try:
+        import compra_proveedor
+    except Exception as e:
+        log.error(f"compra_proveedor no disponible: {e}")
+        return
+    pos = compra_proveedor.pos_esperando_recepcion()
+    if not pos:
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": "No tengo ninguna compra en tránsito ahorita. Cuando tengas el order "
+                       "confirmation o el packing list de un proveedor, mándamelo y arranco el receiving.",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+
+    doc = None
+    if file_url:
+        _log_stream(stream_id, "Leyendo el documento de recepción…", "info")
+        try:
+            imgs = _bajar_imagenes(file_url, nombre, mime)
+            doc = compra_proveedor.leer_documento_receiving(imgs)
+        except Exception as e:
+            doc = {"tipo": "otro", "error": str(e), "items": [], "tracking": ""}
+
+    tipo = (doc or {}).get("tipo", "")
+    tracking_txt = (doc or {}).get("tracking", "") or (texto.strip() if texto and not file_url else "")
+
+    if tipo == "recepcion_paquete":
+        _cotejo_recepcion(stream_id, doc, tracking_txt)
+        return
+    if tipo == "tracking" or (not file_url and tracking_txt):
+        _cotejo_tracking(stream_id, tracking_txt)
+        return
+    # order_confirmation / packing_list / imagen ambigua -> activar el receiving
+    _cotejo_activar(stream_id, doc, tracking_txt, pos)
+
+
+def _cotejo_activar(stream_id: str, doc: dict | None, tracking: str, pos: list) -> None:
+    """Detectó un order confirmation / packing list -> muestra a qué PO ligarlo (con su SO/cliente).
+    El packing list detectado viaja para guardarse como lista de referencia al activar."""
+    import compra_proveedor
+    items = (doc or {}).get("items") or []
+    texto_match = " ".join(f"{it.get('nombre','')} {it.get('mfr_part_no','')}" for it in items)
+    candidatos = compra_proveedor.filtrar_candidatos_recepcion(pos, texto_match, tracking)
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[RECEIVING_COTEJO]" + json.dumps({
+            "modo": "activar", "doc": doc, "tracking": tracking, "candidatos": candidatos,
+            "sin_match": len(candidatos) == len(pos) and len(pos) > 1,
+        }, ensure_ascii=False),
+        "procesado": True, "metadata": {"receiving_cotejo": True},
+    }).execute()
+    _log_stream(stream_id, f"{len(candidatos)} PO candidato(s) para activar el receiving", "ok")
+
+
+def _cotejo_tracking(stream_id: str, tracking: str) -> None:
+    """Llegó un tracking. Si hay UN solo receiving activo, lo marca en tránsito directo; si hay
+    varios (o ninguno activado aún), muestra el cotejo para elegir a cuál corresponde."""
+    activos = _receivings_activos(stream_id)
+    if len(activos) == 1:
+        _marcar_en_transito(stream_id, activos[0]["po_id"], tracking)
+        return
+    if not activos:
+        # No hay receiving activado todavía — se elige el PO directamente (crea el estado al vuelo).
+        import compra_proveedor
+        pos = compra_proveedor.pos_esperando_recepcion()
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": "[RECEIVING_COTEJO]" + json.dumps({
+                "modo": "tracking", "tracking": tracking, "candidatos": pos,
+                "sin_match": len(pos) > 1,
+            }, ensure_ascii=False),
+            "procesado": True, "metadata": {"receiving_cotejo": True},
+        }).execute()
+        return
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[RECEIVING_COTEJO]" + json.dumps({
+            "modo": "tracking", "tracking": tracking,
+            "candidatos": [{"id": a["po_id"], "nombre": a.get("po_nombre", ""), "proveedor": a.get("proveedor", ""),
+                            "so_nombre": a.get("so_nombre", ""), "so_cliente": a.get("so_cliente", ""),
+                            "lineas": a.get("lineas_po", [])} for a in activos],
+            "sin_match": True,
+        }, ensure_ascii=False),
+        "procesado": True, "metadata": {"receiving_cotejo": True},
+    }).execute()
+
+
+def _cotejo_recepcion(stream_id: str, doc: dict | None, guia: str) -> None:
+    """Llegó la foto del paquete. Muestra los receivings PENDIENTES para que el usuario elija a
+    cuál corresponde la recepción; al elegir se arma el checklist de items recibidos."""
+    activos = _receivings_activos(stream_id)
+    if not activos:
+        # No hubo activación previa (packing list) — se cae al listado de PO's en tránsito directo.
+        import compra_proveedor
+        pos = compra_proveedor.pos_esperando_recepcion()
+        candidatos = [{"po_id": p["id"], "po_nombre": p.get("nombre", ""), "proveedor": p.get("proveedor", ""),
+                       "so_nombre": p.get("so_nombre", ""), "so_cliente": p.get("so_cliente", ""),
+                       "estatus": "esperando", "packing_list": None, "lineas_po": p.get("lineas", [])} for p in pos]
+    else:
+        candidatos = activos
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[RECEIVING_COTEJO]" + json.dumps({
+            "modo": "recepcion", "guia": guia, "doc": doc, "candidatos": candidatos,
+            "sin_match": len(candidatos) > 1,
+        }, ensure_ascii=False),
+        "procesado": True, "metadata": {"receiving_cotejo": True},
+    }).execute()
+    _log_stream(stream_id, f"{len(candidatos)} recepción(es) pendiente(s) para cotejar", "ok")
+
+
+def _activar_receiving(stream_id: str, po_id: str, candidato: dict, doc: dict | None, tracking: str = "") -> None:
+    """El usuario ligó el order confirmation / packing list a un PO -> nace el receiving en estatus
+    'esperando' (o 'en_transito' si además vino un tracking). Guarda el packing list como lista de
+    REFERENCIA. NO toca el shipping_stage nativo del PO (regla de Gabriel: eso solo al completar)."""
+    packing_ref = None
+    d = doc or {}
+    if (d.get("items") or []):
+        packing_ref = {"items": d.get("items"), "notas": d.get("notas", "")}
+    estatus = "en_transito" if tracking else "esperando"
+    estado = {
+        "po_id": po_id,
+        "po_nombre": candidato.get("nombre", ""),
+        "proveedor": candidato.get("proveedor", ""),
+        "so_id": candidato.get("so_id", ""), "so_nombre": candidato.get("so_nombre", ""),
+        "so_cliente": candidato.get("so_cliente", ""),
+        "po_url": candidato.get("url", ""), "so_url": candidato.get("so_url", ""),
+        "estatus": estatus, "packing_list": packing_ref, "tracking": tracking,
+        "lineas_po": candidato.get("lineas", []),
+        "tipo_doc": d.get("tipo", ""),
+    }
+    if tracking:
+        try:
+            import compra_proveedor
+            compra_proveedor.registrar_tracking(po_id, tracking)
+        except Exception:
+            pass
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[RECEIVING_ESTADO]" + json.dumps(estado, ensure_ascii=False),
+        "procesado": True, "metadata": {"receiving_estado": True},
+    }).execute()
+    _log_stream(stream_id, f"Receiving activado ({estatus}) para {estado['po_nombre']}", "ok")
+
+
+def _marcar_en_transito(stream_id: str, po_id: str, tracking: str) -> None:
+    """Registra el tracking y mueve el receiving a 'en tránsito' — reemitiendo el [RECEIVING_ESTADO]
+    con los datos que ya tenía (packing list de referencia incluido)."""
+    activos = {a["po_id"]: a for a in _receivings_activos(stream_id)}
+    base = activos.get(po_id)
+    if not base:
+        # Nunca se activó — se construye el contexto desde 1CRM.
+        try:
+            import compra_proveedor
+            pos = compra_proveedor.pos_esperando_recepcion()
+            p = next((x for x in pos if x["id"] == po_id), None)
+        except Exception:
+            p = None
+        base = {"po_id": po_id, "po_nombre": (p or {}).get("nombre", ""),
+                "proveedor": (p or {}).get("proveedor", ""), "so_id": (p or {}).get("so_id", ""),
+                "so_nombre": (p or {}).get("so_nombre", ""), "so_cliente": (p or {}).get("so_cliente", ""),
+                "po_url": (p or {}).get("url", ""), "so_url": (p or {}).get("so_url", ""),
+                "packing_list": None, "lineas_po": (p or {}).get("lineas", [])}
+    try:
+        import compra_proveedor
+        compra_proveedor.registrar_tracking(po_id, tracking)
+    except Exception:
+        pass
+    estado = {**base, "estatus": "en_transito", "tracking": tracking}
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[RECEIVING_ESTADO]" + json.dumps(estado, ensure_ascii=False),
+        "procesado": True, "metadata": {"receiving_estado": True},
+    }).execute()
+    _log_stream(stream_id, f"Tracking registrado — {estado.get('po_nombre','')} en tránsito", "ok")
+
+
+def _iniciar_recepcion(stream_id: str, po_id: str, guia: str = "") -> None:
+    """El usuario eligió a qué receiving pendiente corresponde el paquete -> arma el CHECKLIST de
+    items recibidos: cada línea del PO con su cantidad esperada, lo que ya se recibió antes, lo que
+    falta y (si hubo packing list de referencia) cuánto decía ese packing list."""
+    try:
+        import compra_proveedor
+    except Exception as e:
+        log.error(f"compra_proveedor no disponible: {e}")
+        return
+    po_rec = compra_proveedor.sales_order._crm_get(f"data/PurchaseOrder/{po_id}").get("record", {})
+    estado_anterior = po_rec.get("shipping_stage", "Ordered")
+
+    ya_recibido = _recibido_previo_po(stream_id, po_id)
+    esperadas = compra_proveedor.cantidades_esperadas_po(po_id, ya_recibido)
+
+    # Packing list de referencia guardado al activar (si hubo).
+    ref = {}
+    for a in _receivings_activos(stream_id):
+        if a["po_id"] == po_id and a.get("packing_list"):
+            for it in (a["packing_list"].get("items") or []):
+                pc = compra_proveedor.sales_order._compact(it.get("mfr_part_no") or it.get("nombre") or "")
+                if pc:
+                    ref[pc] = (ref.get(pc, 0) or 0) + (it.get("cantidad") or 0)
+
+    for linea in esperadas:
+        pc = compra_proveedor.sales_order._compact(linea.get("mfr_part_no") or linea.get("name") or "")
+        packing = ref.get(pc)
+        linea["cantidad_packing"] = packing
+        # sugerido = lo que falta, acotado por lo que decía el packing list si existe
+        sug = linea["cantidad_restante"] if packing is None else min(linea["cantidad_restante"], packing)
+        linea["cantidad_sugerida"] = sug
+        linea["recibido"] = sug > 0  # precheck si se espera recibir algo
+
+    payload = {"po_id": po_id, "guia": guia, "lineas": esperadas, "estado_anterior": estado_anterior}
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[RECEIVING_RECEPCION]" + json.dumps(payload, ensure_ascii=False),
+        "procesado": True, "metadata": {"receiving_recepcion": True},
+    }).execute()
+    _log_stream(stream_id, "Checklist de recepción listo — marca lo que recibiste", "ok")
+
+
+def _confirmar_recepcion_checklist(stream_id: str, po_id: str, cantidades: dict, estado_anterior: str = "") -> None:
+    """El usuario confirmó el checklist (items + cantidades recibidas de ESTA entrega). Suma al
+    stock; el shipping_stage nativo del PO solo pasa a Received si el ciclo quedó completo (regla
+    de Gabriel). `cantidades` = {mfr_part_no legible: cantidad} -> se compacta aquí. Emite
+    [RECEIVING_CONFIRMADO]."""
+    try:
+        import compra_proveedor
+    except Exception as e:
+        log.error(f"compra_proveedor no disponible: {e}")
+        return
+    cantidades_compactas = {}
+    for pn, cant in (cantidades or {}).items():
+        pc = compra_proveedor.sales_order._compact(pn)
+        if pc and (cant or 0) > 0:
+            cantidades_compactas[pc] = (cantidades_compactas.get(pc, 0) or 0) + cant
+    ya_recibido_previo = _recibido_previo_po(stream_id, po_id)
+    res = compra_proveedor.confirmar_recepcion_parcial(po_id, cantidades_compactas, ya_recibido_previo)
+    res["cantidades"] = cantidades_compactas
+    res["cantidades_legibles"] = cantidades
+    res["estado_anterior"] = estado_anterior
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[RECEIVING_CONFIRMADO]" + json.dumps(res, ensure_ascii=False),
+        "procesado": True, "metadata": {"receiving_confirmado": True},
+    }).execute()
+    estatus = res.get("estatus_receiving", "")
+    _log_stream(stream_id, f"Recepción confirmada — {estatus}" if res.get("ok") else "No se pudo confirmar",
+                "ok" if res.get("ok") else "error")
+
+
+def _deshacer_receiving(stream_id: str, po_id: str, cantidades: dict, estado_anterior: str) -> None:
+    """Deshace UNA entrega específica (no todo el PO). `cantidades` viene con claves YA compactadas
+    (el widget reenvía el `cantidades` de [RECEIVING_CONFIRMADO])."""
+    try:
+        import compra_proveedor
+    except Exception:
+        return
+    res = compra_proveedor.deshacer_recepcion_parcial(po_id, cantidades, estado_anterior)
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[ACCION_DESHECHA]" + json.dumps({**res, "que": "esta recepción"}, ensure_ascii=False),
+        "procesado": True, "metadata": {"accion_deshecha": True},
+    }).execute()
+    _log_stream(stream_id, "Recepción deshecha ✓" if res.get("ok") else "No se pudo deshacer", "ok" if res.get("ok") else "error")
+
+
+def _deshacer_po(stream_id: str, po_id: str, bill_id: str) -> None:
+    """Deshace la Etapa 1 (botón 'Deshacer' del widget de PO creado)."""
+    try:
+        import compra_proveedor
+    except Exception:
+        return
+    _log_stream(stream_id, "Deshaciendo Purchase Order + cuenta por pagar…", "info")
+    res = compra_proveedor.deshacer_po_y_ap(po_id, bill_id)
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[ACCION_DESHECHA]" + json.dumps({**res, "que": "Purchase Order y cuenta por pagar"}, ensure_ascii=False),
+        "procesado": True, "metadata": {"accion_deshecha": True},
+    }).execute()
+    _log_stream(stream_id, "Deshecho ✓" if res.get("ok") else "No se pudo deshacer", "ok" if res.get("ok") else "error")
+
+
+def _deshacer_pago(stream_id: str, payment_id: str) -> None:
+    """Deshace un pago (borra el Payment). payment_id viaja en el marcador de deshecho para que
+    _pagado_previo_map lo reste del acumulado — sin esto, un pago deshecho seguiría contando
+    contra el saldo restante para siempre."""
+    import pagos
+    res = pagos.deshacer_pago(payment_id)
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[ACCION_DESHECHA]" + json.dumps({**res, "que": "el pago registrado", "payment_id": payment_id}, ensure_ascii=False),
+        "procesado": True, "metadata": {"accion_deshecha": True},
+    }).execute()
+    _log_stream(stream_id, "Pago deshecho ✓" if res.get("ok") else "No se pudo deshacer", "ok" if res.get("ok") else "error")
+
+
+def _deshacer_recepcion(stream_id: str, po_id: str, estado_anterior: str) -> None:
+    """Deshace la Etapa 3 (regresa shipping_stage)."""
+    try:
+        import compra_proveedor
+    except Exception:
+        return
+    res = compra_proveedor.deshacer_recepcion(po_id, estado_anterior)
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[ACCION_DESHECHA]" + json.dumps({**res, "que": "la recepción del PO"}, ensure_ascii=False),
+        "procesado": True, "metadata": {"accion_deshecha": True},
+    }).execute()
+    _log_stream(stream_id, "Recepción deshecha ✓" if res.get("ok") else "No se pudo deshacer", "ok" if res.get("ok") else "error")
+
+
+def _deshacer_cierre(stream_id: str, so_id: str, estado_anterior: str) -> None:
+    """Deshace la Etapa 4 (regresa so_stage)."""
+    try:
+        import compra_proveedor
+    except Exception:
+        return
+    res = compra_proveedor.deshacer_cierre(so_id, estado_anterior)
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[ACCION_DESHECHA]" + json.dumps({**res, "que": "el cierre de la venta"}, ensure_ascii=False),
+        "procesado": True, "metadata": {"accion_deshecha": True},
+    }).execute()
+    _log_stream(stream_id, "Cierre deshecho ✓" if res.get("ok") else "No se pudo deshacer", "ok" if res.get("ok") else "error")
+
+
+def _procesar_cierre_venta(stream_id: str) -> None:
+    """ETAPA 4 (cierre de venta): lista las Sales Orders pendientes de cierre para que el usuario
+    elija cuál y confirme entrega/factura. Emite [COTEJO_CIERRE]."""
+    try:
+        import compra_proveedor
+    except Exception as e:
+        log.error(f"compra_proveedor no disponible: {e}")
+        return
+    sos = compra_proveedor.sos_pendientes_cierre()
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[COTEJO_CIERRE]" + json.dumps({"candidatos": sos}, ensure_ascii=False),
+        "procesado": True, "metadata": {"cotejo_cierre": True},
+    }).execute()
+
+
+def _confirmar_cierre_venta(stream_id: str, so_id: str, facturado: bool, estado_anterior: str = "") -> None:
+    """Marca la dimensión FACTURADO del SO (la factura puede estar o no). Lo ENVIADO NO se marca a
+    mano: se deriva del historial de envíos (shipping). El so_stage se recalcula combinando ambas
+    dimensiones — el SO solo llega a «Closed - Shipped and Invoiced» cuando está TODO enviado Y
+    facturado (regla de Gabriel). Emite [SO_CERRADA_ETAPA4] con la bandera facturado (fuente de
+    verdad de esa dimensión para _facturado_so)."""
+    try:
+        import sales_shipping
+    except Exception as e:
+        log.error(f"sales_shipping no disponible: {e}")
+        return
+    enviado_total = _enviado_previo_so(stream_id, so_id)
+    nuevo_stage = sales_shipping.recalcular_so_stage(so_id, enviado_total, facturado)
+    res = {"ok": True, "so_id": so_id, "so_stage": nuevo_stage, "facturado": facturado,
+           "estado_anterior": estado_anterior,
+           "so_url": f"{sales_shipping.CRM_BASE}/index.php?module=SalesOrders&action=DetailView&record={so_id}"}
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[SO_CERRADA_ETAPA4]" + json.dumps(res, ensure_ascii=False),
+        "procesado": True, "metadata": {"so_cerrada_etapa4": True},
+    }).execute()
+    _log_stream(stream_id, f"Sales Order actualizada a «{nuevo_stage}» ✓", "ok")
+
+
+# ─────────────────────────────────────────────────────────────
+# SHIPPING (stream 'ordenes' / Sales order) — envío al cliente
+# tracking -> elegir SO -> checklist de líneas + peso/dims/costo -> In Preparation
+# "shipped" -> elegir envío en preparación -> Shipped (resta stock, recalcula so_stage)
+# ─────────────────────────────────────────────────────────────
+def _enviado_previo_so(stream_id: str, so_id: str) -> dict:
+    """Suma lo YA enviado de este SO en envíos previos, del historial de [SHIPPING_ENVIADO] (claves
+    = part number compactado). Misma filosofía que _recibido_previo_po."""
+    acumulado: dict = {}
+    try:
+        rows = (supabase.table("mensajes").select("content")
+                .eq("stream_id", stream_id).ilike("content", "%SHIPPING_ENVIADO%").execute())
+        for r in (rows.data or []):
+            content = r.get("content") or ""
+            if not content.startswith("[SHIPPING_ENVIADO]"):
+                continue
+            try:
+                p = json.loads(content[len("[SHIPPING_ENVIADO]"):])
+            except Exception:
+                continue
+            if p.get("so_id") != so_id or not p.get("ok"):
+                continue
+            for ln in (p.get("lineas") or []):
+                import compra_proveedor
+                pc = compra_proveedor.sales_order._compact(ln.get("mfr_part_no") or "")
+                if pc:
+                    acumulado[pc] = acumulado.get(pc, 0) + (ln.get("quantity") or 0)
+    except Exception as e:
+        log.warning(f"No se pudo leer envíos previos del SO {so_id}: {e}")
+    return acumulado
+
+
+def _facturado_so(stream_id: str, so_id: str) -> bool:
+    """¿Este SO ya tiene factura? Se lee del último [SO_CERRADA_ETAPA4] del historial (dimensión
+    'facturado' independiente de lo enviado)."""
+    facturado = False
+    try:
+        rows = (supabase.table("mensajes").select("content")
+                .eq("stream_id", stream_id).ilike("content", "%SO_CERRADA_ETAPA4%")
+                .order("created_at").execute())
+        for r in (rows.data or []):
+            content = r.get("content") or ""
+            if not content.startswith("[SO_CERRADA_ETAPA4]"):
+                continue
+            try:
+                p = json.loads(content[len("[SO_CERRADA_ETAPA4]"):])
+            except Exception:
+                continue
+            if p.get("so_id") == so_id:
+                facturado = bool(p.get("facturado"))  # asc -> el último gana
+    except Exception as e:
+        log.warning(f"No se pudo leer facturado del SO {so_id}: {e}")
+    return facturado
+
+
+def _shippings_en_preparacion(stream_id: str) -> list:
+    """Envíos creados ([SHIPPING_CREADO]) que aún no se marcaron como enviados ([SHIPPING_ENVIADO]
+    con el mismo shipping_id). Derivado del historial."""
+    creados: dict = {}
+    enviados: set = set()
+    try:
+        rows = (supabase.table("mensajes").select("content")
+                .eq("stream_id", stream_id).ilike("content", "%SHIPPING_%")
+                .order("created_at").execute())
+        for r in (rows.data or []):
+            content = r.get("content") or ""
+            if content.startswith("[SHIPPING_CREADO]"):
+                try:
+                    p = json.loads(content[len("[SHIPPING_CREADO]"):])
+                except Exception:
+                    continue
+                if p.get("shipping_id"):
+                    creados[p["shipping_id"]] = p
+            elif content.startswith("[SHIPPING_ENVIADO]"):
+                try:
+                    p = json.loads(content[len("[SHIPPING_ENVIADO]"):])
+                except Exception:
+                    continue
+                if p.get("shipping_id"):
+                    enviados.add(p["shipping_id"])
+    except Exception as e:
+        log.warning(f"No se pudieron leer los envíos en preparación de {stream_id}: {e}")
+    return [c for sid, c in creados.items() if sid not in enviados]
+
+
+def _cuenta_del_stream(stream_id: str) -> dict | None:
+    """Cliente/cuenta de ESTE stream de Sales Order, derivado del [COTEJO_PO] más reciente en el
+    historial (el cotejo del PO, al inicio del flujo, ya resolvió y guardó la cuenta del cliente).
+    Se usa para ESCOPAR operaciones posteriores (envío, etc.) a la cuenta correcta — sin esto,
+    sos_por_enviar() mostraba Sales Orders de CUALQUIER cliente del sistema, no solo el de este
+    stream (bug real reportado por Gabriel con un PO de Weidmann)."""
+    try:
+        rows = (supabase.table("mensajes").select("content")
+                .eq("stream_id", stream_id).ilike("content", "%COTEJO_PO%")
+                .order("created_at", desc=True).limit(20).execute())
+        for r in (rows.data or []):
+            content = r.get("content") or ""
+            if not content.startswith("[COTEJO_PO]"):
+                continue
+            try:
+                p = json.loads(content[len("[COTEJO_PO]"):])
+            except Exception:
+                continue
+            cuenta = (p.get("cotejo") or {}).get("cuenta")
+            if cuenta and cuenta.get("id"):
+                return cuenta
+    except Exception as e:
+        log.warning(f"No se pudo derivar la cuenta del stream {stream_id}: {e}")
+    return None
+
+
+def _procesar_tracking_envio(stream_id: str, tracking: str = "") -> None:
+    """Llegó un tracking de salida -> muestra los Sales Orders pendientes de enviar para elegir a
+    cuál corresponde. Emite [SHIPPING_COTEJO] modo elegir_so."""
+    try:
+        import sales_shipping
+    except Exception as e:
+        log.error(f"sales_shipping no disponible: {e}")
+        return
+    _cuenta = _cuenta_del_stream(stream_id)
+    sos = sales_shipping.sos_por_enviar(cuenta_id=(_cuenta or {}).get("id", ""))
+    if not sos:
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": "No tengo Sales Orders pendientes de enviar ahorita.",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[SHIPPING_COTEJO]" + json.dumps({
+            "modo": "elegir_so", "tracking": tracking, "candidatos": sos, "sin_match": len(sos) > 1,
+        }, ensure_ascii=False),
+        "procesado": True, "metadata": {"shipping_cotejo": True},
+    }).execute()
+    _log_stream(stream_id, f"{len(sos)} Sales Order(s) pendiente(s) de enviar", "ok")
+
+
+def _preparar_envio(stream_id: str, so_id: str, tracking: str = "") -> None:
+    """El usuario eligió el SO -> arma el checklist de líneas por enviar (restante = pedido − ya
+    enviado) + campos de peso/dimensiones/costo. Emite [SHIPPING_FORM]."""
+    try:
+        import sales_shipping
+    except Exception as e:
+        log.error(f"sales_shipping no disponible: {e}")
+        return
+    ya_enviado = _enviado_previo_so(stream_id, so_id)
+    lineas = sales_shipping.cantidades_por_enviar(so_id, ya_enviado)
+    for l in lineas:
+        l["cantidad_sugerida"] = l["cantidad_restante"]
+        l["enviar"] = l["cantidad_restante"] > 0
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[SHIPPING_FORM]" + json.dumps({"so_id": so_id, "tracking": tracking, "lineas": lineas},
+                                                  ensure_ascii=False),
+        "procesado": True, "metadata": {"shipping_form": True},
+    }).execute()
+    _log_stream(stream_id, "Captura qué se envía y los datos del paquete", "ok")
+
+
+def _crear_shipping_confirmado(stream_id: str, so_id: str, lineas: list, datos: dict) -> None:
+    """Crea el Shipping en 'In Preparation' con las líneas y datos logísticos capturados. Emite
+    [SHIPPING_CREADO] (las líneas con su line_id viajan aquí para marcar_enviado/deshacer después)."""
+    try:
+        import sales_shipping
+    except Exception as e:
+        log.error(f"sales_shipping no disponible: {e}")
+        return
+    res = sales_shipping.crear_shipping(so_id, lineas, datos)
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[SHIPPING_CREADO]" + json.dumps(res, ensure_ascii=False),
+        "procesado": True, "metadata": {"shipping_creado": True},
+    }).execute()
+    _log_stream(stream_id, "Envío creado en preparación — teclea «shipped» cuando salga" if res.get("ok") else "No se pudo crear el envío",
+                "ok" if res.get("ok") else "error")
+
+
+def _cotejo_marcar_shipped(stream_id: str) -> None:
+    """El usuario tecleó «shipped» -> muestra los envíos en preparación para elegir cuál ya salió.
+    Emite [SHIPPING_COTEJO] modo marcar_shipped."""
+    prep = _shippings_en_preparacion(stream_id)
+    if not prep:
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": "No tengo envíos en preparación. Manda el tracking de un envío para crearlo primero.",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[SHIPPING_COTEJO]" + json.dumps({
+            "modo": "marcar_shipped", "candidatos": prep, "sin_match": len(prep) > 1,
+        }, ensure_ascii=False),
+        "procesado": True, "metadata": {"shipping_cotejo": True},
+    }).execute()
+    _log_stream(stream_id, f"{len(prep)} envío(s) en preparación", "ok")
+
+
+def _marcar_shipped_confirmado(stream_id: str, ship_id: str, lineas: list, so_id: str, tracking: str = "") -> None:
+    """Marca el envío como 'Shipped': resta stock, recalcula so_stage con lo enviado acumulado
+    (previo + este). Emite [SHIPPING_ENVIADO]."""
+    try:
+        import sales_shipping, compra_proveedor
+    except Exception as e:
+        log.error(f"sales_shipping no disponible: {e}")
+        return
+    enviado_total = dict(_enviado_previo_so(stream_id, so_id))
+    for ln in (lineas or []):
+        pc = compra_proveedor.sales_order._compact(ln.get("mfr_part_no") or "")
+        if pc:
+            enviado_total[pc] = enviado_total.get(pc, 0) + (compra_proveedor.sales_order._num(ln.get("quantity")) or 0)
+    # so_stage ANTES de este envío, para poder deshacer correctamente
+    so_stage_anterior = compra_proveedor.sales_order._crm_get(f"data/SalesOrder/{so_id}").get("record", {}).get("so_stage", "Ordered")
+    facturado = _facturado_so(stream_id, so_id)  # dimensión factura, del historial
+    res = sales_shipping.marcar_enviado(ship_id, lineas, so_id, tracking=tracking,
+                                        enviado_total=enviado_total, facturado=facturado)
+    res["lineas"] = lineas  # para _enviado_previo_so y para deshacer
+    res["so_stage_anterior"] = so_stage_anterior
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[SHIPPING_ENVIADO]" + json.dumps(res, ensure_ascii=False),
+        "procesado": True, "metadata": {"shipping_enviado": True},
+    }).execute()
+    _log_stream(stream_id, f"Envío marcado como enviado — SO → {res.get('so_stage','')}" if res.get("ok") else "No se pudo marcar",
+                "ok" if res.get("ok") else "error")
+
+
+def _deshacer_shipping(stream_id: str, ship_id: str, lineas: list, so_id: str,
+                       estaba_enviado: bool, so_stage_anterior: str) -> None:
+    """Deshace un envío (regresa stock si estaba enviado, borra el Shipping, restaura so_stage)."""
+    try:
+        import sales_shipping
+    except Exception:
+        return
+    res = sales_shipping.deshacer_shipping(ship_id, lineas, so_id=so_id,
+                                           estaba_enviado=estaba_enviado, so_stage_anterior=so_stage_anterior)
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[ACCION_DESHECHA]" + json.dumps({**res, "que": "este envío"}, ensure_ascii=False),
+        "procesado": True, "metadata": {"accion_deshecha": True},
+    }).execute()
+    _log_stream(stream_id, "Envío deshecho ✓" if res.get("ok") else "No se pudo deshacer", "ok" if res.get("ok") else "error")
+
+
+def _procesar_estado_operativo(stream_id: str) -> None:
+    """Rollup Vendido→Comprado→Pagado→Recibido→Facturado de las Sales Orders con actividad en
+    este stream. Reconstruye qué PO/Bill le pertenece a cada SO desde el HISTORIAL de mensajes
+    (fuente confiable — el endpoint de lista de 1CRM no refleja registros recientes, verificado
+    en vivo), no escaneando 1CRM a ciegas. Emite [ESTADO_OPERATIVO]."""
+    try:
+        import compra_proveedor
+    except Exception as e:
+        log.error(f"compra_proveedor no disponible: {e}")
+        return
+
+    por_so: dict = {}   # so_id -> {po_ids:set, bill_ids:set, bill_ids_pagadas:set}
+    try:
+        rows = (supabase.table("mensajes").select("content")
+                .eq("stream_id", stream_id)
+                .or_("content.ilike.%PO_CREADO%,content.ilike.%PAGO_REGISTRADO%")
+                .execute())
+        for r in (rows.data or []):
+            content = r.get("content") or ""
+            if content.startswith("[PO_CREADO]"):
+                try:
+                    payload = json.loads(content[len("[PO_CREADO]"):])
+                except Exception:
+                    continue
+                for res in payload.get("resultados", []):
+                    if not res.get("ok") or not res.get("so_id"):
+                        continue
+                    entry = por_so.setdefault(res["so_id"], {"po_ids": set(), "bill_ids": set(), "bill_ids_pagadas": set()})
+                    if res.get("po_id"):
+                        entry["po_ids"].add(res["po_id"])
+                    if res.get("bill_id"):
+                        entry["bill_ids"].add(res["bill_id"])
+            elif content.startswith("[PAGO_REGISTRADO]"):
+                try:
+                    res = json.loads(content[len("[PAGO_REGISTRADO]"):])
+                except Exception:
+                    continue
+                if res.get("ok") and res.get("bill_id"):
+                    for entry in por_so.values():
+                        if res["bill_id"] in entry["bill_ids"]:
+                            entry["bill_ids_pagadas"].add(res["bill_id"])
+    except Exception as e:
+        log.warning(f"No se pudo leer historial para estado operativo: {e}")
+
+    if not por_so:
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": "No tengo ninguna compra registrada en este stream todavía para armar el estado operativo.",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return
+
+    _log_stream(stream_id, f"Armando estado operativo de {len(por_so)} venta(s)…", "info")
+    ventas = [
+        compra_proveedor.estado_operativo_so(
+            sid, po_ids=list(v["po_ids"]), bill_ids=list(v["bill_ids"]), bill_ids_pagadas=v["bill_ids_pagadas"])
+        for sid, v in por_so.items()
+    ]
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[ESTADO_OPERATIVO]" + json.dumps({"ventas": ventas}, ensure_ascii=False),
+        "procesado": True, "metadata": {"estado_operativo": True},
+    }).execute()
+    _log_stream(stream_id, "Estado operativo listo", "ok")
+
+
+def procesar_mensaje(msg: dict) -> None:
+    msg_id    = msg["id"]
+    stream_id = msg.get("stream_id", "")
+    contenido = msg.get("content", "")
+
+    # Tipo del stream → prompt focalizado (base + solo los modos de ese propósito). Si no hay tipo
+    # reconocido, _build_system_prompt devuelve el prompt completo (comportamiento actual).
+    _tipo_stream = None
+    try:
+        if stream_id:
+            _sres = supabase.table("streams").select("tipo").eq("id", stream_id).single().execute()
+            _tipo_stream = (_sres.data or {}).get("tipo")
+    except Exception as e:
+        log.warning(f"No se pudo leer tipo del stream: {e}")
+    _system_prompt = _build_system_prompt(_tipo_stream)
+
+    log.info(f"Chat msg {msg_id[:8]} | stream={stream_id!r} tipo={_tipo_stream!r} "
+             f"prompt={len(_system_prompt)}ch | '{contenido[:60]}...'")
+
+    # Marcar como procesado
+    supabase.table("mensajes").update({"procesado": True}).eq("id", msg_id).execute()
+
+    # PIPELINE DE ORDEN DE COMPRA: si es un stream 'ordenes' y llega un archivo (PO), léelo y
+    # coteja contra las cotizaciones del cliente — sin pasar por el modelo. Emite el widget y termina.
+    _md0 = msg.get("metadata") if isinstance(msg.get("metadata"), dict) else {}
+    _po_url = _md0.get("file_url") or _md0.get("po_url")
+    if _tipo_stream in ("ordenes", "sales_order"):
+        _file_url  = _md0.get("file_url") or _md0.get("po_url")
+        _file_name = _md0.get("file_name", "")
+        _file_mime = _md0.get("file_mime", "")
+
+        # Confirmaciones (botón ya apretado) — van primero.
+        if _md0.get("so_action") == "crear":
+            _crear_so_confirmada(stream_id, _md0.get("draft") or {})
+            return
+        if _md0.get("so_action") == "elegir_cotizacion":
+            _recotejar_con_cotizacion(stream_id, _md0.get("po") or {}, _md0.get("quote_id", ""))
+            return
+        # SHIPPING (envío al cliente): tracking -> elegir SO -> form -> In Preparation;
+        # "shipped" -> elegir envío -> Shipped.
+        if _md0.get("shipping_action") == "preparar":
+            _preparar_envio(stream_id, _md0.get("so_id", ""), _md0.get("tracking", ""))
+            return
+        if _md0.get("shipping_action") == "crear":
+            _crear_shipping_confirmado(stream_id, _md0.get("so_id", ""), _md0.get("lineas") or [],
+                                       _md0.get("datos") or {})
+            return
+        if _md0.get("shipping_action") == "marcar_shipped":
+            _marcar_shipped_confirmado(stream_id, _md0.get("shipping_id", ""), _md0.get("lineas") or [],
+                                       _md0.get("so_id", ""), _md0.get("tracking", ""))
+            return
+        if _md0.get("shipping_action") == "deshacer":
+            _deshacer_shipping(stream_id, _md0.get("shipping_id", ""), _md0.get("lineas") or [],
+                               _md0.get("so_id", ""), bool(_md0.get("estaba_enviado")),
+                               _md0.get("so_stage_anterior", ""))
+            return
+        # CIERRE / facturación (movido de compras a ordenes, donde corresponde).
+        if _md0.get("cierre_action") == "confirmar":
+            _confirmar_cierre_venta(stream_id, _md0.get("so_id", ""),
+                                    bool(_md0.get("facturado")), _md0.get("estado_anterior", ""))
+            return
+        if _md0.get("cierre_action") == "deshacer":
+            _deshacer_cierre(stream_id, _md0.get("so_id", ""), _md0.get("estado_anterior", ""))
+            return
+        if _md0.get("cancelar_accion"):
+            supabase.table("mensajes").insert({
+                "stream_id": stream_id, "role": "assistant",
+                "content": "Entendido, no hice nada con eso. Mándame el dato correcto cuando quieras.",
+                "procesado": True, "metadata": {},
+            }).execute()
+            return
+
+        # Clasificación de evidencia/texto nuevo.
+        _urls = re.findall(r'https?://\S+', contenido or "")
+        _low = (contenido or "").lower()
+        _es_shipped = bool(re.search(r'\bshipped\b|marcar.*(enviad|shipped)|ya (se )?(envi[oó]|sali[oó])', _low))
+        _es_factura = bool(re.search(r'factura|firmad|facturad|facturar|cerrar\s+venta', _low))
+        _es_estado = (not _file_url and not _urls and
+                      bool(re.search(r'c[oó]mo va|estado (de la venta|operativo)|estatus de la venta|rollup|resumen de (la )?venta', _low)))
+        # BUG REAL confirmado: \b[A-Z0-9]{8,30}\b también matcheaba palabras normales en MAYÚSCULAS
+        # sin nada de tracking (ej. "COTIZACION", 10 letras) — cualquier mensaje en mayúsculas con
+        # una palabra larga se clasificaba como "está dando un número de guía". Un tracking real
+        # SIEMPRE trae al menos un dígito (UPS/FedEx/DHL); exigirlo descarta las palabras sueltas
+        # sin tocar los casos reales (alfanumérico o solo dígitos).
+        _es_tracking = (not _es_shipped and not _es_estado and
+                        bool(_urls or re.search(r'tracking|gu[ií]a|rastreo|n[uú]mero de env[ií]o|env[ií]o|shipping', _low)
+                             or re.search(r'\b(?=[A-Z0-9]{8,30}\b)[A-Z0-9]*\d[A-Z0-9]*\b', contenido or "")))
+
+        if _file_url:
+            # Una IMAGEN en ordenes puede ser la guía de envío (tracking saliente) o la orden de
+            # compra del cliente — se clasifica con visión. Un PDF/otro se asume orden del cliente.
+            _es_img = (_file_mime or "").startswith("image/") or re.search(r'\.(png|jpe?g|webp|gif|heic)$', (_file_name or "").lower())
+            if _es_img:
+                try:
+                    import sales_shipping
+                    _imgs = _bajar_imagenes(_file_url, _file_name, _file_mime)
+                    _ev = sales_shipping.leer_evidencia_envio(_imgs)
+                except Exception as e:
+                    log.warning(f"No se pudo clasificar la imagen de ventas: {e}")
+                    _ev = {"tipo": "orden_compra"}
+                if _ev.get("tipo") == "tracking":
+                    _procesar_tracking_envio(stream_id, _ev.get("tracking", "") or (contenido or "").strip())
+                    return
+            # orden de compra del cliente (flujo existente).
+            _procesar_orden_compra(stream_id, _file_url, _file_name or "orden", _file_mime)
+            return
+        # Texto/link pegado: ¿es una ORDEN DE COMPRA? (copy-paste del correo/portal del cliente). Un link
+        # de paquetería (UPS/FedEx/DHL/Estafeta...) o un mensaje corto de tracking NO lo es.
+        _carrier = re.search(r'ups\.com|fedex|dhl|estafeta|paquetexpress|tracking|rastreo|17track|correos', _low)
+        _kw_po = len(re.findall(r'orden de compra|purchase order|\bpo\b|cantidad|quantity|qty|precio|price|item|part\s*(no|number)|descripci', _low))
+        _lineas = len([l for l in (contenido or "").splitlines() if l.strip()])
+        if not _file_url and not _es_shipped and not _es_estado and not _carrier:
+            _url_po = next((u for u in _urls), "")
+            if _url_po and len(_urls) == 1 and len((contenido or "").replace(_url_po, "").strip()) < 80:
+                _procesar_orden_compra_texto(stream_id, url=_url_po.rstrip(").,"))
+                return
+            if len(contenido or "") >= 120 and (_kw_po >= 2 or _lineas >= 4):
+                _procesar_orden_compra_texto(stream_id, texto=contenido or "")
+                return
+        if _es_shipped:
+            _cotejo_marcar_shipped(stream_id)
+            return
+        if _es_factura:
+            _procesar_cierre_venta(stream_id)
+            return
+        if _es_estado:
+            _procesar_estado_operativo(stream_id)
+            return
+        if _es_tracking:
+            _procesar_tracking_envio(stream_id, (contenido or "").strip())
+            return
+        # Si no matchea nada operativo, cae al chat normal (LLM) — no return.
+
+    # PIPELINE DE COMPRAS: stream tipo 'compras'. Router determinista (sin LLM) que despacha a la
+    # tarea correspondiente según la evidencia que llegue — el usuario no necesita saber a qué
+    # "sub-chat" pertenece. Etapa 1 (match SO + crear PO/AP) primero; luego confirmaciones de las
+    # etapas 2-4 (pagos, recepción, cierre de venta) por metadata explícita del botón que apretó.
+    if _tipo_stream == "compras":
+        _file_url  = _md0.get("file_url", "")
+        _file_name = _md0.get("file_name", "")
+        _file_mime = _md0.get("file_mime", "")
+
+        # Confirmaciones (botón ya apretado en un widget de previo) — van primero.
+        if _md0.get("po_action") == "crear":
+            _crear_po_confirmado(stream_id, _md0.get("grupos") or [])
+            return
+        if _md0.get("po_action") == "deshacer":
+            _deshacer_po(stream_id, _md0.get("po_id", ""), _md0.get("bill_id", ""))
+            return
+        if _md0.get("pago_action") == "confirmar":
+            _confirmar_pago(stream_id, _md0.get("tipo", "bill"), _md0.get("registro_id", ""),
+                            _md0.get("monto", 0), _md0.get("datos_comprobante") or {})
+            return
+        if _md0.get("pago_action") == "deshacer":
+            _deshacer_pago(stream_id, _md0.get("payment_id", ""))
+            return
+        if _md0.get("pago_action") == "iniciar_registro":
+            _iniciar_registro_desde_pago(stream_id, _md0.get("direccion", "outgoing"),
+                                         _md0.get("monto", 0), _md0.get("datos_comprobante") or {})
+            return
+        # Receiving v2 — sub-proceso anidado con ciclo de vida (secuencia flexible):
+        # activar (order confirmation/packing list) -> tracking (en tránsito) -> iniciar_recepcion
+        # (foto del paquete -> checklist) -> confirmar_recepcion (suma stock, cierra si completo).
+        if _md0.get("receiving_action") == "activar":
+            _activar_receiving(stream_id, _md0.get("po_id", ""), _md0.get("candidato") or {},
+                               _md0.get("doc") or None, _md0.get("tracking", ""))
+            return
+        if _md0.get("receiving_action") == "tracking":
+            _marcar_en_transito(stream_id, _md0.get("po_id", ""), _md0.get("tracking", ""))
+            return
+        if _md0.get("receiving_action") == "iniciar_recepcion":
+            _iniciar_recepcion(stream_id, _md0.get("po_id", ""), _md0.get("guia", ""))
+            return
+        if _md0.get("receiving_action") == "confirmar_recepcion":
+            _confirmar_recepcion_checklist(stream_id, _md0.get("po_id", ""),
+                                           _md0.get("cantidades") or {}, _md0.get("estado_anterior", ""))
+            return
+        if _md0.get("receiving_action") == "deshacer":
+            _deshacer_receiving(stream_id, _md0.get("po_id", ""), _md0.get("cantidades") or {},
+                                _md0.get("estado_anterior", ""))
+            return
+        if _md0.get("cancelar_accion"):
+            supabase.table("mensajes").insert({
+                "stream_id": stream_id, "role": "assistant",
+                "content": "Entendido, no hice nada con eso. Mándame el link/foto/dato correcto cuando quieras.",
+                "procesado": True, "metadata": {},
+            }).execute()
+            return
+
+        # Clasificación de evidencia nueva (sin botón todavía). El cierre/facturación se movió al
+        # stream 'ordenes' (Sales order) — aquí solo compra, pago y recepción.
+        _urls = re.findall(r'https?://\S+', contenido or "")
+        _low = (contenido or "").lower()
+        _es_estado = (not _file_url and not _urls and
+                     bool(re.search(r'c[oó]mo va|estado (de la venta|operativo)|estatus de la venta|rollup|resumen de (la )?venta', _low)))
+        _es_tracking_texto = (not _file_url and not _urls and not _es_estado and
+                              bool(re.search(r'tracking|gu[ií]a|rastreo|n[uú]mero de env[ií]o', _low) or
+                                   re.search(r'\b[A-Z0-9]{8,30}\b', contenido or "")))
+
+        if _urls:
+            _procesar_link_proveedor(stream_id, _urls)
+        elif _file_url and _procesar_captura_compra(stream_id, _file_url, _file_name, _file_mime):
+            pass  # captura de compra en línea → ya emitió el cotejo contra Sales Orders
+        elif _file_url and re.search(r'paquete|lleg|recib|contenido|packing|confirmation|confirmaci[oó]n|order\s*conf|gu[ií]a|tracking|env[ií]o|recepci[oó]n|receiving', _low + " " + (_file_name or "").lower()):
+            _procesar_evidencia_receiving(stream_id, contenido, _file_url, _file_name, _file_mime)
+        elif _file_url:
+            # Default para un archivo sin más contexto: comprobante de pago (el caso más común
+            # del transcript — "pagué algo, saco una foto").
+            _procesar_comprobante_pago(stream_id, _file_url, _file_name, _file_mime)
+        elif _es_estado:
+            _procesar_estado_operativo(stream_id)
+        elif _es_tracking_texto:
+            _procesar_evidencia_receiving(stream_id, contenido)
+        else:
+            supabase.table("mensajes").insert({
+                "stream_id": stream_id, "role": "assistant",
+                "content": "Mándame el link del producto que vas a comprar, una foto/PDF del "
+                           "comprobante de pago, o el tracking/packing list de una recepción — "
+                           "y sigo desde ahí.",
+                "procesado": True, "metadata": {},
+            }).execute()
+        return
+
+    # PIPELINE DE PAGOS: stream tipo 'pagos'. Mismo backend que la Etapa 2 dentro de 'compras'
+    # (pagos.py) — aquí NO hace falta clasificar tipo de evidencia primero: cualquier archivo
+    # subido en este stream se asume comprobante de pago directo.
+    if _tipo_stream == "pagos":
+        _file_url  = _md0.get("file_url", "")
+        _file_name = _md0.get("file_name", "")
+        _file_mime = _md0.get("file_mime", "")
+
+        if _md0.get("pago_action") == "confirmar":
+            _confirmar_pago(stream_id, _md0.get("tipo", "bill"), _md0.get("registro_id", ""),
+                            _md0.get("monto", 0), _md0.get("datos_comprobante") or {})
+            return
+        if _md0.get("pago_action") == "deshacer":
+            _deshacer_pago(stream_id, _md0.get("payment_id", ""))
+            return
+        if _md0.get("pago_action") == "iniciar_registro":
+            _iniciar_registro_desde_pago(stream_id, _md0.get("direccion", "outgoing"),
+                                         _md0.get("monto", 0), _md0.get("datos_comprobante") or {})
+            return
+        if _md0.get("cancelar_accion"):
+            supabase.table("mensajes").insert({
+                "stream_id": stream_id, "role": "assistant",
+                "content": "Entendido, no hice nada con eso. Mándame el comprobante correcto cuando quieras.",
+                "procesado": True, "metadata": {},
+            }).execute()
+            return
+
+        if _file_url:
+            _procesar_comprobante_pago(stream_id, _file_url, _file_name, _file_mime)
+        else:
+            supabase.table("mensajes").insert({
+                "stream_id": stream_id, "role": "assistant",
+                "content": "Mándame una foto, captura o PDF del comprobante de pago (a proveedor "
+                           "o de un cliente) y lo cotejo contra lo que tengas abierto en 1CRM.",
+                "procesado": True, "metadata": {},
+            }).execute()
+        return
+
+    # Los triggers [SISTEMA:...] los maneja el widget del frontend — no necesitan respuesta de Claude
+    if contenido.startswith("[SISTEMA:"):
+        log.info(f"Trigger sistema ignorado (widget lo maneja): {contenido[:60]}")
+        return
+
+    # Obtener historial del stream (últimos 10 mensajes, más recientes primero → revertir)
+    historial = []
+    try:
+        hist_resp = (
+            supabase.table("mensajes")
+            .select("role, content, procesado, metadata")
+            .eq("stream_id", stream_id)
+            .order("created_at", desc=True)
+            .limit(12)
+            .execute()
+        )
+        for r in reversed(hist_resp.data or []):
+            if r["role"] not in ("user", "assistant"):
+                continue
+            _md = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
+            if _md.get("estimado") or _md.get("correo_entrante"):
+                continue  # estimados y tarjetas de correo entrante no van al contexto
+            raw_content = r.get("content") or ""
+            if not raw_content or not isinstance(raw_content, str):
+                continue
+            if raw_content.startswith("[SISTEMA:"):
+                continue
+            content = raw_content
+            if r["role"] == "user" and r.get("procesado") and content != contenido:
+                content = "[mensaje anterior — ya procesado]"
+            # Evitar mensajes consecutivos del mismo rol (causa 400 en API de Claude)
+            if historial and historial[-1]["role"] == r["role"]:
+                continue
+            historial.append({"role": r["role"], "content": content})
+    except Exception as e:
+        log.warning(f"No se pudo cargar historial: {e}")
+        historial = [{"role": "user", "content": contenido}]
+
+    # Garantizar que el historial empieza con user y termina con el mensaje actual
+    while historial and historial[0]["role"] != "user":
+        historial.pop(0)
+    if not historial or historial[-1].get("content") != contenido:
+        historial.append({"role": "user", "content": contenido})
+
+    # Visión: si el mensaje trae imagen(es)/PDF(s), se adjuntan al último turno del usuario como
+    # bloques de visión/documento para que el modelo los lea TODOS en el mismo contexto y corra el
+    # flujo de publicar/RFQ. El resto del pipeline (texto) queda igual.
+    # - metadata.attachments: RFQ con varios screenshots/PDFs subidos juntos en un mensaje.
+    # - metadata.image_url: compat con el flujo viejo de una sola imagen (sigue vigente en otros streams).
+    try:
+        _md = msg.get("metadata") or {}
+        _attachments = _md.get("attachments") if isinstance(_md, dict) else None
+        _img_url = _md.get("image_url") if isinstance(_md, dict) else None
+    except Exception:
+        _attachments, _img_url = None, None
+    if _attachments and historial and historial[-1]["role"] == "user":
+        _bloques = _build_attachment_blocks(_attachments)
+        if _bloques:
+            historial[-1]["content"] = [
+                {"type": "text", "text": contenido or "Archivos adjuntos."}, *_bloques,
+            ]
+            log.info(f"Mensaje con {len(_bloques)} adjunto(s) → visión activada")
+    elif _img_url and historial and historial[-1]["role"] == "user":
+        _blk = _build_image_block(_img_url)
+        if _blk:
+            historial[-1]["content"] = [
+                {"type": "text", "text": contenido or "Imagen adjunta."}, _blk,
+            ]
+            log.info("Mensaje con imagen → visión activada")
+
+    # Log del stream: registrar la solicitud entrante (alimenta el log del UI)
+    _log_stream(stream_id, f'Solicitud recibida: "{contenido[:80]}"', "info")
+
+    # El estimado de tiempo ("procesando…") lo muestra el FRONTEND de forma inmediata como una
+    # burbuja animada que se borra sola al llegar la respuesta (ver App.tsx). Aquí NO insertamos
+    # un mensaje de estimado: hacerlo dejaba un texto plano pegado y duplicado.
+
+    # Llamar a Claude
+    token_counts = {"tokens_input": 0, "tokens_output": 0}
+    perf: dict = {}
+    _t_proc = time.time()
+    try:
+        roles = [m['role'] for m in historial]
+        print(f"[BRAIN] historial roles={roles} n={len(historial)}", flush=True)
+        respuesta, tools_used, rfqs_created, token_counts, perf = run_chat(historial, stream_id=str(stream_id), system_prompt=_system_prompt, tipo_stream=_tipo_stream)
+    except Exception as e:
+        import traceback as _tb
+        print(f"[BRAIN ERROR] {e}", flush=True)
+        _tb.print_exc()
+        log.error(f"Error en Claude (completo): {e}")
+        _err_str = str(e)
+        _sin_saldo = "credit balance is too low" in _err_str.lower() or "plans & billing" in _err_str.lower()
+        _log_stream(stream_id, f"Error procesando el mensaje: {_err_str[:150]}", "error")
+        if _sin_saldo:
+            respuesta = (
+                "⚠️ Sin saldo en la API de Anthropic — no se puede procesar mensajes ahorita. "
+                "Hay que recargar créditos en console.anthropic.com → Plans & Billing. "
+                "En cuanto se recargue, vuelve a mandar tu mensaje."
+            )
+            _notif(
+                stream_id,
+                "⚠️ Sin saldo en Anthropic API — el chat dejó de procesar mensajes",
+                "Recarga créditos en console.anthropic.com → Plans & Billing. Todos los streams (RFQ, correo, whatsapp, compras) están bloqueados hasta que se resuelva.",
+                tipo="error",
+            )
+        else:
+            respuesta = f"Error procesando tu mensaje. Intenta de nuevo. ({_err_str[:400]})"
+        tools_used   = []
+        rfqs_created = False
+    # Tiempo de cola: desde que el usuario mandó el mensaje hasta que empezó a procesarse.
+    try:
+        _created = msg.get("created_at")
+        if _created:
+            _t0 = datetime.fromisoformat(_created.replace("Z", "+00:00"))
+            perf["cola_s"] = round((datetime.now(timezone.utc) - _t0).total_seconds() - (time.time() - _t_proc), 1)
+    except Exception:
+        pass
+
+    # Registrar job de chat con tokens para que agente_monitor los sume
+    try:
+        supabase.table("jobs").insert({
+            "agente": "chat",
+            "estado": "completado",
+            "output": {
+                **token_counts,
+                "tokens_total": token_counts["tokens_input"] + token_counts["tokens_output"],
+                "tools_used":   tools_used,
+                "perf":         perf,
+                "stream_id":    str(stream_id) if stream_id else None,
+            },
+        }).execute()
+    except Exception as e:
+        log.warning(f"No se pudo registrar job de chat: {e}")
+
+    # Si se crearon RFQs exitosamente, el widget confirma visualmente — no insertar texto
+    if rfqs_created:
+        log.info("RFQs creados exitosamente — widget maneja UI, omitiendo respuesta")
+        return
+
+    # Respuesta vacía: NO dejar al usuario sin nada (antes se hacía return y el mensaje
+    # quedaba "procesado" sin respuesta → parecía que el chat no contestaba). Insertar un
+    # fallback salvo que se hayan creado RFQs (ese caso ya se manejó arriba).
+    if not respuesta.strip():
+        log.warning("Respuesta vacía del modelo — insertando fallback")
+        log.warning(f"[PERF] respuesta VACÍA tras tools={tools_used}")
+        respuesta = ("Procesé tu solicitud pero no generé un mensaje de respuesta. "
+                     "¿Puedes reformular o intentar de nuevo?")
+
+    # Guardar respuesta del asistente
+    log.info(f"Insertando respuesta | stream_id={str(stream_id)!r} | len={len(respuesta)}")
+    insert_resp = supabase.table("mensajes").insert({
+        "stream_id": stream_id if stream_id else None,
+        "role":      "assistant",
+        "content":   respuesta,
+        "procesado": True,
+        "metadata":  {"tools_used": tools_used, "perf": perf},
+    }).execute()
+    if hasattr(insert_resp, 'error') and insert_resp.error:
+        log.error(f"Error insertando respuesta: {insert_resp.error}")
+    else:
+        log.info(f"Respuesta enviada | tools={tools_used} | tokens={token_counts}")
+
+
+# ─────────────────────────────────────────────────────────────
+# MAIN LOOP
+# ─────────────────────────────────────────────────────────────
+def main() -> None:
+    log.info("Agente Chat iniciado — escuchando tabla `mensajes`...")
+
+    # Al arrancar, descartar SOLO el backlog realmente viejo (>5 min) para no responder a
+    # mensajes de sesiones pasadas. Los mensajes recientes (<5 min) NO se descartan: así, si
+    # el worker reinicia justo después de que el usuario envió algo, ese mensaje SÍ se procesa
+    # en lugar de quedar "procesado" sin respuesta (antes se marcaban TODOS → se perdían).
+    try:
+        from datetime import timedelta
+        corte = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        supabase.table("mensajes").update({"procesado": True}).filter(
+            "procesado", "is", "false"
+        ).eq("role", "user").lt("created_at", corte).execute()
+    except Exception:
+        pass
+
+    while True:
+        try:
+            resp = (
+                supabase.table("mensajes")
+                .select("*")
+                .eq("role", "user")
+                .filter("procesado", "is", "false")
+                .order("created_at")
+                .limit(1)
+                .execute()
+            )
+            if resp.data:
+                procesar_mensaje(resp.data[0])
+        except Exception as e:
+            log.error(f"Error en loop chat: {e}")
+
+        time.sleep(POLL_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
