@@ -4298,6 +4298,56 @@ def _procesar_link_proveedor(stream_id: str, urls: list[str]) -> None:
     log.info(f"Cotejo proveedor emitido | {cotejo.get('resumen','')}")
 
 
+def _procesar_captura_compra(stream_id: str, file_url: str, nombre: str = "", mime: str = "") -> bool:
+    """Captura/PDF de una compra en línea (checkout, carrito, resumen de pedido de eBay/Amazon/etc.)
+    en el stream 'compras': lee tienda + productos + precios y los manda al MISMO cotejo que un link
+    (Sales Orders abiertas → borrador de PO para aprobar). Devuelve True si lo atendió; False si el
+    archivo NO es una compra (comprobante de pago, packing list/tracking, otro) para que el router
+    siga con su flujo de siempre. Antes TODO archivo sin palabras clave caía a comprobante de pago
+    y respondía "no encontré cuenta por pagar" cuando la compra aún no tiene PO. NO escribe al CRM."""
+    try:
+        import compra_proveedor
+    except Exception as e:
+        log.error(f"compra_proveedor no disponible: {e}")
+        return False
+    try:
+        imgs = _bajar_imagenes(file_url, nombre, mime)
+        datos = compra_proveedor.leer_captura_compra(imgs)
+    except Exception as e:
+        log.error(f"_procesar_captura_compra: {e}")
+        return False
+    if datos.get("error"):
+        return False
+    tipo = datos.get("tipo", "otro")
+    if tipo == "order_confirmation":
+        # Un order confirmation con compras ya en tránsito = activar receiving (flujo existente);
+        # sin ninguna en tránsito es la compra que aún no tiene PO.
+        try:
+            if compra_proveedor.pos_esperando_recepcion():
+                return False
+        except Exception:
+            return False
+    elif tipo != "compra_online":
+        return False
+    links = compra_proveedor.captura_a_links(datos)
+    if not links:
+        return False
+    _log_stream(stream_id, f"Captura de compra en {datos.get('tienda') or 'tienda en línea'}: "
+                           f"{len(links)} producto(s). Buscando Sales Orders…", "info")
+    cotejo = compra_proveedor.buscar_sales_orders_candidatas(links)
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[COTEJO_PROVEEDOR]" + json.dumps({
+            "links": links, "cotejo": cotejo,
+            "captura": {"tienda": datos.get("tienda", ""), "orden_numero": datos.get("orden_numero", ""),
+                        "total": datos.get("total"), "moneda": datos.get("moneda", "")},
+        }, ensure_ascii=False),
+        "procesado": True, "metadata": {"cotejo_proveedor": True},
+    }).execute()
+    _log_stream(stream_id, cotejo.get("resumen", "Cotejo listo"), "ok")
+    return True
+
+
 def _crear_po_confirmado(stream_id: str, grupos: list) -> None:
     """Crea el/los Purchase Order(s) + Cuenta(s) por Pagar tras la aprobación del usuario
     (metadata.po_action='crear'). Un `grupo` = un draft de compra_proveedor.crear_po_y_ap
@@ -5406,6 +5456,8 @@ def procesar_mensaje(msg: dict) -> None:
 
         if _urls:
             _procesar_link_proveedor(stream_id, _urls)
+        elif _file_url and _procesar_captura_compra(stream_id, _file_url, _file_name, _file_mime):
+            pass  # captura de compra en línea → ya emitió el cotejo contra Sales Orders
         elif _file_url and re.search(r'paquete|lleg|recib|contenido|packing|confirmation|confirmaci[oó]n|order\s*conf|gu[ií]a|tracking|env[ií]o|recepci[oó]n|receiving', _low + " " + (_file_name or "").lower()):
             _procesar_evidencia_receiving(stream_id, contenido, _file_url, _file_name, _file_mime)
         elif _file_url:

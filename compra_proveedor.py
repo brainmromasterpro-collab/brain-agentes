@@ -211,6 +211,61 @@ def _mapa_ya_comprado(limite: int = 30) -> dict:
     return mapa
 
 
+
+# ─────────────────────────────────────────────────────────────
+# 1b. CAPTURA DE COMPRA EN LÍNEA (screenshot/PDF del checkout o confirmación de una tienda)
+# Mismo destino que pegar el link: se convierte en "links" sintéticos y entra al mismo cotejo
+# contra Sales Orders abiertas (buscar_sales_orders_candidatas) → borrador de PO para aprobar.
+# ─────────────────────────────────────────────────────────────
+_INSTR_CAPTURA = (
+    "Clasifica esta imagen del flujo de compras de una empresa y extrae datos. Devuelve SOLO un JSON "
+    "(sin ``` ni explicaciones) con el esquema exacto:\n"
+    '{"tipo": "compra_online"|"order_confirmation"|"comprobante_pago"|"packing_tracking"|"otro", '
+    '"tienda": "nombre de la tienda/vendedor a quien se le compra (eBay, Amazon, Mercado Libre, '
+    'Grainger, etc.) o \"\"", '
+    '"orden_numero": "número de pedido si aparece o \"\"", "moneda": "USD"|"MXN"|"EUR"|"", '
+    '"total": number o null, "envio": number o null, '
+    '"items": [{"nombre": "título del producto tal cual", "marca": "", "part_number": "modelo/SKU/MPN '
+    'si aparece, o \"\"", "cantidad": number, "precio_unitario": number o null}]}\n'
+    "Definiciones: compra_online = carrito, checkout, resumen de pedido o página de pago de una TIENDA "
+    "EN LÍNEA con productos y precios (aunque aún no se pague); order_confirmation = correo/página de "
+    "pedido ya confirmado; comprobante_pago = recibo/transferencia bancaria sin lista de productos; "
+    "packing_tracking = packing list, guía o foto de paquete. Si hay varios productos, lista todos. "
+    "El precio_unitario es por pieza (si solo ves el total de la línea, divídelo entre la cantidad). "
+    "NO inventes: si algo no es legible usa \"\" o null."
+)
+
+
+def leer_captura_compra(imagenes: list[bytes], model_id: str = "") -> dict:
+    """Clasifica una captura/PDF del flujo de compras y, si es una compra en línea, extrae tienda,
+    productos, cantidades y precios (visión de Claude)."""
+    datos = _leer_con_vision(imagenes, _INSTR_CAPTURA, model_id, max_tokens=1500)
+    if datos.get("error"):
+        return datos
+    datos.setdefault("tipo", "otro")
+    datos.setdefault("items", [])
+    return datos
+
+
+def captura_a_links(datos: dict) -> list[dict]:
+    """Convierte los productos leídos de la captura al mismo formato de 'link leído' que produce
+    _extraer_producto_link, para reusar buscar_sales_orders_candidatas sin duplicar el cotejo."""
+    out = []
+    for it in (datos.get("items") or []):
+        nombre = (it.get("nombre") or "").strip()
+        if not nombre:
+            continue
+        out.append({
+            "ok": True, "url": "", "nombre": nombre, "marca": it.get("marca") or "",
+            "part_number": (it.get("part_number") or "").strip(),
+            "precio_costo": sales_order._num(it.get("precio_unitario")) or 0,
+            "moneda": (datos.get("moneda") or "").upper(),
+            "descripcion": "", "cantidad": sales_order._num(it.get("cantidad")) or 1,
+            "proveedor": (datos.get("tienda") or "").strip(),
+            "origen": "captura",
+        })
+    return out
+
 # ─────────────────────────────────────────────────────────────
 # 2. COTEJO — agrupa los links por la Sales Order que machearon
 # ─────────────────────────────────────────────────────────────
@@ -289,6 +344,24 @@ def buscar_sales_orders_candidatas(links_data: list[dict]) -> dict:
                         candidatos.append((so, ln))
                         tipo_match = "descripcion"
 
+        # Respaldo 3: sin número de parte en ningún lado (capturas de tiendas, anuncios genéricos,
+        # ej. "Sand-Rite Pump Bag Pneumatic Inflatable Sanding Drum" ↔ línea "6x9 Drum Sand-Rite
+        # Pneumatic sanding drums 1in"). Se compara por palabras significativas compartidas: al
+        # menos 3 y la mitad de las del texto más corto. Sale marcado "≈ verificar" y el usuario
+        # lo aprueba/descarta en el borrador — nunca se asume en silencio.
+        if not candidatos:
+            tl = sales_order._tokens(f"{link.get('nombre','')} {link.get('marca','')}")
+            puntuados = []
+            for so in sos:
+                for ln in so["lines"]:
+                    tn = sales_order._tokens(ln["descripcion"])
+                    comun = tl & tn
+                    if len(comun) >= 3 and len(comun) / max(1, min(len(tl), len(tn))) >= 0.5:
+                        puntuados.append((len(comun) / max(1, min(len(tl), len(tn))), so, ln))
+            for _, so, ln in sorted(puntuados, key=lambda x: -x[0]):
+                candidatos.append((so, ln))
+                tipo_match = "descripcion"
+
         if not candidatos:
             sin_match.append({**link, "motivo": "ningún producto de una Sales Order abierta coincide"})
             continue
@@ -319,7 +392,7 @@ def buscar_sales_orders_candidatas(links_data: list[dict]) -> dict:
         links = g["links"]
         # Proveedor sugerido = dominio del primer link (normalmente todos vienen del mismo
         # marketplace en una sola compra); el usuario lo puede corregir en el widget.
-        proveedor_sugerido = _proveedor_de_url(links[0]["url"]) if links else ""
+        proveedor_sugerido = (links[0].get("proveedor") or _proveedor_de_url(links[0].get("url", ""))) if links else ""
         cods = {(l.get("moneda") or "").upper() for l in links if l.get("moneda")}
         moneda_po = _monedas_crm().get(next(iter(cods))) if len(cods) == 1 else None
         terminos_prov = _terminos_proveedor(proveedor_sugerido)
@@ -328,7 +401,7 @@ def buscar_sales_orders_candidatas(links_data: list[dict]) -> dict:
             "name": l.get("nombre") or l.get("descripcion_so") or "Producto",
             "mfr_part_no": l.get("part_number") or l.get("part_number_so") or _modelo_en_titulo(l),
             # Se compra lo que pide la línea de la SO (antes siempre 1); editable en el borrador.
-            "quantity": l.get("cantidad_so") or 1,
+            "quantity": l.get("cantidad") or l.get("cantidad_so") or 1,
             "unit_price": sales_order._num(l.get("precio_costo")) or 0,
         } for l in links]
         grupos_out.append({
@@ -547,7 +620,7 @@ def crear_po_y_ap(draft: dict) -> dict:
     }
 
 
-def _leer_con_vision(imagenes: list[bytes], instruccion: str, model_id: str = "") -> dict:
+def _leer_con_vision(imagenes: list[bytes], instruccion: str, model_id: str = "", max_tokens: int = 500) -> dict:
     """Helper compartido: manda imágenes + una instrucción a Claude vision y parsea el JSON de
     respuesta. Usado por leer_comprobante y leer_contenido_paquete (mismo patrón que
     orden_compra.normalizar_vision)."""
@@ -564,7 +637,7 @@ def _leer_con_vision(imagenes: list[bytes], instruccion: str, model_id: str = ""
         client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
         resp = client.messages.create(
             model=model_id or os.environ.get("PO_MODEL", "claude-haiku-4-5-20251001"),
-            max_tokens=500, temperature=0,
+            max_tokens=max_tokens, temperature=0,
             messages=[{"role": "user", "content": contenido}],
         )
         raw = (resp.content[0].text if resp.content else "").strip()
