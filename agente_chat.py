@@ -3252,6 +3252,54 @@ TOOL_FUNCTIONS = {
     "publicar_sin_imagen_rfq":   tool_publicar_sin_imagen_rfq,
 }
 
+# Tools permitidas por tipo de stream — evita cross-stream contamination.
+_T_VENTAS  = {"enviar_email_gmail", "diagnostico_gmail", "leer_emails_gmail",
+              "buscar_email_gmail", "escanear_emails_ventas",
+              "buscar_clientes_crm", "ver_cliente_crm", "crear_cuenta_crm",
+              "crear_contacto_crm", "actualizar_cuenta_crm", "actualizar_contacto_crm",
+              "buscar_contactos_crm", "ver_contactos_cuenta_crm",
+              "listar_oportunidades_crm", "crear_oportunidad_crm", "actualizar_oportunidad_crm",
+              "listar_cotizaciones_crm", "buscar_internet", "notificar_sistema",
+              "consultar_metricas"}
+_T_RFQ     = {"buscar_productos_crm", "ver_producto_crm", "listar_productos_crm",
+              "buscar_proveedores_crm", "consultar_rfqs", "obtener_opciones_rfq",
+              "seleccionar_proveedor", "obtener_foto_rfq", "publicar_rfq",
+              "publicar_sin_imagen_rfq", "verificar_lista_productos", "crear_rfqs_desde_texto",
+              "buscar_internet", "notificar_sistema", "consultar_metricas"}
+_T_CATALOG = {"buscar_productos_crm", "ver_producto_crm", "listar_productos_crm",
+              "extraer_producto_de_link", "extraer_ficha_pdf",
+              "publicar_producto_link", "publicar_productos_desde_links",
+              "buscar_internet", "notificar_sistema", "consultar_metricas"}
+_T_OPS     = {"buscar_productos_crm", "ver_producto_crm", "listar_productos_crm",
+              "buscar_clientes_crm", "ver_cliente_crm", "buscar_proveedores_crm",
+              "listar_cotizaciones_crm", "buscar_internet", "notificar_sistema",
+              "consultar_metricas"}
+
+TOOLS_POR_TIPO: dict[str, set[str]] = {
+    "correo":       _T_VENTAS | _T_RFQ,
+    "whatsapp":     _T_VENTAS | _T_RFQ,
+    "mensajeria":   _T_VENTAS | _T_RFQ,
+    "rfq":          _T_RFQ,
+    "busquedas":    _T_RFQ,
+    "publicacion":  _T_CATALOG,
+    "catalogo":     _T_CATALOG | _T_RFQ,
+    "cotizacion":   _T_VENTAS,
+    "cotizaciones": _T_VENTAS,
+    "ordenes":      _T_OPS,
+    "compras":      _T_OPS,
+    "pagos":        _T_OPS,
+}
+
+
+def _tools_para_tipo(tipo: str | None) -> list[dict]:
+    """Devuelve el subconjunto de TOOLS permitido para el tipo de stream dado.
+    Tipo no reconocido -> TOOLS completo (comportamiento anterior)."""
+    if not tipo or tipo not in TOOLS_POR_TIPO:
+        return TOOLS
+    nombres = TOOLS_POR_TIPO[tipo]
+    return [t for t in TOOLS if t["name"] in nombres]
+
+
 SYSTEM_PROMPT = """\
 Eres el asistente de Brain MRO Master Pro. Ayudas al equipo a gestionar \
 el catálogo de productos industriales, proveedores y solicitudes de cotización (RFQs).
@@ -3865,6 +3913,37 @@ def _log_stream(stream_id: str, msg: str, tipo: str = "ok") -> None:
         log.warning(f"No se pudo escribir en stream_logs: {e}")
 
 
+def _joy_evento(
+    stream_id: str,
+    tipo: str,
+    descripcion: str,
+    entidad: str = "",
+    entidad_id: str = "",
+    monto: float | None = None,
+    moneda: str = "USD",
+    referencia: str = "",
+    contexto: dict | None = None,
+) -> None:
+    """Escribe un evento de negocio enriquecido en joy_memoria para que Joy tenga contexto.
+    Best-effort: nunca rompe el flujo si falla."""
+    try:
+        row: dict = {
+            "stream_id":   str(stream_id) if stream_id else None,
+            "tipo":        tipo,
+            "descripcion": str(descripcion)[:800],
+            "autor":       "sistema",
+        }
+        if entidad:    row["entidad"]    = str(entidad)[:200]
+        if entidad_id: row["entidad_id"] = str(entidad_id)[:100]
+        if monto is not None: row["monto"] = float(monto)
+        if moneda:     row["moneda"]    = str(moneda)[:10]
+        if referencia: row["referencia"] = str(referencia)[:100]
+        if contexto:   row["contexto"]  = contexto
+        supabase.table("joy_memoria").insert(row).execute()
+    except Exception as e:
+        log.warning(f"No se pudo escribir en joy_memoria: {e}")
+
+
 def _mensaje_log_tool(tool_name: str, tool_input: dict, result) -> tuple[str, str]:
     """Convierte una llamada de tool + su resultado en (mensaje, tipo) legible para el log del UI."""
     err = isinstance(result, dict) and (result.get("error") or result.get("faltantes"))
@@ -3910,12 +3989,14 @@ _LOG_INICIO_TOOL = {
 # ─────────────────────────────────────────────────────────────
 # LOOP DE CLAUDE CON TOOL_USE
 # ─────────────────────────────────────────────────────────────
-def run_chat(messages: list[dict], stream_id: str, system_prompt: str = SYSTEM_PROMPT) -> tuple[str, list[str], bool, dict]:
+def run_chat(messages: list[dict], stream_id: str, system_prompt: str = SYSTEM_PROMPT,
+             tipo_stream: str | None = None) -> tuple[str, list[str], bool, dict]:
     tools_used: list[str] = []
     rfqs_created = False
     current_messages = list(messages)
     total_input_tokens  = 0
     total_output_tokens = 0
+    _tools = _tools_para_tipo(tipo_stream)
 
     import time as _time
     _t_start = _time.time()
@@ -3932,7 +4013,7 @@ def run_chat(messages: list[dict], stream_id: str, system_prompt: str = SYSTEM_P
             # tools (hasta 10 vueltas) las llamadas siguientes leen de caché en vez de
             # reprocesar ~30 tools + 11 modos cada vez → mucha menos latencia y costo.
             system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
-            tools=TOOLS,
+            tools=_tools,
             messages=current_messages,
         )
         _dt_llm = _time.time() - _t_llm
@@ -4221,6 +4302,18 @@ def _crear_so_confirmada(stream_id: str, draft: dict) -> None:
     }).execute()
     _log_stream(stream_id, f"Sales Order {res.get('so_numero','')} creada ✓", "ok")
     log.info(f"Sales Order creada: {res.get('so_id')} ({res.get('so_numero')})")
+    _d = draft or {}
+    _joy_evento(
+        stream_id, "so_creada",
+        f"Sales Order {res.get('so_numero','')} creada para {_d.get('cliente_nombre','') or _d.get('billing_account','')}"
+        + (f" por ${res.get('grand_total',''):,}" if res.get("grand_total") else ""),
+        entidad=_d.get("cliente_nombre","") or _d.get("billing_account",""),
+        entidad_id=_d.get("billing_account_id",""),
+        monto=res.get("grand_total"),
+        moneda=_d.get("currency","USD"),
+        referencia=res.get("so_numero",""),
+        contexto={"so_id": res.get("so_id"), "po_number": _d.get("po_number","")},
+    )
 
     # Subir el PO original a la sección de Documentos/Notas de la SO — best-effort: si falla, la SO
     # ya quedó creada y esto NO la afecta, solo se loguea (ver sales_order.subir_po_a_so).
@@ -4370,6 +4463,18 @@ def _crear_po_confirmado(stream_id: str, grupos: list) -> None:
         resultados.append(res)
         if res.get("ok"):
             _log_stream(stream_id, "Purchase Order + cuenta por pagar creados ✓", "ok")
+            _joy_evento(
+                stream_id, "po_creada",
+                f"Purchase Order creada"
+                + (f" para {draft.get('proveedor_nombre','')}" if draft.get("proveedor_nombre") else "")
+                + (f" por ${res.get('grand_total',''):,}" if res.get("grand_total") else ""),
+                entidad=draft.get("proveedor_nombre",""),
+                entidad_id=draft.get("proveedor_id",""),
+                monto=res.get("grand_total"),
+                moneda=draft.get("currency","USD"),
+                referencia=res.get("po_numero","") or res.get("nombre",""),
+                contexto={"po_id": res.get("po_id"), "bill_id": res.get("bill_id"), "so_id": draft.get("so_id","")},
+            )
         else:
             _log_stream(stream_id, f"No se pudo crear: {res.get('error','')}", "error")
 
@@ -4478,6 +4583,20 @@ def _confirmar_pago(stream_id: str, tipo: str, registro_id: str, monto: float, d
     }).execute()
     _log_stream(stream_id, "Pago registrado ✓" if res.get("ok") else f"No se pudo registrar: {res.get('error','')}",
                 "ok" if res.get("ok") else "error")
+    if res.get("ok"):
+        _joy_evento(
+            stream_id, "pago_registrado",
+            f"Pago de ${monto:,.2f} registrado ({tipo}) — {datos_comprobante.get('referencia','') or res.get('payment_id','')}",
+            monto=monto,
+            referencia=res.get("payment_id",""),
+            contexto={
+                "tipo": tipo,
+                "registro_id": registro_id,
+                "payment_id": res.get("payment_id"),
+                "referencia_comprobante": datos_comprobante.get("referencia",""),
+                "fecha": datos_comprobante.get("fecha",""),
+            },
+        )
 
 
 def _iniciar_registro_desde_pago(stream_id: str, direccion: str, monto: float, datos_comprobante: dict) -> None:
@@ -5600,7 +5719,7 @@ def procesar_mensaje(msg: dict) -> None:
     try:
         roles = [m['role'] for m in historial]
         print(f"[BRAIN] historial roles={roles} n={len(historial)}", flush=True)
-        respuesta, tools_used, rfqs_created, token_counts, perf = run_chat(historial, stream_id=str(stream_id), system_prompt=_system_prompt)
+        respuesta, tools_used, rfqs_created, token_counts, perf = run_chat(historial, stream_id=str(stream_id), system_prompt=_system_prompt, tipo_stream=_tipo_stream)
     except Exception as e:
         import traceback as _tb
         print(f"[BRAIN ERROR] {e}", flush=True)
