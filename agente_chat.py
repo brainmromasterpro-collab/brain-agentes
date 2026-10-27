@@ -5118,6 +5118,90 @@ def _facturado_so(stream_id: str, so_id: str) -> bool:
     return facturado
 
 
+# ─────────────────────────────────────────────────────────────
+# FACTURACIÓN CON ALEGRA (stream 'ordenes'): Sales Order de 1CRM -> factura de venta en Alegra.
+# Borrador (no escribe) -> con el sí del usuario se crea en Alegra como BORRADOR -> timbrar es un
+# paso aparte y explícito (solo si la cuenta ya está lista). Módulo: alegra.py (API REST).
+# ─────────────────────────────────────────────────────────────
+def _alegra_msg(stream_id: str, texto: str) -> None:
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant", "content": texto,
+        "procesado": True, "metadata": {},
+    }).execute()
+
+
+def _alegra_elegir(stream_id: str, texto: str) -> None:
+    """El usuario pide facturar en Alegra: si el texto trae el número de una SO abierta va directo
+    al borrador; si no, muestra las SO para elegir."""
+    try:
+        import alegra
+        import compra_proveedor
+    except Exception as e:
+        _alegra_msg(stream_id, f"No pude cargar el módulo de Alegra: {e}")
+        return
+    if not alegra.configurado():
+        _alegra_msg(stream_id, "Alegra no está configurado en el servidor (faltan ALEGRA_EMAIL y ALEGRA_TOKEN en Railway).")
+        return
+    _log_stream(stream_id, "Buscando Sales Orders para facturar en Alegra…", "info")
+    sos = compra_proveedor.sos_pendientes_cierre()
+    nums = set(re.findall(r"(?<![\d.,])(\d{2,6})(?![\d.,])", texto or ""))
+    hits = [s for s in sos if str(s.get("so_number") or "") in nums]
+    if len(hits) == 1:
+        _alegra_borrador(stream_id, hits[0]["id"])
+        return
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[ALEGRA_ELEGIR]" + json.dumps({"sos": sos}, ensure_ascii=False),
+        "procesado": True, "metadata": {"alegra_elegir": True},
+    }).execute()
+
+
+def _alegra_borrador(stream_id: str, so_id: str) -> None:
+    """Arma y muestra el borrador de la factura (NO escribe en Alegra ni en 1CRM). Emite [ALEGRA_BORRADOR]."""
+    import alegra
+    _log_stream(stream_id, "Armando el borrador de la factura para Alegra…", "info")
+    draft = alegra.borrador_desde_so(so_id)
+    if draft.get("error"):
+        _alegra_msg(stream_id, f"No pude armar la factura: {draft['error']}")
+        return
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[ALEGRA_BORRADOR]" + json.dumps(draft, ensure_ascii=False),
+        "procesado": True, "metadata": {"alegra_borrador": True},
+    }).execute()
+    _log_stream(stream_id, f"Borrador listo — {len(draft.get('avisos') or [])} aviso(s)", "ok")
+
+
+def _alegra_crear(stream_id: str, draft: dict, timbrar: bool) -> None:
+    """Crea la factura en Alegra tras la aprobación. Sin `timbrar` queda como borrador en Alegra;
+    con `timbrar` solo si la cuenta de Alegra ya está lista (RFC, régimen, CSD). Emite [ALEGRA_CREADA]."""
+    import alegra
+    if timbrar and not alegra.estado_cuenta().get("timbrado_listo"):
+        timbrar = False
+        _log_stream(stream_id, "La cuenta de Alegra aún no puede timbrar — se crea como borrador", "info")
+    _log_stream(stream_id, "Creando la factura en Alegra…", "info")
+    res = alegra.crear_factura(draft or {}, timbrar=timbrar)
+    res["so_id"] = (draft or {}).get("so_id")
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[ALEGRA_CREADA]" + json.dumps(res, ensure_ascii=False),
+        "procesado": True, "metadata": {"alegra_creada": True},
+    }).execute()
+    _log_stream(stream_id, "Factura creada en Alegra ✓" if res.get("ok") else f"No se pudo crear: {res.get('error','')}",
+                "ok" if res.get("ok") else "error")
+
+
+def _alegra_deshacer(stream_id: str, invoice_id: str) -> None:
+    import alegra
+    res = alegra.eliminar_borrador(invoice_id)
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant",
+        "content": "[ACCION_DESHECHA]" + json.dumps({"ok": res.get("ok"), "error": res.get("error", ""),
+                                                      "que": "la factura en borrador de Alegra"}, ensure_ascii=False),
+        "procesado": True, "metadata": {"accion_deshecha": True},
+    }).execute()
+
+
 def _shippings_en_preparacion(stream_id: str) -> list:
     """Envíos creados ([SHIPPING_CREADO]) que aún no se marcaron como enviados ([SHIPPING_ENVIADO]
     con el mismo shipping_id). Derivado del historial."""
@@ -5438,6 +5522,16 @@ def procesar_mensaje(msg: dict) -> None:
         if _md0.get("cierre_action") == "deshacer":
             _deshacer_cierre(stream_id, _md0.get("so_id", ""), _md0.get("estado_anterior", ""))
             return
+        # Facturación con Alegra (botones de los widgets [ALEGRA_*]).
+        if _md0.get("alegra_action") == "borrador":
+            _alegra_borrador(stream_id, _md0.get("so_id", ""))
+            return
+        if _md0.get("alegra_action") == "crear":
+            _alegra_crear(stream_id, _md0.get("draft") or {}, bool(_md0.get("timbrar")))
+            return
+        if _md0.get("alegra_action") == "deshacer":
+            _alegra_deshacer(stream_id, _md0.get("invoice_id", ""))
+            return
         if _md0.get("cancelar_accion"):
             supabase.table("mensajes").insert({
                 "stream_id": stream_id, "role": "assistant",
@@ -5450,6 +5544,7 @@ def procesar_mensaje(msg: dict) -> None:
         _urls = re.findall(r'https?://\S+', contenido or "")
         _low = (contenido or "").lower()
         _es_shipped = bool(re.search(r'\bshipped\b|marcar.*(enviad|shipped)|ya (se )?(envi[oó]|sali[oó])', _low))
+        _es_alegra = bool(re.search(r'alegra', _low)) and not _file_url
         _es_factura = bool(re.search(r'factura|firmad|facturad|facturar|cerrar\s+venta', _low))
         _es_estado = (not _file_url and not _urls and
                       bool(re.search(r'c[oó]mo va|estado (de la venta|operativo)|estatus de la venta|rollup|resumen de (la )?venta', _low)))
@@ -5493,6 +5588,9 @@ def procesar_mensaje(msg: dict) -> None:
             if len(contenido or "") >= 120 and (_kw_po >= 2 or _lineas >= 4):
                 _procesar_orden_compra_texto(stream_id, texto=contenido or "")
                 return
+        if _es_alegra:
+            _alegra_elegir(stream_id, contenido or "")
+            return
         if _es_shipped:
             _cotejo_marcar_shipped(stream_id)
             return

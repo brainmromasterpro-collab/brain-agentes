@@ -917,6 +917,7 @@ def sos_pendientes_cierre(limite: int = 40) -> list[dict]:
             continue
         cuenta = sales_order.cuenta_por_id(rec.get("billing_account_id", ""))
         out.append({"id": sid, "nombre": rec.get("name", ""), "so_stage": rec.get("so_stage"),
+                    "so_number": rec.get("so_number"),
                     "cliente": (cuenta or {}).get("nombre", ""),
                     "url": f"{CRM_BASE}/index.php?module=SalesOrders&action=DetailView&record={sid}"})
     return out
