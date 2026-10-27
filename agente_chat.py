@@ -5144,7 +5144,7 @@ def _alegra_elegir(stream_id: str, texto: str) -> None:
         return
     _log_stream(stream_id, "Buscando Sales Orders para facturar en Alegra…", "info")
     sos = compra_proveedor.sos_pendientes_cierre()
-    nums = set(re.findall(r"(?<![\d.,])(\d{2,6})(?![\d.,])", texto or ""))
+    nums = set(re.findall(r"(?<![\d.])(\d{2,6})(?!\d|[.,]\d)", texto or ""))
     hits = [s for s in sos if str(s.get("so_number") or "") in nums]
     if len(hits) == 1:
         _alegra_borrador(stream_id, hits[0]["id"])
