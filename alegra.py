@@ -26,6 +26,7 @@ import urllib.parse
 import urllib.request
 
 import sales_order
+import validador_sat
 
 log = logging.getLogger("alegra")
 
@@ -283,13 +284,9 @@ def borrador_desde_so(so_id: str) -> dict:
     regime_sat = _REGIMEN_SAT.get(regimen_1crm, "")
     if regimen_1crm == "Extranjero / Internacional" and not rfc:
         rfc = RFC_EXTRANJERO
-    if not rfc:
-        avisos.append("La cuenta del cliente no tiene RFC en 1CRM (campo RFC) — se necesita para timbrar.")
     if not regime_sat:
         avisos.append("La cuenta del cliente no tiene Régimen fiscal en 1CRM — se necesita para timbrar (CFDI 4.0).")
     cp = (acc.get("billing_address_postalcode") or "").strip()
-    if not cp:
-        avisos.append("La cuenta del cliente no tiene código postal fiscal en 1CRM — se necesita para timbrar.")
 
     lineas = []
     for li in so.get("line_items") or []:
@@ -323,11 +320,15 @@ def borrador_desde_so(so_id: str) -> dict:
     elif pay_method == "other":
         pay_method = "transfer"       # PUE no puede ir "Por definir"
     cfdi_use = fact.get("cfdiUse") or "G03"
+    if fact and not fact.get("cfdiUse"):
+        avisos.append("La ficha del cliente no tiene uso de CFDI; se usó G03 (Gastos en general).")
+    if pay_type == "PPD" and fact.get("paymentMethod") not in (None, "", "other"):
+        avisos.append("La ficha del cliente trae una forma de pago distinta de «Por definir» con método PPD; el SAT exige «Por definir», se usó esa.")
     if not fact:
         avisos.append("La ficha del cliente no trae sus datos de facturación (uso de CFDI, forma y método de pago); se usan valores por defecto.")
     cuenta = estado_cuenta()
     existente = buscar_cliente(rfc, acc.get("name") or "") if configurado() else None
-    return {
+    borrador = {
         "so_id": so_id, "so_nombre": so.get("name"), "so_numero": so.get("so_number"),
         "so_url": f"{sales_order.CRM_BASE}/index.php?module=SalesOrders&action=DetailView&record={so_id}",
         "po_cliente": so.get("purchase_order_num") or "",
@@ -346,6 +347,13 @@ def borrador_desde_so(so_id: str) -> dict:
         "avisos": avisos, "timbrable": bool(not avisos and cuenta.get("timbrado_listo")),
         "cuenta_alegra": cuenta,
     }
+    borrador["cliente"]["razon_social"] = (acc.get("razon_social") or "").strip()
+    # Validación fiscal contra reglas/catálogos del SAT: SIEMPRE al armar la factura.
+    val = validador_sat.validar_draft(borrador)
+    borrador["validacion"] = val
+    borrador["avisos"] = avisos + val["errores"] + val["avisos"]
+    borrador["timbrable"] = bool(not borrador["avisos"] and cuenta.get("timbrado_listo"))
+    return borrador
 
 
 # ─────────────────────────────────────────────────────────────
@@ -357,6 +365,11 @@ def crear_factura(draft: dict, timbrar: bool = False) -> dict:
     timbra con CFDI 4.0; si el timbrado falla, queda en borrador y se devuelve el error."""
     if not configurado():
         return {"ok": False, "error": "Alegra no está configurado (ALEGRA_EMAIL / ALEGRA_TOKEN)."}
+    # Validación fiscal (SAT) también al crear: el borrador pudo editarse o envejecer desde que se mostró.
+    val = validador_sat.validar_draft(draft)
+    if timbrar and val["errores"]:
+        return {"ok": False, "validacion": val,
+                "error": "No se timbró: " + " ".join(val["errores"]) + " Corrige los datos fiscales del cliente en 1CRM o crea la factura como borrador."}
     cli = draft.get("cliente") or {}
     cliente_id = cli.get("alegra_id") or ""
     cliente_nuevo = False
@@ -409,7 +422,7 @@ def crear_factura(draft: dict, timbrar: bool = False) -> dict:
     inv = data.get("invoice") if isinstance(data, dict) and isinstance(data.get("invoice"), dict) else data
     if st in (200, 201) and isinstance(inv, dict) and inv.get("id"):
         return {"ok": True, **_resumen_factura(inv), "timbrada": bool(timbrar),
-                "cliente_nuevo": cliente_nuevo, "so_id": draft.get("so_id")}
+                "cliente_nuevo": cliente_nuevo, "so_id": draft.get("so_id"), "validacion": val}
     if isinstance(inv, dict) and inv.get("id"):  # timbrado falló: la factura quedó en borrador
         return {"ok": True, **_resumen_factura(inv), "timbrada": False, "cliente_nuevo": cliente_nuevo,
                 "so_id": draft.get("so_id"), "aviso": f"No se pudo timbrar, quedó en borrador: {_msg(data.get('error') if isinstance(data, dict) else data)}"}
