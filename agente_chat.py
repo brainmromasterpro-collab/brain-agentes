@@ -5182,6 +5182,12 @@ def _alegra_crear(stream_id: str, draft: dict, timbrar: bool) -> None:
     _log_stream(stream_id, "Creando la factura en Alegra…", "info")
     res = alegra.crear_factura(draft or {}, timbrar=timbrar)
     res["so_id"] = (draft or {}).get("so_id")
+    if res.get("ok"):
+        # Espejo en 1CRM: Invoice ligada a la SO con la referencia de Alegra (cuenta por cobrar que ve Pagos).
+        esp = alegra.crear_espejo_1crm(draft or {}, res)
+        res["crm_invoice"] = esp
+        _log_stream(stream_id, "Invoice espejo creada en 1CRM ✓" if esp.get("ok") else f"No se creó la Invoice en 1CRM: {esp.get('error','')}",
+                    "ok" if esp.get("ok") else "error")
     supabase.table("mensajes").insert({
         "stream_id": stream_id, "role": "assistant",
         "content": "[ALEGRA_CREADA]" + json.dumps(res, ensure_ascii=False),
@@ -5189,11 +5195,19 @@ def _alegra_crear(stream_id: str, draft: dict, timbrar: bool) -> None:
     }).execute()
     _log_stream(stream_id, "Factura creada en Alegra ✓" if res.get("ok") else f"No se pudo crear: {res.get('error','')}",
                 "ok" if res.get("ok") else "error")
+    # Una factura TIMBRADA es la que marca la SO como facturada (un borrador aún no es factura fiscal).
+    if res.get("ok") and res.get("timbrada") and res.get("so_id"):
+        try:
+            _confirmar_cierre_venta(stream_id, res["so_id"], True, "")
+        except Exception as e:
+            log.warning(f"No se pudo marcar facturada la SO {res.get('so_id')}: {e}")
 
 
-def _alegra_deshacer(stream_id: str, invoice_id: str) -> None:
+def _alegra_deshacer(stream_id: str, invoice_id: str, crm_invoice_id: str = "") -> None:
     import alegra
     res = alegra.eliminar_borrador(invoice_id)
+    if res.get("ok") and crm_invoice_id:
+        alegra.cancelar_espejo_1crm(crm_invoice_id)
     supabase.table("mensajes").insert({
         "stream_id": stream_id, "role": "assistant",
         "content": "[ACCION_DESHECHA]" + json.dumps({"ok": res.get("ok"), "error": res.get("error", ""),
@@ -5530,7 +5544,7 @@ def procesar_mensaje(msg: dict) -> None:
             _alegra_crear(stream_id, _md0.get("draft") or {}, bool(_md0.get("timbrar")))
             return
         if _md0.get("alegra_action") == "deshacer":
-            _alegra_deshacer(stream_id, _md0.get("invoice_id", ""))
+            _alegra_deshacer(stream_id, _md0.get("invoice_id", ""), _md0.get("crm_invoice_id", ""))
             return
         if _md0.get("cancelar_accion"):
             supabase.table("mensajes").insert({

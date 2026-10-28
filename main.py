@@ -95,6 +95,7 @@ if __name__ == "__main__":
     import agente_chat
     import agente_monitor
     import agente_lector
+    import alegra_sync
 
     disponibles = {
         "buscador":   agente_buscador.main,
@@ -103,6 +104,7 @@ if __name__ == "__main__":
         "chat":       agente_chat.main,
         "monitor":    agente_monitor.main,
         "lector":     agente_lector.main,
+        "alegra":     alegra_sync.main,
     }
 
     agents_env = os.environ.get("AGENTS", "").strip().lower()
@@ -118,6 +120,9 @@ if __name__ == "__main__":
     # AGENTS=chat no lo liste explícitamente.
     if "chat" in seleccionados and "lector" not in seleccionados:
         seleccionados.append("lector")
+    # Cobros/estatus de Alegra → 1CRM: necesita Supabase + 1CRM + Alegra (servicio chat).
+    if "chat" in seleccionados and "alegra" not in seleccionados:
+        seleccionados.append("alegra")
 
     log.info(f"Iniciando Brain MRO Master Pro — agentes: {seleccionados}")
 

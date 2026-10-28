@@ -75,6 +75,8 @@ def invoices_abiertas(limite: int = 40) -> list[dict]:
             continue
         d = sales_order._crm_get(f"data/Invoice/{iid}")
         rec = d.get("record", d)
+        if str(rec.get("cancelled") or "0") in ("1", "True", "true"):
+            continue  # Invoice cancelada (p.ej. espejo de una factura de Alegra deshecha)
         due = sales_order._num(rec.get("amount_due"))
         if not due or due <= 0:
             continue

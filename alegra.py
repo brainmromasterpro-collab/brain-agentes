@@ -450,3 +450,54 @@ def facturas_con_movimiento(limite: int = 30) -> list[dict]:
                     "cliente": (inv.get("client") or {}).get("name", ""),
                     "observaciones": inv.get("observations") or ""})
     return out
+
+# ─────────────────────────────────────────────────────────────
+# 6. ESPEJO EN 1CRM — la Invoice (cuenta por cobrar) ligada a la Sales Order
+# Verificado en vivo (2026-10-28): POST data/Invoice con from_so_id AUTO-COPIA las líneas y los montos
+# de la SO (igual que related_quote_id en SalesOrder). DELETE no existe para Invoice (404): deshacer
+# = PATCH cancelled=true. OJO: Invoice.amount_due no se recalcula solo (ver pagos.py).
+# ─────────────────────────────────────────────────────────────
+_TERMS_1CRM = {"net 7": "Net 7", "net 15": "Net 15", "net 30": "Net 30", "net 45": "Net 45", "net 60": "Net 60",
+               "net 90": "Net 90", "cod": "COD", "due on receipt": "Due on Receipt"}
+
+
+def crear_espejo_1crm(draft: dict, res: dict) -> dict:
+    """Crea en 1CRM la Invoice ligada a la SO con la referencia de la factura de Alegra."""
+    so_id = draft.get("so_id")
+    if not so_id:
+        return {"ok": False, "error": "sin so_id"}
+    so = sales_order._crm_get(f"data/SalesOrder/{so_id}").get("record", {})
+    if not so.get("id"):
+        return {"ok": False, "error": "no encontré la Sales Order"}
+    terms_so = (so.get("terms") or "").replace("_", " ").replace(" Days", "").strip().lower()
+    terms = _TERMS_1CRM.get(terms_so, "Net 30" if _dias_credito(terms_so) else "Due on Receipt")
+    desc = (f"Alegra ID: {res.get('invoice_id')}\nAlegra folio: {res.get('numero') or '(borrador)'}\n"
+            f"Alegra: {res.get('url')}\nEstado en Alegra: {res.get('estado')}")
+    payload = {"name": so.get("name"), "billing_account_id": so.get("billing_account_id"),
+               "currency_id": so.get("currency_id"), "from_so_id": so_id,
+               "invoice_date": draft.get("fecha") or datetime.date.today().isoformat(),
+               "due_date": draft.get("vence") or datetime.date.today().isoformat(),
+               "terms": terms, "purchase_order_num": so.get("purchase_order_num") or "", "description": desc}
+    r = sales_order._crm_post("Invoice", payload)
+    iid = r.get("id")
+    if not iid:
+        return {"ok": False, "error": f"no se pudo crear la Invoice en 1CRM: {str(r)[:200]}"}
+    g = sales_order._crm_get(f"data/Invoice/{iid}").get("record", {})
+    return {"ok": True, "id": iid, "numero": g.get("invoice_number"), "total": sales_order._num(g.get("amount")),
+            "lineas": len(g.get("line_items") or []),
+            "url": f"{sales_order.CRM_BASE}/index.php?module=Invoice&action=DetailView&record={iid}"}
+
+
+def cancelar_espejo_1crm(invoice_id: str) -> dict:
+    """Deshacer del espejo: 1CRM no deja borrar Invoices por API, se marca cancelada."""
+    r = sales_order._crm_patch("Invoice", invoice_id, {"cancelled": True})
+    return {"ok": "error" not in r and r.get("result", True) is not False}
+
+
+def anotar_espejo_1crm(invoice_id: str, linea: str) -> None:
+    """Agrega una línea al historial (descripción) de la Invoice espejo."""
+    try:
+        d = sales_order._crm_get(f"data/Invoice/{invoice_id}").get("record", {})
+        sales_order._crm_patch("Invoice", invoice_id, {"description": ((d.get("description") or "").rstrip() + "\n" + linea).strip()})
+    except Exception as e:
+        log.warning(f"anotar_espejo_1crm: {e}")
