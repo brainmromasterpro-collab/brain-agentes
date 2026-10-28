@@ -230,6 +230,30 @@ def _dias_credito(terminos: str) -> int:
     return int(m.group(1)) if m and "advance" not in (terminos or "").lower() else 0
 
 
+# Datos de facturación del cliente (Excel "Clientes-Factura"): 1CRM no tiene campos para uso de CFDI /
+# forma / método de pago, así que viven en un bloque legible dentro de la Descripción de la cuenta
+# ([DATOS DE FACTURACIÓN] ... [/DATOS DE FACTURACIÓN]). Aquí se leen para armar la factura.
+_USO_CFDI = {"adquisicion de mercancias": "G01", "gastos en general": "G03"}
+_FORMA_PAGO = {"transferencia electronica de fondos": "transfer", "por definir": "other",
+               "tarjeta de credito": "credit-card", "tarjeta de debito": "debit-card", "efectivo": "cash",
+               "cheque nominativo": "check"}
+
+
+def datos_facturacion(descripcion: str) -> dict:
+    m = re.search(r"\[DATOS DE FACTURACI[ÓO]N\](.*?)\[/DATOS DE FACTURACI[ÓO]N\]", descripcion or "", re.S)
+    if not m:
+        return {}
+    d = {}
+    for ln in m.group(1).splitlines():
+        if ":" in ln:
+            k, v = ln.split(":", 1)
+            d[sales_order._norm(k).strip().lower()] = v.strip()
+    out = {"razon_social": d.get("razon social", ""), "metodo": (d.get("metodo de pago") or "").upper()}
+    out["cfdiUse"] = _USO_CFDI.get(sales_order._norm(d.get("uso de cfdi", "")).strip().lower(), "")
+    out["paymentMethod"] = _FORMA_PAGO.get(sales_order._norm(d.get("forma de pago", "")).strip().lower(), "")
+    return out
+
+
 def borrador_desde_so(so_id: str) -> dict:
     """Arma el borrador de la factura de venta de Alegra a partir de la SO de 1CRM, con avisos de
     todo lo que falte (RFC, régimen, etc.). NO escribe en Alegra ni en 1CRM."""
@@ -276,6 +300,17 @@ def borrador_desde_so(so_id: str) -> dict:
         avisos.append(f"La Sales Order está en {moneda}; verifica que la cuenta de Alegra tenga multimoneda activa.")
     dias = _dias_credito(so.get("terms") or "")
     hoy = datetime.date.today()
+    # Datos con los que SE LE FACTURA a este cliente (de su ficha); si no hay, se deduce de las condiciones.
+    fact = datos_facturacion(acc.get("description") or "")
+    pay_type = fact.get("metodo") if fact.get("metodo") in ("PUE", "PPD") else ("PUE" if dias == 0 else "PPD")
+    pay_method = fact.get("paymentMethod") or ("transfer" if pay_type == "PUE" else "other")
+    if pay_type == "PPD":
+        pay_method = "other"          # Alegra: con PPD solo se admite "Por definir"
+    elif pay_method == "other":
+        pay_method = "transfer"       # PUE no puede ir "Por definir"
+    cfdi_use = fact.get("cfdiUse") or "G03"
+    if not fact:
+        avisos.append("La ficha del cliente no trae sus datos de facturación (uso de CFDI, forma y método de pago); se usan valores por defecto.")
     cuenta = estado_cuenta()
     existente = buscar_cliente(rfc, acc.get("name") or "") if configurado() else None
     return {
@@ -291,9 +326,8 @@ def borrador_desde_so(so_id: str) -> dict:
         "moneda": moneda, "fecha": hoy.isoformat(),
         "vence": (hoy + datetime.timedelta(days=dias)).isoformat(), "terminos": so.get("terms") or "",
         # PUE = pago en una sola exhibición (contado); PPD = a crédito/diferido.
-        "paymentType": "PUE" if dias == 0 else "PPD",
-        "paymentMethod": "transfer" if dias == 0 else "other",
-        "cfdiUse": "G03",
+        "paymentType": pay_type, "paymentMethod": pay_method, "cfdiUse": cfdi_use,
+        "facturacion_de_ficha": bool(fact),
         "lineas": lineas, "subtotal": sub, "iva": iva, "total": round(sub + iva, 2),
         "avisos": avisos, "timbrable": bool(not avisos and cuenta.get("timbrado_listo")),
         "cuenta_alegra": cuenta,
