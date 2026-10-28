@@ -230,13 +230,27 @@ def _dias_credito(terminos: str) -> int:
     return int(m.group(1)) if m and "advance" not in (terminos or "").lower() else 0
 
 
-# Datos de facturación del cliente (Excel "Clientes-Factura"): 1CRM no tiene campos para uso de CFDI /
-# forma / método de pago, así que viven en un bloque legible dentro de la Descripción de la cuenta
-# ([DATOS DE FACTURACIÓN] ... [/DATOS DE FACTURACIÓN]). Aquí se leen para armar la factura.
+# Datos de facturación del cliente (Excel "Clientes-Factura"): viven en los campos de la cuenta de 1CRM
+# (USOCFDI, FormadePago, MetodoDpago). Si la cuenta aún no los tiene, se cae al bloque legible de la
+# Descripción ([DATOS DE FACTURACIÓN] ... [/DATOS DE FACTURACIÓN]) que se cargó antes de existir esos campos.
 _USO_CFDI = {"adquisicion de mercancias": "G01", "gastos en general": "G03"}
 _FORMA_PAGO = {"transferencia electronica de fondos": "transfer", "por definir": "other",
                "tarjeta de credito": "credit-card", "tarjeta de debito": "debit-card", "efectivo": "cash",
                "cheque nominativo": "check"}
+
+
+# Códigos de la lista FormadePago de 1CRM → forma de pago de Alegra (los valores "0".."7" son los de esa lista).
+_FORMA_PAGO_CAMPO = {"01": "cash", "02": "check", "03": "transfer", "04": "credit-card", "0": "debit-card", "1": "other"}
+
+
+def datos_facturacion_cuenta(acc: dict) -> dict:
+    """Datos de facturación desde los campos de la cuenta; si no hay ninguno, desde el bloque de la Descripción."""
+    uso, forma, metodo = (acc.get("USOCFDI") or ""), (acc.get("FormadePago") or ""), (acc.get("MetodoDpago") or "")
+    if not (uso or forma or metodo):
+        return datos_facturacion(acc.get("description") or "")
+    return {"razon_social": acc.get("razon_social") or "", "metodo": metodo.upper(),
+            "cfdiUse": uso if uso in ("G01", "G03") else "",
+            "paymentMethod": _FORMA_PAGO_CAMPO.get(forma, "other" if forma else "")}
 
 
 def datos_facturacion(descripcion: str) -> dict:
@@ -301,7 +315,7 @@ def borrador_desde_so(so_id: str) -> dict:
     dias = _dias_credito(so.get("terms") or "")
     hoy = datetime.date.today()
     # Datos con los que SE LE FACTURA a este cliente (de su ficha); si no hay, se deduce de las condiciones.
-    fact = datos_facturacion(acc.get("description") or "")
+    fact = datos_facturacion_cuenta(acc)
     pay_type = fact.get("metodo") if fact.get("metodo") in ("PUE", "PPD") else ("PUE" if dias == 0 else "PPD")
     pay_method = fact.get("paymentMethod") or ("transfer" if pay_type == "PUE" else "other")
     if pay_type == "PPD":
