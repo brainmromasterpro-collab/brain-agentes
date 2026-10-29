@@ -96,6 +96,7 @@ if __name__ == "__main__":
     import agente_monitor
     import agente_lector
     import alegra_sync
+    import validar_facturas
 
     disponibles = {
         "buscador":   agente_buscador.main,
@@ -105,6 +106,7 @@ if __name__ == "__main__":
         "monitor":    agente_monitor.main,
         "lector":     agente_lector.main,
         "alegra":     alegra_sync.main,
+        "validador":  validar_facturas.main,
     }
 
     agents_env = os.environ.get("AGENTS", "").strip().lower()
@@ -123,6 +125,9 @@ if __name__ == "__main__":
     # Cobros/estatus de Alegra → 1CRM: necesita Supabase + 1CRM + Alegra (servicio chat).
     if "chat" in seleccionados and "alegra" not in seleccionados:
         seleccionados.append("alegra")
+    # Validación fiscal (SAT) de las Invoices capturadas a mano en 1CRM (servicio chat).
+    if "chat" in seleccionados and "validador" not in seleccionados:
+        seleccionados.append("validador")
 
     log.info(f"Iniciando Brain MRO Master Pro — agentes: {seleccionados}")
 
