@@ -175,6 +175,34 @@ for _t in ("rfq", "correo", "publicacion", "pagos", "compras", "ordenes", "tipo_
     _ok, _ins = _trig(_t)
     check(f"{_t} NO recibe busqueda_completa", _ok is False and _ins == [])
 
+print("Contrato espejo del frontend coincide con el backend")
+import os as _os, re as _re
+_ts = "/Users/gabrielfuentes/Documents/mrojinni-app/src/lib/streamContracts.ts"
+if _os.path.exists(_ts):
+    _txt = open(_ts).read()
+    _tipos_ts = set(_re.findall(r"'([a-z_]+)'", _re.search(r"TIPOS_PIPELINE_RFQ = \[(.*?)\]", _txt, _re.S).group(1)))
+    _tipos_be = {t for t, c in sc.CONTRATOS.items() if "pipeline_rfq" in c.procesos} | set(sc.TIPOS_SIN_RESTRICCION)
+    check("tipos con pipeline_rfq: frontend == backend", _tipos_ts == _tipos_be, f"{_tipos_ts} vs {_tipos_be}")
+    _sql = "/Users/gabrielfuentes/Documents/mrojinni-app/sql/2026-11-05_rfqs_stream_contrato.sql"
+    _sqltxt = open(_sql).read()
+    _bus_sql = set(_re.findall(r"'([a-z_]+)'", _re.search(r"v_busqueda\s+text\[\] := ARRAY\[(.*?)\]", _sqltxt, _re.S).group(1)))
+    _pub_sql = set(_re.findall(r"'([a-z_]+)'", _re.search(r"v_publicacion\s+text\[\] := ARRAY\[(.*?)\]", _sqltxt, _re.S).group(1)))
+    check("SQL: tipos para RFQ de búsqueda == backend", _bus_sql == _tipos_be, f"{_bus_sql} vs {_tipos_be}")
+    _pub_be = {t for t, c in sc.CONTRATOS.items() if "publicar_producto" in c.procesos} | set(sc.TIPOS_SIN_RESTRICCION)
+    check("SQL: tipos para publicación desde link == backend", _pub_sql == _pub_be, f"{_pub_sql} vs {_pub_be}")
+else:
+    print("  (omitido: no está el repo del frontend)")
+
+print("El PROMPT de cada stream no trae instrucciones de procesos que no son suyos")
+def _p(t): return ac._build_system_prompt(t)
+check("Oportunidad: el prompt no manda a usar crear_rfqs_desde_texto", "crear_rfqs_desde_texto" not in _p("rfq"))
+check("Oportunidad: el prompt no menciona publicar_producto_link / extraer_ficha_pdf", not any(x in _p("rfq") for x in ("publicar_producto_link", "extraer_ficha_pdf")))
+check("Buscar prods: sin reglas de oportunidades", "REGLA ABSOLUTA" not in _p("busquedas") and "crear_oportunidad_crm" not in _p("busquedas"))
+check("Productos: sin reglas de oportunidades ni pipeline de búsqueda", "REGLA ABSOLUTA" not in _p("publicacion") and "crear_rfqs_desde_texto" not in _p("publicacion"))
+check("Correo: sin pipeline de catálogo en el prompt", "crear_rfqs_desde_texto" not in _p("correo"))
+check("todos los prompts focalizados traen su límite", all("LÍMITE DE ESTE STREAM" in _p(t) for t in ("rfq", "correo", "busquedas", "publicacion", "whatsapp")))
+check("generico (legado) conserva el prompt completo", _p("generico") == ac.SYSTEM_PROMPT)
+
 if _fallos:
     print(f"\n❌ {len(_fallos)} fallo(s): {_fallos}")
     raise SystemExit(1)

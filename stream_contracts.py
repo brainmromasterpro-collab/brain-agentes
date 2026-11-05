@@ -140,3 +140,16 @@ def insertar_trigger(supabase, stream_id, trigger: str, fila: dict, log=None) ->
         return False
     supabase.table("mensajes").insert(fila).execute()
     return True
+
+
+def stream_permite_proceso(supabase, stream_id, proceso: str, log=None) -> bool:
+    """¿El contrato del stream incluye este proceso? Falla cerrado (False) si no se puede leer el tipo."""
+    if not stream_id:
+        return False
+    try:
+        tipo = (supabase.table("streams").select("tipo").eq("id", stream_id).single().execute().data or {}).get("tipo")
+    except Exception as e:
+        if log: log.error(f"no se pudo leer el tipo del stream {stream_id!r} ({e})")
+        return False
+    c = CONTRATOS.get(tipo)
+    return bool(c and proceso in c.procesos)

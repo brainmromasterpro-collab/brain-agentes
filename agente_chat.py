@@ -3857,16 +3857,53 @@ _PROMPT_INTRO, _PROMPT_MODOS = _partir_prompt(SYSTEM_PROMPT)
 TIPO_MODOS = stream_contracts.modos_por_tipo()   # derivado de stream_contracts.CONTRATOS
 
 
+# Reglas del MODO 7 (base, va en TODOS los prompts) que pertenecen a UN proceso: solo se incluyen en los streams
+# cuyo contrato incluye ese proceso. Antes iban en todos y, p.ej., Buscar prods recibía las reglas de oportunidades y
+# Oportunidad recibía "usa crear_rfqs_desde_texto" (así se mezclaban los procesos desde el propio prompt).
+_REGLAS_POR_PROCESO = [
+    ("- OPORTUNIDADES",                          "oportunidades"),
+    ("- TÍTULO/NOMBRE DE LA OPORTUNIDAD",        "oportunidades"),
+    ("- RFQ REPETIDO",                           "oportunidades"),
+    ("- CONTACTOS CRM",                          "oportunidades"),
+    ("- Para listas de productos, SIEMPRE usa crear_rfqs_desde_texto", "pipeline_rfq"),
+    ("- IDIOMA DE CORREOS",                      "correo"),
+    ("- EMAILS Y ACCIÓN",                        "correo"),
+]
+
+
+def _modo7_para(procesos) -> str:
+    """MODO 7 sin las reglas de procesos que el stream no tiene."""
+    import re as _re
+    texto = _PROMPT_MODOS.get(7, "")
+    partes = _re.split(r"(?m)^(?=- )", texto)
+    fuera = []
+    for parte in partes:
+        proc = next((pr for pref, pr in _REGLAS_POR_PROCESO if parte.startswith(pref)), None)
+        if proc is None or proc in procesos:
+            fuera.append(parte)
+    return "".join(fuera)
+
+
+def _limite_del_stream(contrato) -> str:
+    otros = [f"«{c.nombre}» ({c.descripcion})" for t, c in stream_contracts.CONTRATOS.items()
+             if t not in ("mensajeria", "cotizaciones", "catalogo", "whatsapp") and c.tipo != contrato.tipo]
+    return (f"\n\nLÍMITE DE ESTE STREAM — aquí SOLO haces: {contrato.descripcion} Cada proceso vive en su propio stream. "
+            "Si te piden algo que no es de aquí, NO lo intentes ni improvises: responde en una línea en qué stream se hace "
+            f"y no ejecutes nada. Streams: {'; '.join(otros)}.\n")
+
+
 def _build_system_prompt(tipo: str) -> str:
-    """Prompt focalizado según el tipo del stream. Tipo no reconocido → prompt completo."""
-    if not tipo or tipo not in TIPO_MODOS or not _PROMPT_MODOS:
+    """Prompt focalizado según el tipo del stream. Tipo no reconocido → prompt completo (solo 'generico' llega aquí)."""
+    contrato = stream_contracts.contrato_de(tipo)
+    if contrato is None or tipo not in TIPO_MODOS or not _PROMPT_MODOS:
         return SYSTEM_PROMPT
     partes = [_PROMPT_INTRO]
     for n in TIPO_MODOS[tipo]:
         if n in _PROMPT_MODOS:
             partes.append(_PROMPT_MODOS[n])
     if 7 in _PROMPT_MODOS:
-        partes.append(_PROMPT_MODOS[7])  # MODO 7 = reglas generales, siempre al final
+        partes.append(_modo7_para(contrato.procesos))  # MODO 7 = reglas generales, siempre al final
+    partes.append(_limite_del_stream(contrato))
     return "".join(partes)
 
 

@@ -68,7 +68,7 @@ def _bloque(val: dict) -> str:
 def _stream_facturacion() -> str:
     """La facturación (Alegra, Invoices ligadas a la Sales Order) vive en el stream de Sales Order, no en Pagos."""
     from agente_chat import supabase
-    r = supabase.table("streams").select("id").eq("tipo", "ordenes").limit(1).execute().data or []
+    r = supabase.table("streams").select("id").eq("tipo", "ordenes").order("created_at").limit(1).execute().data or []
     return r[0]["id"] if r else ""
 
 

@@ -24,6 +24,7 @@ Variables de entorno (mismas que agente_buscador):
   ONECRM_PASSWORD=
 """
 
+import stream_contracts
 import os
 import time
 import json
@@ -890,7 +891,8 @@ def procesar_job_publicador(job: dict) -> None:
             "titulo":    titulo,
             "mensaje":   mensaje,
             "rfq_id":    rfq_uuid,
-            "stream_id": rfq.get("stream_id"),
+            # solo se liga a un stream cuyo contrato incluye el pipeline de búsqueda (si no, sin stream: no aparece en otro proceso)
+            "stream_id": (rfq.get("stream_id") if stream_contracts.stream_permite_proceso(supabase, rfq.get("stream_id"), "pipeline_rfq", log) else None),
             "leida":     False,
         }).execute()
 
