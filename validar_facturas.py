@@ -8,7 +8,7 @@ no se tocan las históricas, porque la mayoría de las cuentas antiguas aún no 
 El resultado se deja en dos lugares:
   • bloque [VALIDACIÓN SAT] en la Descripción de la Invoice (visible donde se captura; se reescribe solo
     si el resultado cambia, así que no hay avisos duplicados ni escrituras en cada pasada);
-  • aviso en el stream de Pagos cuando aparecen problemas.
+  • aviso en el stream de Sales Order (donde vive la facturación) cuando aparecen problemas.
 """
 import datetime
 import logging
@@ -65,9 +65,10 @@ def _bloque(val: dict) -> str:
     return "\n".join(l + [FIN])
 
 
-def _stream_pagos() -> str:
+def _stream_facturacion() -> str:
+    """La facturación (Alegra, Invoices ligadas a la Sales Order) vive en el stream de Sales Order, no en Pagos."""
     from agente_chat import supabase
-    r = supabase.table("streams").select("id").eq("tipo", "pagos").limit(1).execute().data or []
+    r = supabase.table("streams").select("id").eq("tipo", "ordenes").limit(1).execute().data or []
     return r[0]["id"] if r else ""
 
 
@@ -106,7 +107,7 @@ def revisar(limite: int = 40) -> dict:
 
 
 def _avisar(inv: dict, acc: dict, val: dict) -> None:
-    sid = _stream_pagos()
+    sid = _stream_facturacion()
     if not sid:
         return
     from agente_chat import supabase

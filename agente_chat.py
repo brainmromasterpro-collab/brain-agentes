@@ -3298,6 +3298,29 @@ TOOLS_POR_TIPO: dict[str, set[str]] = {
 }
 
 
+# Único stream que conserva TODO a propósito (legacy, sin uso desde 2026-10-14); cualquier otro tipo debe estar en
+# TOOLS_POR_TIPO. Un tipo desconocido ya no hereda todas las herramientas.
+TIPOS_SIN_RESTRICCION = {"generico"}
+
+
+def _resolver_tipo_stream(stream_id) -> tuple[str | None, bool]:
+    """(tipo, ok). Reintenta la lectura; ok=False si no se pudo leer o el tipo no está registrado."""
+    if not stream_id:
+        return None, True  # llamadas sin stream (internas): comportamiento previo
+    tipo = None
+    for intento in range(3):
+        try:
+            r = supabase.table("streams").select("tipo").eq("id", stream_id).single().execute()
+            tipo = (r.data or {}).get("tipo")
+            break
+        except Exception as e:
+            log.warning(f"No se pudo leer tipo del stream (intento {intento + 1}/3): {e}")
+            time.sleep(0.5)
+    else:
+        return None, False
+    return tipo, bool(tipo in TOOLS_POR_TIPO or tipo in TIPOS_SIN_RESTRICCION)
+
+
 def _tools_para_tipo(tipo: str | None) -> list[dict]:
     """Devuelve el subconjunto de TOOLS permitido para el tipo de stream dado.
     Tipo no reconocido -> TOOLS completo (comportamiento anterior)."""
@@ -5486,13 +5509,14 @@ def procesar_mensaje(msg: dict) -> None:
 
     # Tipo del stream → prompt focalizado (base + solo los modos de ese propósito). Si no hay tipo
     # reconocido, _build_system_prompt devuelve el prompt completo (comportamiento actual).
-    _tipo_stream = None
-    try:
-        if stream_id:
-            _sres = supabase.table("streams").select("tipo").eq("id", stream_id).single().execute()
-            _tipo_stream = (_sres.data or {}).get("tipo")
-    except Exception as e:
-        log.warning(f"No se pudo leer tipo del stream: {e}")
+    _tipo_stream, _tipo_ok = _resolver_tipo_stream(stream_id)
+    if not _tipo_ok:
+        # FALLAR CERRADO: sin saber de qué proceso es el stream, NO se le da el prompt completo ni todas las
+        # herramientas (así se mezclaban los procesos entre streams).
+        log.error(f"STREAM SIN TIPO CONOCIDO: stream={stream_id!r} tipo={_tipo_stream!r} — no se procesa el mensaje")
+        _alegra_msg(stream_id, "No pude identificar de qué tipo es este stream, así que no ejecuté nada para no mezclar procesos. "
+                               "Vuelve a enviar el mensaje; si se repite, avísame.")
+        return
     _system_prompt = _build_system_prompt(_tipo_stream)
 
     log.info(f"Chat msg {msg_id[:8]} | stream={stream_id!r} tipo={_tipo_stream!r} "

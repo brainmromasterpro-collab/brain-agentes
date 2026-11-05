@@ -69,6 +69,11 @@ for tipo, modos in ac.TIPO_MODOS.items():
     else:
         check(tipo, not faltan, str(faltan))
 
+print("Tipo de stream desconocido: falla cerrado (no hereda todas las herramientas)")
+check("stream inexistente → no ok", ac._resolver_tipo_stream("00000000-0000-0000-0000-000000000000")[1] is False)
+check("stream real (Oportunidad) → rfq", ac._resolver_tipo_stream("66c0d303-e633-45cc-a042-12824c40d02b") == ("rfq", True))
+check("todo tipo de TIPO_MODOS tiene herramientas registradas", set(ac.TIPO_MODOS) <= set(ac.TOOLS_POR_TIPO))
+
 if _fallos:
     print(f"\n❌ {len(_fallos)} fallo(s): {_fallos}")
     raise SystemExit(1)
