@@ -3772,7 +3772,7 @@ FUENTE DE VERDAD — el catálogo real de 1CRM sí. Si el usuario dice explícit
 había publicado: verifica el estado REAL antes de decidir. Si tienes el link, vuelve a llamar \
 extraer_producto_de_link (ya trae el chequeo de "ya_existe" contra el catálogo ACTUAL, no contra el \
 historial) y confía en ESE resultado, no en lo que dice el chat. Si no tienes el link, usa \
-verificar_lista_productos con el part_number para confirmar. Si el CRM confirma que de verdad NO \
+buscar_productos_crm con el part_number para confirmar. Si el CRM confirma que de verdad NO \
 está, procede normal: [PRODUCTO_PREVIEW] (con los mismos datos del historial si no hay link nuevo) + \
 [DECISION], como si fuera la primera vez.
 
