@@ -3323,9 +3323,12 @@ def _resolver_tipo_stream(stream_id) -> tuple[str | None, bool]:
 
 def _tools_para_tipo(tipo: str | None) -> list[dict]:
     """Devuelve el subconjunto de TOOLS permitido para el tipo de stream dado.
-    Tipo no reconocido -> TOOLS completo (comportamiento anterior)."""
-    if not tipo or tipo not in TOOLS_POR_TIPO:
+    Tipo 'generico' (stream legado, explícito) -> TOOLS completo. Tipo desconocido/None -> NINGUNA herramienta
+    (falla cerrado: antes heredaba todas y así se mezclaban los procesos entre streams)."""
+    if tipo in TIPOS_SIN_RESTRICCION:
         return TOOLS
+    if not tipo or tipo not in TOOLS_POR_TIPO:
+        return []
     nombres = TOOLS_POR_TIPO[tipo]
     return [t for t in TOOLS if t["name"] in nombres]
 
@@ -4027,6 +4030,7 @@ def run_chat(messages: list[dict], stream_id: str, system_prompt: str = SYSTEM_P
     total_input_tokens  = 0
     total_output_tokens = 0
     _tools = _tools_para_tipo(tipo_stream)
+    _permitidas = {t["name"] for t in _tools}
 
     import time as _time
     _t_start = _time.time()
@@ -4107,8 +4111,26 @@ def run_chat(messages: list[dict], stream_id: str, system_prompt: str = SYSTEM_P
                     })
                     continue
 
-                # Inyectar stream_id automáticamente en tools que lo necesitan
-                if tool_name in ("crear_rfqs_desde_texto", "notificar_sistema", "publicar_producto_link", "publicar_productos_desde_links", "crear_cuenta_crm", "crear_contacto_crm", "crear_oportunidad_crm") and not tool_input.get("stream_id"):
+                # BARRERA DE EJECUCIÓN: solo se ejecuta lo que el tipo del stream tiene permitido. Antes solo se
+                # limitaba la lista que se le MOSTRABA al modelo; si pedía otra herramienta (por el prompt, el
+                # historial o una alucinación) se ejecutaba igual y se mezclaban los procesos.
+                if tool_name not in _permitidas:
+                    log.error(f"[BARRERA] Tool '{tool_name}' NO permitida en stream tipo={tipo_stream!r} "
+                              f"stream={stream_id!r} — no se ejecuta")
+                    _log_stream(stream_id, f"Bloqueé «{tool_name}»: no pertenece al proceso de este stream", "error")
+                    tool_results.append({
+                        "type": "tool_result", "tool_use_id": block.id,
+                        "content": json.dumps({"error": f"La herramienta '{tool_name}' no pertenece a este stream y no se ejecutó. "
+                                                        "Dile al usuario que ese proceso se hace en su stream correspondiente."},
+                                              ensure_ascii=False),
+                    })
+                    continue
+
+                # El stream_id SIEMPRE es el del stream que originó el mensaje; el modelo no puede escribir en otro.
+                if tool_name in ("crear_rfqs_desde_texto", "notificar_sistema", "publicar_producto_link", "publicar_productos_desde_links", "crear_cuenta_crm", "crear_contacto_crm", "crear_oportunidad_crm"):
+                    if tool_input.get("stream_id") and tool_input.get("stream_id") != stream_id:
+                        log.error(f"[BARRERA] {tool_name} pidió stream_id={tool_input.get('stream_id')!r} distinto al del "
+                                  f"mensaje ({stream_id!r}) — se sobrescribe")
                     tool_input["stream_id"] = stream_id
 
                 # Aviso de inicio con estimado (la burbuja "procesando" lo muestra en vivo)

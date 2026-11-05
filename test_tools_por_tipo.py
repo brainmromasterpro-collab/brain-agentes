@@ -73,6 +73,40 @@ check("stream inexistente → no ok", ac._resolver_tipo_stream("00000000-0000-00
 check("stream real (Oportunidad) → rfq", ac._resolver_tipo_stream("66c0d303-e633-45cc-a042-12824c40d02b") == ("rfq", True))
 check("todo tipo de TIPO_MODOS tiene herramientas registradas", set(ac.TIPO_MODOS) <= set(ac.TOOLS_POR_TIPO))
 
+print("Barrera de ejecución: una herramienta de otro proceso NO se ejecuta aunque el modelo la pida")
+from types import SimpleNamespace as _NS
+_llamadas = []
+def _fake_tool(**kw):
+    _llamadas.append(kw); return {"ok": True}
+def _resp(blocks, stop):
+    return _NS(content=blocks, stop_reason=stop, usage=None)
+def _tool_use(name, inp):
+    return _NS(type="tool_use", id="t1", name=name, input=inp)
+def _correr(tipo, nombre_tool, inp):
+    _llamadas.clear()
+    originales = dict(ac.TOOL_FUNCTIONS)
+    ac.TOOL_FUNCTIONS[nombre_tool] = _fake_tool
+    seq = [_resp([_tool_use(nombre_tool, inp)], "tool_use"), _resp([_NS(type="text", text="listo")], "end_turn")]
+    orig_create = ac.claude.messages.create
+    ac.claude.messages.create = lambda **kw: seq.pop(0)
+    try:
+        ac.run_chat([{"role": "user", "content": "x"}], stream_id="STREAM-REAL", system_prompt="", tipo_stream=tipo)
+    finally:
+        ac.claude.messages.create = orig_create
+        ac.TOOL_FUNCTIONS.clear(); ac.TOOL_FUNCTIONS.update(originales)
+    return list(_llamadas)
+check("rfq pide crear_rfqs_desde_texto → bloqueada", _correr("rfq", "crear_rfqs_desde_texto", {"texto": "x"}) == [])
+check("rfq pide buscar_proveedores_crm → bloqueada", _correr("rfq", "buscar_proveedores_crm", {"nombre": "x"}) == [])
+check("correo pide crear_rfqs_desde_texto → bloqueada", _correr("correo", "crear_rfqs_desde_texto", {"texto": "x"}) == [])
+check("busquedas pide publicar_producto_link → bloqueada", _correr("busquedas", "publicar_producto_link", {"url": "x"}) == [])
+check("tipo desconocido no ejecuta nada", _correr("inventado", "crear_oportunidad_crm", {"nombre": "x"}) == [])
+_ok = _correr("rfq", "crear_oportunidad_crm", {"nombre": "x"})
+check("rfq sí ejecuta crear_oportunidad_crm", len(_ok) == 1)
+_ok = _correr("rfq", "crear_oportunidad_crm", {"nombre": "x", "stream_id": "OTRO-STREAM"})
+check("el stream_id del modelo se sobrescribe con el real", len(_ok) == 1 and _ok[0].get("stream_id") == "STREAM-REAL", str(_ok))
+check("_tools_para_tipo(None) y desconocido → vacío", ac._tools_para_tipo(None) == [] and ac._tools_para_tipo("zzz") == [])
+check("generico (legado) conserva todo", len(ac._tools_para_tipo("generico")) == len(ac.TOOLS))
+
 if _fallos:
     print(f"\n❌ {len(_fallos)} fallo(s): {_fallos}")
     raise SystemExit(1)
