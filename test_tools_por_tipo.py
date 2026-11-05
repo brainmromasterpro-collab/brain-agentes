@@ -47,6 +47,28 @@ print("Catálogo/Productos: sin crear oportunidades")
 for tipo in ("publicacion", "busquedas"):
     check(tipo, "crear_oportunidad_crm" not in ac.TOOLS_POR_TIPO[tipo])
 
+print("Registro de procesos (streams_registry): ninguna mezcla nueva ni herramienta sin clasificar")
+import re
+import streams_registry as sr
+_err, _avi = sr.verificar(ac.TOOLS_POR_TIPO, nombres)
+check("sin errores", not _err, "; ".join(_err))
+for a in _avi:
+    print(f"  ⚠ {a}")
+
+print("El prompt de cada stream no pide herramientas que ese stream no tiene")
+_PEND = {"busquedas": "MODO 14 (ficha técnica/publicación) pertenece al stream Productos",
+         "publicacion": "MODO 13 menciona verificar_lista_productos (pipeline de búsqueda)"}
+for tipo, modos in ac.TIPO_MODOS.items():
+    if not modos or tipo not in ac.TOOLS_POR_TIPO:
+        continue
+    texto = "".join(ac._PROMPT_MODOS.get(n, "") for n in modos)
+    faltan = sorted(n for n in nombres if re.search(r"\b" + re.escape(n) + r"\b", texto)) 
+    faltan = [n for n in faltan if n not in ac.TOOLS_POR_TIPO[tipo]]
+    if faltan and tipo in _PEND:
+        print(f"  ⚠ {tipo}: pide {faltan} sin tenerlas — conocido: {_PEND[tipo]}")
+    else:
+        check(tipo, not faltan, str(faltan))
+
 if _fallos:
     print(f"\n❌ {len(_fallos)} fallo(s): {_fallos}")
     raise SystemExit(1)

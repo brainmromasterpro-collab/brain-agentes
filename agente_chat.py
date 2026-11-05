@@ -5922,6 +5922,16 @@ def procesar_mensaje(msg: dict) -> None:
 # ─────────────────────────────────────────────────────────────
 def main() -> None:
     log.info("Agente Chat iniciado — escuchando tabla `mensajes`...")
+    # Los streams no deben mezclar procesos: se valida el mapa herramienta↔stream contra streams_registry.
+    try:
+        import streams_registry
+        _err, _avi = streams_registry.verificar(TOOLS_POR_TIPO, {t["name"] for t in TOOLS})
+        for _e in _err:
+            log.error(f"STREAMS MEZCLADOS: {_e}")
+        for _a in _avi:
+            log.warning(f"Mezcla de streams conocida: {_a}")
+    except Exception as _e:
+        log.warning(f"No se pudo verificar streams_registry: {_e}")
 
     # Al arrancar, descartar SOLO el backlog realmente viejo (>5 min) para no responder a
     # mensajes de sesiones pasadas. Los mensajes recientes (<5 min) NO se descartan: así, si
