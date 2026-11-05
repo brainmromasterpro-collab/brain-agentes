@@ -3266,6 +3266,13 @@ _T_RFQ     = {"buscar_productos_crm", "ver_producto_crm", "listar_productos_crm"
               "seleccionar_proveedor", "obtener_foto_rfq", "publicar_rfq",
               "publicar_sin_imagen_rfq", "verificar_lista_productos", "crear_rfqs_desde_texto",
               "buscar_internet", "notificar_sistema", "consultar_metricas"}
+# Oportunidad (stream 'rfq', MODO 15/12): solo CRM de ventas (cuenta, contacto, oportunidad). SIN el pipeline
+# de catálogo (crear_rfqs_desde_texto, proveedores, publicar) ni Gmail: ese pipeline crea RFQs de búsqueda de
+# producto, no oportunidades, y buscar_proveedores_crm confunde proveedor con cliente.
+_T_OPORT   = {"buscar_clientes_crm", "ver_cliente_crm", "crear_cuenta_crm", "crear_contacto_crm",
+              "actualizar_cuenta_crm", "actualizar_contacto_crm", "buscar_contactos_crm",
+              "ver_contactos_cuenta_crm", "listar_oportunidades_crm", "crear_oportunidad_crm",
+              "actualizar_oportunidad_crm", "buscar_internet", "notificar_sistema", "consultar_metricas"}
 _T_CATALOG = {"buscar_productos_crm", "ver_producto_crm", "listar_productos_crm",
               "extraer_producto_de_link", "extraer_ficha_pdf",
               "publicar_producto_link", "publicar_productos_desde_links",
@@ -3279,7 +3286,7 @@ TOOLS_POR_TIPO: dict[str, set[str]] = {
     "correo":       _T_VENTAS | _T_RFQ,
     "whatsapp":     _T_VENTAS | _T_RFQ,
     "mensajeria":   _T_VENTAS | _T_RFQ,
-    "rfq":          _T_RFQ,
+    "rfq":          _T_OPORT,
     "busquedas":    _T_RFQ,
     "publicacion":  _T_CATALOG,
     "catalogo":     _T_CATALOG | _T_RFQ,
