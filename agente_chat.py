@@ -3253,54 +3253,10 @@ TOOL_FUNCTIONS = {
 }
 
 # Tools permitidas por tipo de stream — evita cross-stream contamination.
-_T_VENTAS  = {"enviar_email_gmail", "diagnostico_gmail", "leer_emails_gmail",
-              "buscar_email_gmail", "escanear_emails_ventas",
-              "buscar_clientes_crm", "ver_cliente_crm", "crear_cuenta_crm",
-              "crear_contacto_crm", "actualizar_cuenta_crm", "actualizar_contacto_crm",
-              "buscar_contactos_crm", "ver_contactos_cuenta_crm",
-              "listar_oportunidades_crm", "crear_oportunidad_crm", "actualizar_oportunidad_crm",
-              "listar_cotizaciones_crm", "buscar_internet", "notificar_sistema",
-              "consultar_metricas"}
-_T_RFQ     = {"buscar_productos_crm", "ver_producto_crm", "listar_productos_crm",
-              "buscar_proveedores_crm", "consultar_rfqs", "obtener_opciones_rfq",
-              "seleccionar_proveedor", "obtener_foto_rfq", "publicar_rfq",
-              "publicar_sin_imagen_rfq", "verificar_lista_productos", "crear_rfqs_desde_texto",
-              "buscar_internet", "notificar_sistema", "consultar_metricas"}
-# Oportunidad (stream 'rfq', MODO 15/12): solo CRM de ventas (cuenta, contacto, oportunidad). SIN el pipeline
-# de catálogo (crear_rfqs_desde_texto, proveedores, publicar) ni Gmail: ese pipeline crea RFQs de búsqueda de
-# producto, no oportunidades, y buscar_proveedores_crm confunde proveedor con cliente.
-_T_OPORT   = {"buscar_clientes_crm", "ver_cliente_crm", "crear_cuenta_crm", "crear_contacto_crm",
-              "actualizar_cuenta_crm", "actualizar_contacto_crm", "buscar_contactos_crm",
-              "ver_contactos_cuenta_crm", "listar_oportunidades_crm", "crear_oportunidad_crm",
-              "actualizar_oportunidad_crm", "buscar_internet", "notificar_sistema", "consultar_metricas"}
-_T_CATALOG = {"buscar_productos_crm", "ver_producto_crm", "listar_productos_crm",
-              "extraer_producto_de_link", "extraer_ficha_pdf",
-              "publicar_producto_link", "publicar_productos_desde_links",
-              "buscar_internet", "notificar_sistema", "consultar_metricas"}
-_T_OPS     = {"buscar_productos_crm", "ver_producto_crm", "listar_productos_crm",
-              "buscar_clientes_crm", "ver_cliente_crm", "buscar_proveedores_crm",
-              "listar_cotizaciones_crm", "buscar_internet", "notificar_sistema",
-              "consultar_metricas"}
-
-TOOLS_POR_TIPO: dict[str, set[str]] = {
-    "correo":       _T_VENTAS,
-    "whatsapp":     _T_VENTAS,
-    "mensajeria":   _T_VENTAS,
-    "rfq":          _T_OPORT,
-    "busquedas":    _T_RFQ,
-    "publicacion":  _T_CATALOG,
-    "catalogo":     _T_CATALOG | _T_RFQ,
-    "cotizacion":   _T_VENTAS,
-    "cotizaciones": _T_VENTAS,
-    "ordenes":      _T_OPS,
-    "compras":      _T_OPS,
-    "pagos":        _T_OPS,
-}
-
-
-# Único stream que conserva TODO a propósito (legacy, sin uso desde 2026-10-14); cualquier otro tipo debe estar en
-# TOOLS_POR_TIPO. Un tipo desconocido ya no hereda todas las herramientas.
-TIPOS_SIN_RESTRICCION = {"generico"}
+# FUENTE ÚNICA: stream_contracts.CONTRATOS (cada stream tiene un contrato escrito). Aquí solo se derivan.
+import stream_contracts
+TOOLS_POR_TIPO: dict[str, set[str]] = stream_contracts.tools_por_tipo()
+TIPOS_SIN_RESTRICCION = set(stream_contracts.TIPOS_SIN_RESTRICCION)
 
 
 def _resolver_tipo_stream(stream_id) -> tuple[str | None, bool]:
@@ -3898,21 +3854,7 @@ _PROMPT_INTRO, _PROMPT_MODOS = _partir_prompt(SYSTEM_PROMPT)
 
 # Qué modos carga cada tipo (además del intro y MODO 7 = reglas base, que van siempre).
 # "generico" / "compras" / "general" / desconocido / None → prompt COMPLETO (todos los modos).
-TIPO_MODOS = {
-    "correo":       [10, 11, 12],                 # correo: oportunidades del correo + alta cliente (NUNCA catálogo)
-    "rfq":          [15, 12],                      # RFQ manual: usuario sube texto/screenshot, sin correo
-    "whatsapp":     [10, 11, 12],                 # WhatsApp: mismos modos que correo, otro canal
-    "busquedas":    [1, 2, 3, 4, 5, 6, 8],         # búsqueda RFQ + selección proveedor + imagen (publicar ficha = stream Productos)
-    "publicacion":  [13, 14],                      # publicar producto(s) desde link o ficha técnica PDF
-    "cotizacion":   [],                            # (módulo de cotización se agrega después)
-    "ordenes":      [],
-    "compras":      [],                            # compras a proveedor: pipeline 100% determinista
-    "pagos":        [],                            # pagos (Bill+Invoice): pipeline 100% determinista
-    # aliases de compatibilidad
-    "mensajeria":   [10, 11, 12],
-    "catalogo":     [1, 2, 3, 4, 5, 6, 8, 13, 14],
-    "cotizaciones": [],
-}
+TIPO_MODOS = stream_contracts.modos_por_tipo()   # derivado de stream_contracts.CONTRATOS
 
 
 def _build_system_prompt(tipo: str) -> str:
@@ -5524,6 +5466,255 @@ def _procesar_estado_operativo(stream_id: str) -> None:
     _log_stream(stream_id, "Estado operativo listo", "ok")
 
 
+def _manejar_ordenes(msg: dict, stream_id: str, contenido: str, _md0: dict) -> bool:
+    """Manejador del stream 'ordenes' (Sales Order). True = atendido; False = pasar al modelo."""
+    _file_url  = _md0.get("file_url") or _md0.get("po_url")
+    _file_name = _md0.get("file_name", "")
+    _file_mime = _md0.get("file_mime", "")
+
+    # Confirmaciones (botón ya apretado) — van primero.
+    if _md0.get("so_action") == "crear":
+        _crear_so_confirmada(stream_id, _md0.get("draft") or {})
+        return True
+    if _md0.get("so_action") == "elegir_cotizacion":
+        _recotejar_con_cotizacion(stream_id, _md0.get("po") or {}, _md0.get("quote_id", ""))
+        return True
+    # SHIPPING (envío al cliente): tracking -> elegir SO -> form -> In Preparation;
+    # "shipped" -> elegir envío -> Shipped.
+    if _md0.get("shipping_action") == "preparar":
+        _preparar_envio(stream_id, _md0.get("so_id", ""), _md0.get("tracking", ""))
+        return True
+    if _md0.get("shipping_action") == "crear":
+        _crear_shipping_confirmado(stream_id, _md0.get("so_id", ""), _md0.get("lineas") or [],
+                                   _md0.get("datos") or {})
+        return True
+    if _md0.get("shipping_action") == "marcar_shipped":
+        _marcar_shipped_confirmado(stream_id, _md0.get("shipping_id", ""), _md0.get("lineas") or [],
+                                   _md0.get("so_id", ""), _md0.get("tracking", ""))
+        return True
+    if _md0.get("shipping_action") == "deshacer":
+        _deshacer_shipping(stream_id, _md0.get("shipping_id", ""), _md0.get("lineas") or [],
+                           _md0.get("so_id", ""), bool(_md0.get("estaba_enviado")),
+                           _md0.get("so_stage_anterior", ""))
+        return True
+    # CIERRE / facturación (movido de compras a ordenes, donde corresponde).
+    if _md0.get("cierre_action") == "confirmar":
+        _confirmar_cierre_venta(stream_id, _md0.get("so_id", ""),
+                                bool(_md0.get("facturado")), _md0.get("estado_anterior", ""))
+        return True
+    if _md0.get("cierre_action") == "deshacer":
+        _deshacer_cierre(stream_id, _md0.get("so_id", ""), _md0.get("estado_anterior", ""))
+        return True
+    # Facturación con Alegra (botones de los widgets [ALEGRA_*]).
+    if _md0.get("alegra_action") == "borrador":
+        _alegra_borrador(stream_id, _md0.get("so_id", ""))
+        return True
+    if _md0.get("alegra_action") == "crear":
+        _alegra_crear(stream_id, _md0.get("draft") or {}, bool(_md0.get("timbrar")))
+        return True
+    if _md0.get("alegra_action") == "deshacer":
+        _alegra_deshacer(stream_id, _md0.get("invoice_id", ""), _md0.get("crm_invoice_id", ""))
+        return True
+    if _md0.get("cancelar_accion"):
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": "Entendido, no hice nada con eso. Mándame el dato correcto cuando quieras.",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return True
+    # Clasificación de evidencia/texto nuevo.
+    _urls = re.findall(r'https?://\S+', contenido or "")
+    _low = (contenido or "").lower()
+    _es_shipped = bool(re.search(r'\bshipped\b|marcar.*(enviad|shipped)|ya (se )?(envi[oó]|sali[oó])', _low))
+    _es_alegra = bool(re.search(r'alegra', _low)) and not _file_url
+    _es_factura = bool(re.search(r'factura|firmad|facturad|facturar|cerrar\s+venta', _low))
+    _es_estado = (not _file_url and not _urls and
+                  bool(re.search(r'c[oó]mo va|estado (de la venta|operativo)|estatus de la venta|rollup|resumen de (la )?venta', _low)))
+    # BUG REAL confirmado: \b[A-Z0-9]{8,30}\b también matcheaba palabras normales en MAYÚSCULAS
+    # sin nada de tracking (ej. "COTIZACION", 10 letras) — cualquier mensaje en mayúsculas con
+    # una palabra larga se clasificaba como "está dando un número de guía". Un tracking real
+    # SIEMPRE trae al menos un dígito (UPS/FedEx/DHL); exigirlo descarta las palabras sueltas
+    # sin tocar los casos reales (alfanumérico o solo dígitos).
+    _es_tracking = (not _es_shipped and not _es_estado and
+                    bool(_urls or re.search(r'tracking|gu[ií]a|rastreo|n[uú]mero de env[ií]o|env[ií]o|shipping', _low)
+                         or re.search(r'\b(?=[A-Z0-9]{8,30}\b)[A-Z0-9]*\d[A-Z0-9]*\b', contenido or "")))
+
+    if _file_url:
+        # Una IMAGEN en ordenes puede ser la guía de envío (tracking saliente) o la orden de
+        # compra del cliente — se clasifica con visión. Un PDF/otro se asume orden del cliente.
+        _es_img = (_file_mime or "").startswith("image/") or re.search(r'\.(png|jpe?g|webp|gif|heic)$', (_file_name or "").lower())
+        if _es_img:
+            try:
+                import sales_shipping
+                _imgs = _bajar_imagenes(_file_url, _file_name, _file_mime)
+                _ev = sales_shipping.leer_evidencia_envio(_imgs)
+            except Exception as e:
+                log.warning(f"No se pudo clasificar la imagen de ventas: {e}")
+                _ev = {"tipo": "orden_compra"}
+            if _ev.get("tipo") == "tracking":
+                _procesar_tracking_envio(stream_id, _ev.get("tracking", "") or (contenido or "").strip())
+                return True
+        # orden de compra del cliente (flujo existente).
+        _procesar_orden_compra(stream_id, _file_url, _file_name or "orden", _file_mime)
+        return True
+    # Texto/link pegado: ¿es una ORDEN DE COMPRA? (copy-paste del correo/portal del cliente). Un link
+    # de paquetería (UPS/FedEx/DHL/Estafeta...) o un mensaje corto de tracking NO lo es.
+    _carrier = re.search(r'ups\.com|fedex|dhl|estafeta|paquetexpress|tracking|rastreo|17track|correos', _low)
+    _kw_po = len(re.findall(r'orden de compra|purchase order|\bpo\b|cantidad|quantity|qty|precio|price|item|part\s*(no|number)|descripci', _low))
+    _lineas = len([l for l in (contenido or "").splitlines() if l.strip()])
+    if not _file_url and not _es_shipped and not _es_estado and not _carrier:
+        _url_po = next((u for u in _urls), "")
+        if _url_po and len(_urls) == 1 and len((contenido or "").replace(_url_po, "").strip()) < 80:
+            _procesar_orden_compra_texto(stream_id, url=_url_po.rstrip(").,"))
+            return True
+        if len(contenido or "") >= 120 and (_kw_po >= 2 or _lineas >= 4):
+            _procesar_orden_compra_texto(stream_id, texto=contenido or "")
+            return True
+    if _es_alegra:
+        _alegra_elegir(stream_id, contenido or "")
+        return True
+    if _es_shipped:
+        _cotejo_marcar_shipped(stream_id)
+        return True
+    if _es_factura:
+        _procesar_cierre_venta(stream_id)
+        return True
+    if _es_estado:
+        _procesar_estado_operativo(stream_id)
+        return True
+    if _es_tracking:
+        _procesar_tracking_envio(stream_id, (contenido or "").strip())
+        return True
+    # Si no matchea nada operativo, cae al chat normal (LLM) — no return.
+    return False  # nada operativo: el llamador lo pasa al modelo (con SUS herramientas)
+
+
+def _manejar_compras(msg: dict, stream_id: str, contenido: str, _md0: dict) -> bool:
+    """Manejador determinista del stream 'compras' (Purchase Order). Siempre atiende."""
+    _file_url  = _md0.get("file_url", "")
+    _file_name = _md0.get("file_name", "")
+    _file_mime = _md0.get("file_mime", "")
+
+    # Confirmaciones (botón ya apretado en un widget de previo) — van primero.
+    if _md0.get("po_action") == "crear":
+        _crear_po_confirmado(stream_id, _md0.get("grupos") or [])
+        return True
+    if _md0.get("po_action") == "deshacer":
+        _deshacer_po(stream_id, _md0.get("po_id", ""), _md0.get("bill_id", ""))
+        return True
+    if _md0.get("pago_action") == "confirmar":
+        _confirmar_pago(stream_id, _md0.get("tipo", "bill"), _md0.get("registro_id", ""),
+                        _md0.get("monto", 0), _md0.get("datos_comprobante") or {})
+        return True
+    if _md0.get("pago_action") == "deshacer":
+        _deshacer_pago(stream_id, _md0.get("payment_id", ""))
+        return True
+    if _md0.get("pago_action") == "iniciar_registro":
+        _iniciar_registro_desde_pago(stream_id, _md0.get("direccion", "outgoing"),
+                                     _md0.get("monto", 0), _md0.get("datos_comprobante") or {})
+        return True
+    # Receiving v2 — sub-proceso anidado con ciclo de vida (secuencia flexible):
+    # activar (order confirmation/packing list) -> tracking (en tránsito) -> iniciar_recepcion
+    # (foto del paquete -> checklist) -> confirmar_recepcion (suma stock, cierra si completo).
+    if _md0.get("receiving_action") == "activar":
+        _activar_receiving(stream_id, _md0.get("po_id", ""), _md0.get("candidato") or {},
+                           _md0.get("doc") or None, _md0.get("tracking", ""))
+        return True
+    if _md0.get("receiving_action") == "tracking":
+        _marcar_en_transito(stream_id, _md0.get("po_id", ""), _md0.get("tracking", ""))
+        return True
+    if _md0.get("receiving_action") == "iniciar_recepcion":
+        _iniciar_recepcion(stream_id, _md0.get("po_id", ""), _md0.get("guia", ""))
+        return True
+    if _md0.get("receiving_action") == "confirmar_recepcion":
+        _confirmar_recepcion_checklist(stream_id, _md0.get("po_id", ""),
+                                       _md0.get("cantidades") or {}, _md0.get("estado_anterior", ""))
+        return True
+    if _md0.get("receiving_action") == "deshacer":
+        _deshacer_receiving(stream_id, _md0.get("po_id", ""), _md0.get("cantidades") or {},
+                            _md0.get("estado_anterior", ""))
+        return True
+    if _md0.get("cancelar_accion"):
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": "Entendido, no hice nada con eso. Mándame el link/foto/dato correcto cuando quieras.",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return True
+    # Clasificación de evidencia nueva (sin botón todavía). El cierre/facturación se movió al
+    # stream 'ordenes' (Sales order) — aquí solo compra, pago y recepción.
+    _urls = re.findall(r'https?://\S+', contenido or "")
+    _low = (contenido or "").lower()
+    _es_estado = (not _file_url and not _urls and
+                 bool(re.search(r'c[oó]mo va|estado (de la venta|operativo)|estatus de la venta|rollup|resumen de (la )?venta', _low)))
+    _es_tracking_texto = (not _file_url and not _urls and not _es_estado and
+                          bool(re.search(r'tracking|gu[ií]a|rastreo|n[uú]mero de env[ií]o', _low) or
+                               re.search(r'\b[A-Z0-9]{8,30}\b', contenido or "")))
+
+    if _urls:
+        _procesar_link_proveedor(stream_id, _urls)
+    elif _file_url and _procesar_captura_compra(stream_id, _file_url, _file_name, _file_mime):
+        pass  # captura de compra en línea → ya emitió el cotejo contra Sales Orders
+    elif _file_url and re.search(r'paquete|lleg|recib|contenido|packing|confirmation|confirmaci[oó]n|order\s*conf|gu[ií]a|tracking|env[ií]o|recepci[oó]n|receiving', _low + " " + (_file_name or "").lower()):
+        _procesar_evidencia_receiving(stream_id, contenido, _file_url, _file_name, _file_mime)
+    elif _file_url:
+        # Default para un archivo sin más contexto: comprobante de pago (el caso más común
+        # del transcript — "pagué algo, saco una foto").
+        _procesar_comprobante_pago(stream_id, _file_url, _file_name, _file_mime)
+    elif _es_estado:
+        _procesar_estado_operativo(stream_id)
+    elif _es_tracking_texto:
+        _procesar_evidencia_receiving(stream_id, contenido)
+    else:
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": "Mándame el link del producto que vas a comprar, una foto/PDF del "
+                       "comprobante de pago, o el tracking/packing list de una recepción — "
+                       "y sigo desde ahí.",
+            "procesado": True, "metadata": {},
+        }).execute()
+    return True
+
+
+def _manejar_pagos(msg: dict, stream_id: str, contenido: str, _md0: dict) -> bool:
+    """Manejador determinista del stream 'pagos'. Siempre atiende."""
+    _file_url  = _md0.get("file_url", "")
+    _file_name = _md0.get("file_name", "")
+    _file_mime = _md0.get("file_mime", "")
+
+    if _md0.get("pago_action") == "confirmar":
+        _confirmar_pago(stream_id, _md0.get("tipo", "bill"), _md0.get("registro_id", ""),
+                        _md0.get("monto", 0), _md0.get("datos_comprobante") or {})
+        return True
+    if _md0.get("pago_action") == "deshacer":
+        _deshacer_pago(stream_id, _md0.get("payment_id", ""))
+        return True
+    if _md0.get("pago_action") == "iniciar_registro":
+        _iniciar_registro_desde_pago(stream_id, _md0.get("direccion", "outgoing"),
+                                     _md0.get("monto", 0), _md0.get("datos_comprobante") or {})
+        return True
+    if _md0.get("cancelar_accion"):
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": "Entendido, no hice nada con eso. Mándame el comprobante correcto cuando quieras.",
+            "procesado": True, "metadata": {},
+        }).execute()
+        return True
+    if _file_url:
+        _procesar_comprobante_pago(stream_id, _file_url, _file_name, _file_mime)
+    else:
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant",
+            "content": "Mándame una foto, captura o PDF del comprobante de pago (a proveedor "
+                       "o de un cliente) y lo cotejo contra lo que tengas abierto en 1CRM.",
+            "procesado": True, "metadata": {},
+        }).execute()
+    return True
+
+
+_MANEJADORES = {"ordenes": _manejar_ordenes, "compras": _manejar_compras, "pagos": _manejar_pagos}
+
+
 def procesar_mensaje(msg: dict) -> None:
     msg_id    = msg["id"]
     stream_id = msg.get("stream_id", "")
@@ -5539,6 +5730,13 @@ def procesar_mensaje(msg: dict) -> None:
         _alegra_msg(stream_id, "No pude identificar de qué tipo es este stream, así que no ejecuté nada para no mezclar procesos. "
                                "Vuelve a enviar el mensaje; si se repite, avísame.")
         return
+    _contrato = stream_contracts.contrato_de(_tipo_stream)
+    if _contrato is None and _tipo_stream not in TIPOS_SIN_RESTRICCION:
+        log.error(f"STREAM SIN CONTRATO: tipo={_tipo_stream!r} stream={stream_id!r} — no se procesa")
+        _alegra_msg(stream_id, "Este tipo de stream no tiene un contrato definido, así que no ejecuté nada para no mezclar procesos.")
+        return
+    if _contrato is None:  # 'generico' (legado, explícito): sin router determinista
+        _contrato = stream_contracts.Contrato("generico", "Genérico (legado)", "", "llm", frozenset(), frozenset())
     _system_prompt = _build_system_prompt(_tipo_stream)
 
     log.info(f"Chat msg {msg_id[:8]} | stream={stream_id!r} tipo={_tipo_stream!r} "
@@ -5547,257 +5745,11 @@ def procesar_mensaje(msg: dict) -> None:
     # Marcar como procesado
     supabase.table("mensajes").update({"procesado": True}).eq("id", msg_id).execute()
 
-    # PIPELINE DE ORDEN DE COMPRA: si es un stream 'ordenes' y llega un archivo (PO), léelo y
-    # coteja contra las cotizaciones del cliente — sin pasar por el modelo. Emite el widget y termina.
+    # DESPACHO POR CONTRATO (stream_contracts.CONTRATOS): cada tipo de stream tiene UN manejador. Los routers
+    # deterministas (ordenes/compras/pagos) no usan el modelo; el resto cae al modelo con SU prompt y SUS herramientas.
     _md0 = msg.get("metadata") if isinstance(msg.get("metadata"), dict) else {}
-    _po_url = _md0.get("file_url") or _md0.get("po_url")
-    if _tipo_stream in ("ordenes", "sales_order"):
-        _file_url  = _md0.get("file_url") or _md0.get("po_url")
-        _file_name = _md0.get("file_name", "")
-        _file_mime = _md0.get("file_mime", "")
-
-        # Confirmaciones (botón ya apretado) — van primero.
-        if _md0.get("so_action") == "crear":
-            _crear_so_confirmada(stream_id, _md0.get("draft") or {})
-            return
-        if _md0.get("so_action") == "elegir_cotizacion":
-            _recotejar_con_cotizacion(stream_id, _md0.get("po") or {}, _md0.get("quote_id", ""))
-            return
-        # SHIPPING (envío al cliente): tracking -> elegir SO -> form -> In Preparation;
-        # "shipped" -> elegir envío -> Shipped.
-        if _md0.get("shipping_action") == "preparar":
-            _preparar_envio(stream_id, _md0.get("so_id", ""), _md0.get("tracking", ""))
-            return
-        if _md0.get("shipping_action") == "crear":
-            _crear_shipping_confirmado(stream_id, _md0.get("so_id", ""), _md0.get("lineas") or [],
-                                       _md0.get("datos") or {})
-            return
-        if _md0.get("shipping_action") == "marcar_shipped":
-            _marcar_shipped_confirmado(stream_id, _md0.get("shipping_id", ""), _md0.get("lineas") or [],
-                                       _md0.get("so_id", ""), _md0.get("tracking", ""))
-            return
-        if _md0.get("shipping_action") == "deshacer":
-            _deshacer_shipping(stream_id, _md0.get("shipping_id", ""), _md0.get("lineas") or [],
-                               _md0.get("so_id", ""), bool(_md0.get("estaba_enviado")),
-                               _md0.get("so_stage_anterior", ""))
-            return
-        # CIERRE / facturación (movido de compras a ordenes, donde corresponde).
-        if _md0.get("cierre_action") == "confirmar":
-            _confirmar_cierre_venta(stream_id, _md0.get("so_id", ""),
-                                    bool(_md0.get("facturado")), _md0.get("estado_anterior", ""))
-            return
-        if _md0.get("cierre_action") == "deshacer":
-            _deshacer_cierre(stream_id, _md0.get("so_id", ""), _md0.get("estado_anterior", ""))
-            return
-        # Facturación con Alegra (botones de los widgets [ALEGRA_*]).
-        if _md0.get("alegra_action") == "borrador":
-            _alegra_borrador(stream_id, _md0.get("so_id", ""))
-            return
-        if _md0.get("alegra_action") == "crear":
-            _alegra_crear(stream_id, _md0.get("draft") or {}, bool(_md0.get("timbrar")))
-            return
-        if _md0.get("alegra_action") == "deshacer":
-            _alegra_deshacer(stream_id, _md0.get("invoice_id", ""), _md0.get("crm_invoice_id", ""))
-            return
-        if _md0.get("cancelar_accion"):
-            supabase.table("mensajes").insert({
-                "stream_id": stream_id, "role": "assistant",
-                "content": "Entendido, no hice nada con eso. Mándame el dato correcto cuando quieras.",
-                "procesado": True, "metadata": {},
-            }).execute()
-            return
-
-        # Clasificación de evidencia/texto nuevo.
-        _urls = re.findall(r'https?://\S+', contenido or "")
-        _low = (contenido or "").lower()
-        _es_shipped = bool(re.search(r'\bshipped\b|marcar.*(enviad|shipped)|ya (se )?(envi[oó]|sali[oó])', _low))
-        _es_alegra = bool(re.search(r'alegra', _low)) and not _file_url
-        _es_factura = bool(re.search(r'factura|firmad|facturad|facturar|cerrar\s+venta', _low))
-        _es_estado = (not _file_url and not _urls and
-                      bool(re.search(r'c[oó]mo va|estado (de la venta|operativo)|estatus de la venta|rollup|resumen de (la )?venta', _low)))
-        # BUG REAL confirmado: \b[A-Z0-9]{8,30}\b también matcheaba palabras normales en MAYÚSCULAS
-        # sin nada de tracking (ej. "COTIZACION", 10 letras) — cualquier mensaje en mayúsculas con
-        # una palabra larga se clasificaba como "está dando un número de guía". Un tracking real
-        # SIEMPRE trae al menos un dígito (UPS/FedEx/DHL); exigirlo descarta las palabras sueltas
-        # sin tocar los casos reales (alfanumérico o solo dígitos).
-        _es_tracking = (not _es_shipped and not _es_estado and
-                        bool(_urls or re.search(r'tracking|gu[ií]a|rastreo|n[uú]mero de env[ií]o|env[ií]o|shipping', _low)
-                             or re.search(r'\b(?=[A-Z0-9]{8,30}\b)[A-Z0-9]*\d[A-Z0-9]*\b', contenido or "")))
-
-        if _file_url:
-            # Una IMAGEN en ordenes puede ser la guía de envío (tracking saliente) o la orden de
-            # compra del cliente — se clasifica con visión. Un PDF/otro se asume orden del cliente.
-            _es_img = (_file_mime or "").startswith("image/") or re.search(r'\.(png|jpe?g|webp|gif|heic)$', (_file_name or "").lower())
-            if _es_img:
-                try:
-                    import sales_shipping
-                    _imgs = _bajar_imagenes(_file_url, _file_name, _file_mime)
-                    _ev = sales_shipping.leer_evidencia_envio(_imgs)
-                except Exception as e:
-                    log.warning(f"No se pudo clasificar la imagen de ventas: {e}")
-                    _ev = {"tipo": "orden_compra"}
-                if _ev.get("tipo") == "tracking":
-                    _procesar_tracking_envio(stream_id, _ev.get("tracking", "") or (contenido or "").strip())
-                    return
-            # orden de compra del cliente (flujo existente).
-            _procesar_orden_compra(stream_id, _file_url, _file_name or "orden", _file_mime)
-            return
-        # Texto/link pegado: ¿es una ORDEN DE COMPRA? (copy-paste del correo/portal del cliente). Un link
-        # de paquetería (UPS/FedEx/DHL/Estafeta...) o un mensaje corto de tracking NO lo es.
-        _carrier = re.search(r'ups\.com|fedex|dhl|estafeta|paquetexpress|tracking|rastreo|17track|correos', _low)
-        _kw_po = len(re.findall(r'orden de compra|purchase order|\bpo\b|cantidad|quantity|qty|precio|price|item|part\s*(no|number)|descripci', _low))
-        _lineas = len([l for l in (contenido or "").splitlines() if l.strip()])
-        if not _file_url and not _es_shipped and not _es_estado and not _carrier:
-            _url_po = next((u for u in _urls), "")
-            if _url_po and len(_urls) == 1 and len((contenido or "").replace(_url_po, "").strip()) < 80:
-                _procesar_orden_compra_texto(stream_id, url=_url_po.rstrip(").,"))
-                return
-            if len(contenido or "") >= 120 and (_kw_po >= 2 or _lineas >= 4):
-                _procesar_orden_compra_texto(stream_id, texto=contenido or "")
-                return
-        if _es_alegra:
-            _alegra_elegir(stream_id, contenido or "")
-            return
-        if _es_shipped:
-            _cotejo_marcar_shipped(stream_id)
-            return
-        if _es_factura:
-            _procesar_cierre_venta(stream_id)
-            return
-        if _es_estado:
-            _procesar_estado_operativo(stream_id)
-            return
-        if _es_tracking:
-            _procesar_tracking_envio(stream_id, (contenido or "").strip())
-            return
-        # Si no matchea nada operativo, cae al chat normal (LLM) — no return.
-
-    # PIPELINE DE COMPRAS: stream tipo 'compras'. Router determinista (sin LLM) que despacha a la
-    # tarea correspondiente según la evidencia que llegue — el usuario no necesita saber a qué
-    # "sub-chat" pertenece. Etapa 1 (match SO + crear PO/AP) primero; luego confirmaciones de las
-    # etapas 2-4 (pagos, recepción, cierre de venta) por metadata explícita del botón que apretó.
-    if _tipo_stream == "compras":
-        _file_url  = _md0.get("file_url", "")
-        _file_name = _md0.get("file_name", "")
-        _file_mime = _md0.get("file_mime", "")
-
-        # Confirmaciones (botón ya apretado en un widget de previo) — van primero.
-        if _md0.get("po_action") == "crear":
-            _crear_po_confirmado(stream_id, _md0.get("grupos") or [])
-            return
-        if _md0.get("po_action") == "deshacer":
-            _deshacer_po(stream_id, _md0.get("po_id", ""), _md0.get("bill_id", ""))
-            return
-        if _md0.get("pago_action") == "confirmar":
-            _confirmar_pago(stream_id, _md0.get("tipo", "bill"), _md0.get("registro_id", ""),
-                            _md0.get("monto", 0), _md0.get("datos_comprobante") or {})
-            return
-        if _md0.get("pago_action") == "deshacer":
-            _deshacer_pago(stream_id, _md0.get("payment_id", ""))
-            return
-        if _md0.get("pago_action") == "iniciar_registro":
-            _iniciar_registro_desde_pago(stream_id, _md0.get("direccion", "outgoing"),
-                                         _md0.get("monto", 0), _md0.get("datos_comprobante") or {})
-            return
-        # Receiving v2 — sub-proceso anidado con ciclo de vida (secuencia flexible):
-        # activar (order confirmation/packing list) -> tracking (en tránsito) -> iniciar_recepcion
-        # (foto del paquete -> checklist) -> confirmar_recepcion (suma stock, cierra si completo).
-        if _md0.get("receiving_action") == "activar":
-            _activar_receiving(stream_id, _md0.get("po_id", ""), _md0.get("candidato") or {},
-                               _md0.get("doc") or None, _md0.get("tracking", ""))
-            return
-        if _md0.get("receiving_action") == "tracking":
-            _marcar_en_transito(stream_id, _md0.get("po_id", ""), _md0.get("tracking", ""))
-            return
-        if _md0.get("receiving_action") == "iniciar_recepcion":
-            _iniciar_recepcion(stream_id, _md0.get("po_id", ""), _md0.get("guia", ""))
-            return
-        if _md0.get("receiving_action") == "confirmar_recepcion":
-            _confirmar_recepcion_checklist(stream_id, _md0.get("po_id", ""),
-                                           _md0.get("cantidades") or {}, _md0.get("estado_anterior", ""))
-            return
-        if _md0.get("receiving_action") == "deshacer":
-            _deshacer_receiving(stream_id, _md0.get("po_id", ""), _md0.get("cantidades") or {},
-                                _md0.get("estado_anterior", ""))
-            return
-        if _md0.get("cancelar_accion"):
-            supabase.table("mensajes").insert({
-                "stream_id": stream_id, "role": "assistant",
-                "content": "Entendido, no hice nada con eso. Mándame el link/foto/dato correcto cuando quieras.",
-                "procesado": True, "metadata": {},
-            }).execute()
-            return
-
-        # Clasificación de evidencia nueva (sin botón todavía). El cierre/facturación se movió al
-        # stream 'ordenes' (Sales order) — aquí solo compra, pago y recepción.
-        _urls = re.findall(r'https?://\S+', contenido or "")
-        _low = (contenido or "").lower()
-        _es_estado = (not _file_url and not _urls and
-                     bool(re.search(r'c[oó]mo va|estado (de la venta|operativo)|estatus de la venta|rollup|resumen de (la )?venta', _low)))
-        _es_tracking_texto = (not _file_url and not _urls and not _es_estado and
-                              bool(re.search(r'tracking|gu[ií]a|rastreo|n[uú]mero de env[ií]o', _low) or
-                                   re.search(r'\b[A-Z0-9]{8,30}\b', contenido or "")))
-
-        if _urls:
-            _procesar_link_proveedor(stream_id, _urls)
-        elif _file_url and _procesar_captura_compra(stream_id, _file_url, _file_name, _file_mime):
-            pass  # captura de compra en línea → ya emitió el cotejo contra Sales Orders
-        elif _file_url and re.search(r'paquete|lleg|recib|contenido|packing|confirmation|confirmaci[oó]n|order\s*conf|gu[ií]a|tracking|env[ií]o|recepci[oó]n|receiving', _low + " " + (_file_name or "").lower()):
-            _procesar_evidencia_receiving(stream_id, contenido, _file_url, _file_name, _file_mime)
-        elif _file_url:
-            # Default para un archivo sin más contexto: comprobante de pago (el caso más común
-            # del transcript — "pagué algo, saco una foto").
-            _procesar_comprobante_pago(stream_id, _file_url, _file_name, _file_mime)
-        elif _es_estado:
-            _procesar_estado_operativo(stream_id)
-        elif _es_tracking_texto:
-            _procesar_evidencia_receiving(stream_id, contenido)
-        else:
-            supabase.table("mensajes").insert({
-                "stream_id": stream_id, "role": "assistant",
-                "content": "Mándame el link del producto que vas a comprar, una foto/PDF del "
-                           "comprobante de pago, o el tracking/packing list de una recepción — "
-                           "y sigo desde ahí.",
-                "procesado": True, "metadata": {},
-            }).execute()
-        return
-
-    # PIPELINE DE PAGOS: stream tipo 'pagos'. Mismo backend que la Etapa 2 dentro de 'compras'
-    # (pagos.py) — aquí NO hace falta clasificar tipo de evidencia primero: cualquier archivo
-    # subido en este stream se asume comprobante de pago directo.
-    if _tipo_stream == "pagos":
-        _file_url  = _md0.get("file_url", "")
-        _file_name = _md0.get("file_name", "")
-        _file_mime = _md0.get("file_mime", "")
-
-        if _md0.get("pago_action") == "confirmar":
-            _confirmar_pago(stream_id, _md0.get("tipo", "bill"), _md0.get("registro_id", ""),
-                            _md0.get("monto", 0), _md0.get("datos_comprobante") or {})
-            return
-        if _md0.get("pago_action") == "deshacer":
-            _deshacer_pago(stream_id, _md0.get("payment_id", ""))
-            return
-        if _md0.get("pago_action") == "iniciar_registro":
-            _iniciar_registro_desde_pago(stream_id, _md0.get("direccion", "outgoing"),
-                                         _md0.get("monto", 0), _md0.get("datos_comprobante") or {})
-            return
-        if _md0.get("cancelar_accion"):
-            supabase.table("mensajes").insert({
-                "stream_id": stream_id, "role": "assistant",
-                "content": "Entendido, no hice nada con eso. Mándame el comprobante correcto cuando quieras.",
-                "procesado": True, "metadata": {},
-            }).execute()
-            return
-
-        if _file_url:
-            _procesar_comprobante_pago(stream_id, _file_url, _file_name, _file_mime)
-        else:
-            supabase.table("mensajes").insert({
-                "stream_id": stream_id, "role": "assistant",
-                "content": "Mándame una foto, captura o PDF del comprobante de pago (a proveedor "
-                           "o de un cliente) y lo cotejo contra lo que tengas abierto en 1CRM.",
-                "procesado": True, "metadata": {},
-            }).execute()
+    _manejador = _MANEJADORES.get(_contrato.manejador)
+    if _manejador is not None and _manejador(msg, stream_id, contenido, _md0):
         return
 
     # Los triggers [SISTEMA:...] los maneja el widget del frontend — no necesitan respuesta de Claude

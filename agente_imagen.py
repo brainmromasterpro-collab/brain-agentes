@@ -25,6 +25,7 @@ Variables de entorno:
   REMOVEBG_API_KEY=      # https://www.remove.bg/dashboard#api-key
 """
 
+import stream_contracts
 import os
 import io
 import time
@@ -551,7 +552,7 @@ def procesar_job_imagen(job: dict) -> None:
                 "foto_url": foto_url,
                 "estado":   "foto_lista",
             }).eq("id", rfq_uuid).execute()
-            supabase.table("mensajes").insert({
+            stream_contracts.insertar_trigger(supabase, stream_id, "imagen_lista", {
                 "stream_id": stream_id,
                 "role":      "user",
                 "content":   (
@@ -563,7 +564,7 @@ def procesar_job_imagen(job: dict) -> None:
                 # Publicar (esa es la aprobación). (ahorro de costo)
                 "procesado": True,
                 "metadata":  {"trigger": "imagen_lista", "rfq_id": rfq_uuid, "foto_url": foto_url},
-            }).execute()
+            }, log)
             log.info(f"HITL: imagen lista — esperando aprobación del usuario en stream {str(stream_id)[:8]}")
         else:
             # Automático: publicar de inmediato
@@ -622,7 +623,7 @@ def procesar_job_imagen(job: dict) -> None:
                 # HITL: hay un usuario en el stream → NO auto-publicar. Marcar imagen fallida y avisar;
                 # el usuario decide en el widget (Reintentar / Publicar sin imagen / omitir).
                 supabase.table("rfqs").update({"estado": "imagen_fallida"}).eq("id", rfq_uuid).execute()
-                supabase.table("mensajes").insert({
+                stream_contracts.insertar_trigger(supabase, stream_id_fb, "imagen_no_encontrada", {
                     "stream_id": stream_id_fb,
                     "role":      "user",
                     "content":   (
@@ -634,7 +635,7 @@ def procesar_job_imagen(job: dict) -> None:
                     # botones Reintentar / Publicar sin imagen. (ahorro de costo)
                     "procesado": True,
                     "metadata":  {"trigger": "imagen_no_encontrada", "rfq_id": rfq_uuid},
-                }).execute()
+                }, log)
                 log.info(f"HITL: imagen no encontrada rfq {rfq_uuid} — esperando decisión del usuario (NO auto-publica)")
             else:
                 # Modo automático (sin stream): sí publica sin imagen.

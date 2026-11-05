@@ -107,6 +107,74 @@ check("el stream_id del modelo se sobrescribe con el real", len(_ok) == 1 and _o
 check("_tools_para_tipo(None) y desconocido → vacío", ac._tools_para_tipo(None) == [] and ac._tools_para_tipo("zzz") == [])
 check("generico (legado) conserva todo", len(ac._tools_para_tipo("generico")) == len(ac.TOOLS))
 
+print("Contratos y despachador: cada stream tiene contrato y lo atiende SU manejador")
+import stream_contracts as sc
+check("los 4 manejadores deterministas existen", all(c.manejador == "llm" or c.manejador in ac._MANEJADORES for c in sc.CONTRATOS.values()))
+check("TOOLS_POR_TIPO sale de los contratos", ac.TOOLS_POR_TIPO == sc.tools_por_tipo())
+check("TIPO_MODOS sale de los contratos", ac.TIPO_MODOS == sc.modos_por_tipo())
+check("solo los streams llm tienen modos de prompt", all((c.manejador == "llm") or not c.modos_prompt for c in sc.CONTRATOS.values()))
+check("triggers: solo busquedas/catalogo reciben busqueda_completa",
+      {t for t in sc.CONTRATOS if sc.trigger_permitido(t, "busqueda_completa")} == {"busquedas", "catalogo"})
+try:
+    _reales = ac.supabase.table("streams").select("id,tipo,nombre").execute().data or []
+    _sin = [f'{r["nombre"]}:{r["tipo"]}' for r in _reales if r.get("tipo") not in sc.CONTRATOS and r.get("tipo") not in sc.TIPOS_SIN_RESTRICCION]
+    check("todo stream real de la BD tiene contrato", not _sin, str(_sin))
+except Exception as _e:
+    print(f"  (omitido, sin BD: {_e})")
+
+class _Res:  # respuesta falsa de Supabase
+    def __init__(self, data): self.data = data
+class _Q:
+    def __init__(self, bd, tabla): self.bd, self.tabla, self.op, self.payload = bd, tabla, "select", None
+    def select(self, *a, **k): self.op = "select"; return self
+    def insert(self, p): self.op, self.payload = "insert", p; return self
+    def update(self, p): self.op, self.payload = "update", p; return self
+    def __getattr__(self, n): return lambda *a, **k: self
+    def execute(self):
+        if self.op == "insert": self.bd.insertados.append((self.tabla, self.payload)); return _Res([self.payload])
+        if self.op == "update": return _Res([])
+        if self.tabla == "streams": return _Res({"tipo": self.bd.tipo})
+        return _Res([])
+class _BD:
+    def __init__(self, tipo): self.tipo, self.insertados = tipo, []
+    def table(self, t): return _Q(self, t)
+
+def _despachar(tipo, msg_extra):
+    bd = _BD(tipo)
+    orig_sb, orig_run = ac.supabase, ac.run_chat
+    llamadas = []
+    ac.supabase = bd
+    ac.run_chat = lambda *a, **k: (llamadas.append(k.get("tipo_stream")) or ("ok", [], False, {"tokens_input": 0, "tokens_output": 0}, {}))
+    try:
+        ac.procesar_mensaje({"id": "m1" * 4, "stream_id": "S1", "content": "hola", "metadata": {}, **msg_extra})
+    finally:
+        ac.supabase, ac.run_chat = orig_sb, orig_run
+    return llamadas, bd.insertados
+
+_ll, _ins = _despachar("compras", {"metadata": {"cancelar_accion": True}})
+check("compras: lo atiende su router, el modelo NO se usa", _ll == [] and len(_ins) >= 1)
+_ll, _ins = _despachar("pagos", {"content": "hola"})
+check("pagos: lo atiende su router, el modelo NO se usa", _ll == [])
+_ll, _ins = _despachar("ordenes", {"metadata": {"cancelar_accion": True}})
+check("ordenes: botón cancelar lo atiende su router", _ll == [])
+_ll, _ins = _despachar("rfq", {"content": "necesito 2 pzas del modelo X"})
+check("Oportunidad (rfq) → modelo con tipo rfq", _ll == ["rfq"], str(_ll))
+_ll, _ins = _despachar("correo", {})
+check("correo → modelo con tipo correo", _ll == ["correo"], str(_ll))
+_ll, _ins = _despachar("tipo_inventado", {})
+check("tipo sin contrato → no se ejecuta nada", _ll == [])
+
+print("Triggers de otros agentes: solo se escriben en streams cuyo contrato los permite")
+import logging as _lg
+def _trig(tipo):
+    bd = _BD(tipo)
+    ok = sc.insertar_trigger(bd, "S1", "busqueda_completa", {"stream_id": "S1", "content": "[SISTEMA:busqueda_completa]"}, _lg.getLogger("t"))
+    return ok, bd.insertados
+check("busquedas recibe busqueda_completa", _trig("busquedas")[0] is True and len(_trig("busquedas")[1]) == 1)
+for _t in ("rfq", "correo", "publicacion", "pagos", "compras", "ordenes", "tipo_inventado"):
+    _ok, _ins = _trig(_t)
+    check(f"{_t} NO recibe busqueda_completa", _ok is False and _ins == [])
+
 if _fallos:
     print(f"\n❌ {len(_fallos)} fallo(s): {_fallos}")
     raise SystemExit(1)

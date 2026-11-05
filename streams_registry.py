@@ -33,21 +33,9 @@ PROCESO_DE_HERRAMIENTA = {
         "publicar_productos_desde_links")},
 }
 
-_BASE = {"consulta"}
-PROCESOS_PERMITIDOS = {
-    "rfq":          _BASE | {"oportunidades"},                                   # Oportunidad: NUNCA catálogo
-    "correo":       _BASE | {"oportunidades", "correo"},
-    "whatsapp":     _BASE | {"oportunidades", "correo"},
-    "mensajeria":   _BASE | {"oportunidades", "correo"},
-    "busquedas":    _BASE | {"proveedores", "pipeline_rfq"},
-    "publicacion":  _BASE | {"publicar_producto"},
-    "catalogo":     _BASE | {"proveedores", "pipeline_rfq", "publicar_producto"},
-    "cotizacion":   _BASE | {"oportunidades", "correo"},
-    "cotizaciones": _BASE | {"oportunidades", "correo"},
-    "ordenes":      _BASE | {"proveedores"},
-    "compras":      _BASE | {"proveedores"},
-    "pagos":        _BASE | {"proveedores"},
-}
+# Procesos permitidos por tipo: salen del CONTRATO del stream (stream_contracts.CONTRATOS), única fuente de verdad.
+import stream_contracts
+PROCESOS_PERMITIDOS = stream_contracts.procesos_permitidos()
 
 # Mezclas que HOY existen a propósito o están pendientes de decidir. Aparecen como advertencia en cada
 # verificación hasta que se resuelvan; no se pueden agregar nuevas sin escribirlas aquí con su motivo.

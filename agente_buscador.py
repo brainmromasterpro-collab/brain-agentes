@@ -20,6 +20,7 @@ Variables de entorno (.env):
   FX_API_KEY=        # opcional — fixer.io o similar
 """
 
+import stream_contracts
 import os
 import re
 import time
@@ -1301,7 +1302,7 @@ def procesar_job(job: dict) -> None:
         if stream_id:
             marca_disp = rfq.get("marca", "").strip() or "?"
             modelo_disp = rfq.get("modelo", "").strip()
-            supabase.table("mensajes").insert({
+            stream_contracts.insertar_trigger(supabase, stream_id, "busqueda_completa", {
                 "stream_id": stream_id,
                 "role":      "user",
                 "content":   (
@@ -1312,7 +1313,7 @@ def procesar_job(job: dict) -> None:
                 # las opciones. Solo queda como registro. (ahorro de costo)
                 "procesado": True,
                 "metadata":  {"trigger": "busqueda_completa", "rfq_id": rfq_uuid},
-            }).execute()
+            }, log)
             log.info(f"Trigger de busqueda_completa enviado al stream {str(stream_id)[:8]}")
 
         # Cerrar job exitosamente
