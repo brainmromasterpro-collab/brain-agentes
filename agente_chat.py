@@ -3283,9 +3283,9 @@ _T_OPS     = {"buscar_productos_crm", "ver_producto_crm", "listar_productos_crm"
               "consultar_metricas"}
 
 TOOLS_POR_TIPO: dict[str, set[str]] = {
-    "correo":       _T_VENTAS | _T_RFQ,
-    "whatsapp":     _T_VENTAS | _T_RFQ,
-    "mensajeria":   _T_VENTAS | _T_RFQ,
+    "correo":       _T_VENTAS,
+    "whatsapp":     _T_VENTAS,
+    "mensajeria":   _T_VENTAS,
     "rfq":          _T_OPORT,
     "busquedas":    _T_RFQ,
     "publicacion":  _T_CATALOG,
@@ -3896,17 +3896,17 @@ _PROMPT_INTRO, _PROMPT_MODOS = _partir_prompt(SYSTEM_PROMPT)
 # Qué modos carga cada tipo (además del intro y MODO 7 = reglas base, que van siempre).
 # "generico" / "compras" / "general" / desconocido / None → prompt COMPLETO (todos los modos).
 TIPO_MODOS = {
-    "correo":       [9, 10, 11, 12],              # correo: RFQ, oportunidades, alta cliente
+    "correo":       [10, 11, 12],                 # correo: oportunidades del correo + alta cliente (NUNCA catálogo)
     "rfq":          [15, 12],                      # RFQ manual: usuario sube texto/screenshot, sin correo
-    "whatsapp":     [9, 10, 11, 12],              # WhatsApp: mismos modos que correo, otro canal
-    "busquedas":    [1, 2, 3, 4, 5, 6, 8, 14],     # búsqueda RFQ + selección proveedor + imagen + ficha técnica PDF
+    "whatsapp":     [10, 11, 12],                 # WhatsApp: mismos modos que correo, otro canal
+    "busquedas":    [1, 2, 3, 4, 5, 6, 8],         # búsqueda RFQ + selección proveedor + imagen (publicar ficha = stream Productos)
     "publicacion":  [13, 14],                      # publicar producto(s) desde link o ficha técnica PDF
     "cotizacion":   [],                            # (módulo de cotización se agrega después)
     "ordenes":      [],
     "compras":      [],                            # compras a proveedor: pipeline 100% determinista
     "pagos":        [],                            # pagos (Bill+Invoice): pipeline 100% determinista
     # aliases de compatibilidad
-    "mensajeria":   [9, 10, 11, 12],
+    "mensajeria":   [10, 11, 12],
     "catalogo":     [1, 2, 3, 4, 5, 6, 8, 13, 14],
     "cotizaciones": [],
 }

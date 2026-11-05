@@ -56,8 +56,7 @@ for a in _avi:
     print(f"  ⚠ {a}")
 
 print("El prompt de cada stream no pide herramientas que ese stream no tiene")
-_PEND = {"busquedas": "MODO 14 (ficha técnica/publicación) pertenece al stream Productos",
-         "publicacion": "MODO 13 menciona verificar_lista_productos (pipeline de búsqueda)"}
+_PEND = {"publicacion": "MODO 13 menciona verificar_lista_productos (pipeline de búsqueda)"}
 for tipo, modos in ac.TIPO_MODOS.items():
     if not modos or tipo not in ac.TOOLS_POR_TIPO:
         continue

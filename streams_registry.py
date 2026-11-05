@@ -36,9 +36,9 @@ PROCESO_DE_HERRAMIENTA = {
 _BASE = {"consulta"}
 PROCESOS_PERMITIDOS = {
     "rfq":          _BASE | {"oportunidades"},                                   # Oportunidad: NUNCA catálogo
-    "correo":       _BASE | {"proveedores", "oportunidades", "correo", "pipeline_rfq"},
-    "whatsapp":     _BASE | {"proveedores", "oportunidades", "correo", "pipeline_rfq"},
-    "mensajeria":   _BASE | {"proveedores", "oportunidades", "correo", "pipeline_rfq"},
+    "correo":       _BASE | {"oportunidades", "correo"},
+    "whatsapp":     _BASE | {"oportunidades", "correo"},
+    "mensajeria":   _BASE | {"oportunidades", "correo"},
     "busquedas":    _BASE | {"proveedores", "pipeline_rfq"},
     "publicacion":  _BASE | {"publicar_producto"},
     "catalogo":     _BASE | {"proveedores", "pipeline_rfq", "publicar_producto"},
@@ -51,11 +51,7 @@ PROCESOS_PERMITIDOS = {
 
 # Mezclas que HOY existen a propósito o están pendientes de decidir. Aparecen como advertencia en cada
 # verificación hasta que se resuelvan; no se pueden agregar nuevas sin escribirlas aquí con su motivo.
-EXCEPCIONES_CONOCIDAS = {
-    ("correo", "pipeline_rfq"): "MODO 9 (RFQ del correo → RFQ de catálogo) choca con MODO 10/11 (RFQ del correo → oportunidad). DECISIÓN PENDIENTE.",
-    ("whatsapp", "pipeline_rfq"): "igual que correo (mismos modos 9-12).",
-    ("mensajeria", "pipeline_rfq"): "igual que correo (mismos modos 9-12).",
-}
+EXCEPCIONES_CONOCIDAS: dict = {}  # vacío: ya no hay mezclas conocidas
 
 
 def verificar(tools_por_tipo: dict, nombres_tools: set) -> tuple[list[str], list[str]]:
