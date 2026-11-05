@@ -96,11 +96,23 @@ CONTRATOS: dict[str, Contrato] = {c.tipo: c for c in (
              "Orden de compra del cliente → cotejo con cotizaciones → Sales Order, envío, cierre y facturación.",
              "ordenes", _BASE | {"proveedores"}, _T_OPS, ()),
     Contrato("compras", "Purchase Order",
-             "Compra a proveedor: link → PO/AP, pagos, recepción.", "compras",
-             _BASE | {"proveedores"}, _T_OPS, ()),
+             "Compra a proveedor: link → PO/AP, pago de esa compra, recepción.", "compras",
+             _BASE | {"proveedores", "pagos_proveedor"}, _T_OPS, ()),
     Contrato("pagos", "Pagos", "Comprobantes de pago → Bill/Invoice.", "pagos",
-             _BASE | {"proveedores"}, _T_OPS, ()),
+             _BASE | {"proveedores", "pagos_proveedor"}, _T_OPS, ()),
 )}
+
+
+# Procesos que DOS streams comparten a propósito (decisión de Gabriel, 2026-11-05). Cualquier otro proceso compartido
+# entre contratos hace fallar test_tools_por_tipo.py.
+PROCESOS_COMPARTIDOS_DECLARADOS = {
+    "oportunidades": ({"rfq", "correo"},
+                      "Es EL MISMO proceso (cuenta/contacto/oportunidad en el CRM) con dos canales de entrada: captura manual y correo."),
+    "proveedores": ({"busquedas", "ordenes", "compras", "pagos"},
+                    "Solo consulta de proveedores en el CRM (lectura); nunca los confunde con clientes en Oportunidad/Correo."),
+    "pagos_proveedor": ({"compras", "pagos"},
+                        "Compras registra el pago de SU compra (Etapa 2); Pagos registra cualquier comprobante. Mismo backend (pagos.py)."),
+}
 
 
 def contrato_de(tipo):

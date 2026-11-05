@@ -203,6 +203,17 @@ check("Correo: sin pipeline de catálogo en el prompt", "crear_rfqs_desde_texto"
 check("todos los prompts focalizados traen su límite", all("LÍMITE DE ESTE STREAM" in _p(t) for t in ("rfq", "correo", "busquedas", "publicacion", "whatsapp")))
 check("generico (legado) conserva el prompt completo", _p("generico") == ac.SYSTEM_PROMPT)
 
+print("Procesos compartidos entre streams: solo los declarados a propósito")
+_reg = {}
+for _t, _c in sc.CONTRATOS.items():
+    if _t in ("mensajeria", "cotizaciones", "whatsapp", "catalogo", "cotizacion"):
+        continue  # alias/variantes de otro contrato
+    for _p in _c.procesos - {"consulta"}:
+        _reg.setdefault(_p, set()).add(_t)
+_comp = {p: ts for p, ts in _reg.items() if len(ts) > 1}
+_decl = {p: ts for p, (ts, _m) in sc.PROCESOS_COMPARTIDOS_DECLARADOS.items()}
+check("solo se comparten los procesos declarados", _comp == _decl, f"{_comp} vs {_decl}")
+
 if _fallos:
     print(f"\n❌ {len(_fallos)} fallo(s): {_fallos}")
     raise SystemExit(1)
