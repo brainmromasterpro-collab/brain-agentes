@@ -1104,49 +1104,13 @@ def crear_sales_order(draft: dict) -> dict:
 # 5. SUBIR EL PO ORIGINAL A LA SALES ORDER (módulo Documentos)
 # ─────────────────────────────────────────────────────────────
 def subir_po_a_so(so_id: str, file_url: str, po_number: str = "") -> dict:
-    """Crea un Documento en 1CRM con el PDF del PO y lo vincula a la Sales Order.
+    """Guarda el PO original en Documentos de 1CRM, ligado a la Sales Order. SÍNCRONO (~10 s).
 
-    Usa la API REST: descarga el archivo, lo codifica en base64 y hace POST a /data/Document
-    con parent_type=SalesOrders + parent_id=so_id.  Verificado en vivo: la API acepta el file
-    en base64 y guarda la relación directamente.  Sin Playwright.
-
-    Si falla (descarga o API) la SO ya quedó creada — el documento no afecta la SO."""
-    if not file_url or not so_id:
-        return {"ok": False, "error": "falta file_url o so_id"}
-
-    import base64
-    import pathlib
-    from urllib.parse import urlparse
-
-    nombre_doc = (po_number or "").strip() or "Orden de compra"
-
-    try:
-        r = httpx.get(file_url, timeout=30, follow_redirects=True)
-        r.raise_for_status()
-        ext = pathlib.Path(urlparse(file_url).path).suffix or ".pdf"
-        filename = f"{nombre_doc.replace('/', '-').replace(' ', '_')}{ext}"
-        file_b64 = base64.b64encode(r.content).decode("utf-8")
-    except Exception as e:
-        log.warning(f"No se pudo descargar el PO para subirlo a 1CRM: {e}")
-        return {"ok": False, "error": str(e)}
-
-    try:
-        result = _crm_post("Document", {
-            "document_name": nombre_doc,
-            "status_id": "Active",
-            "revision": "1",
-            "change_log": "Orden de compra del cliente",
-            "filename": filename,
-            "file": file_b64,
-            "parent_type": "SalesOrders",
-            "parent_id": so_id,
-        })
-        doc_id = result.get("id")
-        if doc_id:
-            log.info(f"PO guardado en Documentos: id={doc_id} nombre='{nombre_doc}' SO={so_id}")
-            return {"ok": True, "metodo": "api", "doc_id": doc_id}
-        log.warning(f"API Document no devolvió id: {result}")
-        return {"ok": False, "error": f"sin id en respuesta: {result}"}
-    except Exception as e:
-        log.warning(f"No se pudo subir el PO a 1CRM (SO ya quedó creada, esto no la afecta): {e}")
-        return {"ok": False, "error": str(e)}
+    OJO: la versión anterior hacía POST /data/Document con el archivo en base64 y logueaba "guardado ✓", pero la API de
+    1CRM NO guarda los bytes (solo el registro): los Documentos quedaban VACÍOS. Verificado en vivo el 2026-11-10.
+    Ahora delega en crm_documentos, que sube el archivo por la pantalla de Documentos y verifica el resultado.
+    En el chat se usa agente_chat._guardar_doc_crm (cola en segundo plano); esta función queda para uso directo."""
+    import crm_documentos
+    return crm_documentos.guardar_documento(
+        tipo="orden_compra_cliente", file_url=file_url, parent_type="SalesOrders", parent_id=so_id,
+        referencia=(f"PO {po_number}" if po_number else ""))

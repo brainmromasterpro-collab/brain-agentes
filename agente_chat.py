@@ -4210,6 +4210,67 @@ def _build_attachment_blocks(attachments: list) -> list:
 # ─────────────────────────────────────────────────────────────
 # PROCESADOR DE MENSAJES
 # ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# DOCUMENTOS EN 1CRM — todo archivo que llega a un stream se guarda en el módulo Documentos y se liga al registro de
+# la acción (SO, Shipping, PO, Payment). Ver crm_documentos.py (por qué se sube por pantalla y no por la API).
+# ─────────────────────────────────────────────────────────────
+def _guardar_doc_crm(stream_id: str, tipo: str, file_url: str, parent_type: str, parent_id: str,
+                     referencia: str = "", detalle: str = "", nombre_sugerido: str = "") -> None:
+    """Encola el guardado del archivo en Documentos de 1CRM (no frena el chat) y avisa el resultado en el stream.
+    Best-effort: la acción de negocio ya quedó hecha; si esto falla solo se avisa."""
+    if not file_url or not parent_id:
+        return
+    try:
+        import crm_documentos
+    except Exception as e:
+        log.warning(f"crm_documentos no disponible: {e}")
+        return
+    etiqueta = crm_documentos.TIPOS.get(tipo, (tipo, ""))[0]
+    donde = crm_documentos.PARENT_LABEL.get(parent_type, parent_type)
+
+    def _fin(res: dict) -> None:
+        if res.get("ok"):
+            _log_stream(stream_id, f"📎 {etiqueta} guardado en Documentos de 1CRM ✓", "ok")
+            if res.get("duplicado"):
+                return  # ya estaba guardado (reintento): sin ruido en el chat
+            txt = f"📎 Guardé «{res.get('nombre','')}» en Documentos de 1CRM, ligado a {donde}" + \
+                  (f" {referencia}" if referencia else "") + f".\n{res.get('url','')}"
+        else:
+            _log_stream(stream_id, f"No se pudo guardar {etiqueta.lower()} en Documentos de 1CRM: {res.get('error','')}", "warn")
+            txt = (f"⚠️ No pude guardar {etiqueta.lower()} en Documentos de 1CRM ({res.get('error','error desconocido')}). "
+                   f"La acción ya quedó registrada; el archivo sigue disponible en este chat.")
+        try:
+            supabase.table("mensajes").insert({
+                "stream_id": stream_id, "role": "assistant", "content": txt,
+                "procesado": True, "metadata": {"doc_crm": True, "doc_ok": bool(res.get("ok"))},
+            }).execute()
+        except Exception as e:
+            log.warning(f"no se pudo avisar el guardado del documento: {e}")
+
+    if not crm_documentos.encolar(on_done=_fin, tipo=tipo, file_url=file_url, parent_type=parent_type,
+                                  parent_id=parent_id, referencia=referencia, detalle=detalle,
+                                  nombre_archivo_sugerido=nombre_sugerido):
+        log.info("Documentos de 1CRM deshabilitado: no se guardó el archivo")
+
+
+def _archivo_reciente(stream_id: str, marcador: str, extractor, horas: int = 12) -> str:
+    """URL del archivo que originó el widget MÁS RECIENTE con ese marcador en el stream (los widgets guardan su
+    `archivo_url`). Solo mira el último widget: si ese no trae archivo, no hay archivo que guardar."""
+    try:
+        r = (supabase.table("mensajes").select("content,created_at").eq("stream_id", stream_id)
+             .eq("role", "assistant").like("content", f"{marcador}%").order("created_at", desc=True).limit(1)
+             .execute().data or [])
+        if not r:
+            return ""
+        c = datetime.fromisoformat(r[0]["created_at"].replace("Z", "+00:00"))
+        if (datetime.now(timezone.utc) - c).total_seconds() > horas * 3600:
+            return ""
+        return extractor(json.loads(r[0]["content"][len(marcador):])) or ""
+    except Exception as e:
+        log.warning(f"_archivo_reciente({marcador}): {e}")
+        return ""
+
+
 def _procesar_orden_compra(stream_id: str, file_url: str, nombre: str = "orden", mime: str = "") -> None:
     """PIPELINE DE ORDEN DE COMPRA (Fase 1, stream 'ordenes'): lee el PO, lo coteja contra las
     cotizaciones del cliente y emite el widget [COTEJO_PO]. NO escribe al CRM. Determinista
@@ -4346,18 +4407,15 @@ def _crear_so_confirmada(stream_id: str, draft: dict) -> None:
         contexto={"so_id": res.get("so_id"), "po_number": _d.get("po_number","")},
     )
 
-    # Subir el PO original a la sección de Documentos/Notas de la SO — best-effort: si falla, la SO
-    # ya quedó creada y esto NO la afecta, solo se loguea (ver sales_order.subir_po_a_so).
+    # Guardar el PO original en Documentos de 1CRM, ligado a la SO (cola en segundo plano; si falla, la SO ya quedó
+    # creada y solo se avisa). Ver crm_documentos.py.
     _file_url = (draft or {}).get("file_url", "")
     if _file_url and res.get("so_id"):
-        try:
-            up = sales_order.subir_po_a_so(res["so_id"], _file_url, (draft or {}).get("po_number", ""))
-            if up.get("ok"):
-                _log_stream(stream_id, "PO original guardado en la SO (Documentos) ✓", "ok")
-            else:
-                _log_stream(stream_id, f"No se pudo guardar el PO en la SO: {up.get('error','')}", "warn")
-        except Exception as e:
-            log.warning(f"subir_po_a_so falló: {e}")
+        _po_num = (draft or {}).get("po_number", "")
+        _cli = _d.get("cliente_nombre", "") or _d.get("billing_account", "")
+        _guardar_doc_crm(stream_id, "orden_compra_cliente", _file_url, "SalesOrders", res["so_id"],
+                         referencia=" · ".join(x for x in (f"PO {_po_num}" if _po_num else "", res.get("so_numero", "")) if x),
+                         detalle=(f"Cliente: {_cli}." if _cli else ""))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -4464,7 +4522,7 @@ def _procesar_captura_compra(stream_id: str, file_url: str, nombre: str = "", mi
         "content": "[COTEJO_PROVEEDOR]" + json.dumps({
             "links": links, "cotejo": cotejo,
             "captura": {"tienda": datos.get("tienda", ""), "orden_numero": datos.get("orden_numero", ""),
-                        "total": datos.get("total"), "moneda": datos.get("moneda", "")},
+                        "total": datos.get("total"), "moneda": datos.get("moneda", ""), "archivo_url": file_url},
         }, ensure_ascii=False),
         "procesado": True, "metadata": {"cotejo_proveedor": True},
     }).execute()
@@ -4494,6 +4552,10 @@ def _crear_po_confirmado(stream_id: str, grupos: list) -> None:
         resultados.append(res)
         if res.get("ok"):
             _log_stream(stream_id, "Purchase Order + cuenta por pagar creados ✓", "ok")
+            _cap = _archivo_reciente(stream_id, "[COTEJO_PROVEEDOR]", lambda p: (p.get("captura") or {}).get("archivo_url"))
+            if _cap and res.get("po_id"):
+                _guardar_doc_crm(stream_id, "captura_compra", _cap, "PurchaseOrders", res["po_id"],
+                                 referencia=" · ".join(x for x in (res.get("po_numero", "") or res.get("nombre", ""), draft.get("proveedor_nombre", "")) if x))
             _joy_evento(
                 stream_id, "po_creada",
                 f"Purchase Order creada"
@@ -4592,6 +4654,8 @@ def _procesar_comprobante_pago(stream_id: str, file_url: str, nombre: str = "", 
             "procesado": True, "metadata": {},
         }).execute()
         return
+    comprobante["archivo_url"] = file_url      # viaja con el comprobante hasta que se confirme el pago
+    comprobante["archivo_nombre"] = nombre
     cuentas = pagos.cuentas_abiertas(_pagado_previo_map())
     cotejo = pagos.buscar_candidata(comprobante, cuentas)
     supabase.table("mensajes").insert({
@@ -4614,6 +4678,11 @@ def _confirmar_pago(stream_id: str, tipo: str, registro_id: str, monto: float, d
     }).execute()
     _log_stream(stream_id, "Pago registrado ✓" if res.get("ok") else f"No se pudo registrar: {res.get('error','')}",
                 "ok" if res.get("ok") else "error")
+    if res.get("ok") and (datos_comprobante or {}).get("archivo_url") and res.get("payment_id"):
+        _guardar_doc_crm(stream_id, "comprobante_pago", datos_comprobante["archivo_url"], "Payments", res["payment_id"],
+                         referencia=" · ".join(x for x in (f"${monto:,.2f}", str(datos_comprobante.get("referencia", "") or "")) if x),
+                         detalle=f"Pago {'a proveedor' if tipo == 'bill' else 'de cliente'}.",
+                         nombre_sugerido=datos_comprobante.get("archivo_nombre", ""))
     if res.get("ok"):
         _joy_evento(
             stream_id, "pago_registrado",
@@ -4752,6 +4821,9 @@ def _procesar_evidencia_receiving(stream_id: str, texto: str, file_url: str = ""
         except Exception as e:
             doc = {"tipo": "otro", "error": str(e), "items": [], "tracking": ""}
 
+    if file_url and isinstance(doc, dict):
+        doc["archivo_url"] = file_url          # el widget lo devuelve en metadata.doc → se guarda al ligar al PO
+        doc["archivo_nombre"] = nombre
     tipo = (doc or {}).get("tipo", "")
     tracking_txt = (doc or {}).get("tracking", "") or (texto.strip() if texto and not file_url else "")
 
@@ -4759,7 +4831,7 @@ def _procesar_evidencia_receiving(stream_id: str, texto: str, file_url: str = ""
         _cotejo_recepcion(stream_id, doc, tracking_txt)
         return
     if tipo == "tracking" or (not file_url and tracking_txt):
-        _cotejo_tracking(stream_id, tracking_txt)
+        _cotejo_tracking(stream_id, tracking_txt, file_url)
         return
     # order_confirmation / packing_list / imagen ambigua -> activar el receiving
     _cotejo_activar(stream_id, doc, tracking_txt, pos)
@@ -4783,12 +4855,12 @@ def _cotejo_activar(stream_id: str, doc: dict | None, tracking: str, pos: list) 
     _log_stream(stream_id, f"{len(candidatos)} PO candidato(s) para activar el receiving", "ok")
 
 
-def _cotejo_tracking(stream_id: str, tracking: str) -> None:
+def _cotejo_tracking(stream_id: str, tracking: str, file_url: str = "") -> None:
     """Llegó un tracking. Si hay UN solo receiving activo, lo marca en tránsito directo; si hay
     varios (o ninguno activado aún), muestra el cotejo para elegir a cuál corresponde."""
     activos = _receivings_activos(stream_id)
     if len(activos) == 1:
-        _marcar_en_transito(stream_id, activos[0]["po_id"], tracking)
+        _marcar_en_transito(stream_id, activos[0]["po_id"], tracking, file_url)
         return
     if not activos:
         # No hay receiving activado todavía — se elige el PO directamente (crea el estado al vuelo).
@@ -4797,7 +4869,7 @@ def _cotejo_tracking(stream_id: str, tracking: str) -> None:
         supabase.table("mensajes").insert({
             "stream_id": stream_id, "role": "assistant",
             "content": "[RECEIVING_COTEJO]" + json.dumps({
-                "modo": "tracking", "tracking": tracking, "candidatos": pos,
+                "modo": "tracking", "tracking": tracking, "candidatos": pos, "archivo_url": file_url,
                 "sin_match": len(pos) > 1,
             }, ensure_ascii=False),
             "procesado": True, "metadata": {"receiving_cotejo": True},
@@ -4806,7 +4878,7 @@ def _cotejo_tracking(stream_id: str, tracking: str) -> None:
     supabase.table("mensajes").insert({
         "stream_id": stream_id, "role": "assistant",
         "content": "[RECEIVING_COTEJO]" + json.dumps({
-            "modo": "tracking", "tracking": tracking,
+            "modo": "tracking", "tracking": tracking, "archivo_url": file_url,
             "candidatos": [{"id": a["po_id"], "nombre": a.get("po_nombre", ""), "proveedor": a.get("proveedor", ""),
                             "so_nombre": a.get("so_nombre", ""), "so_cliente": a.get("so_cliente", ""),
                             "lineas": a.get("lineas_po", [])} for a in activos],
@@ -4872,9 +4944,14 @@ def _activar_receiving(stream_id: str, po_id: str, candidato: dict, doc: dict | 
         "procesado": True, "metadata": {"receiving_estado": True},
     }).execute()
     _log_stream(stream_id, f"Receiving activado ({estatus}) para {estado['po_nombre']}", "ok")
+    if d.get("archivo_url"):
+        _guardar_doc_crm(stream_id, "packing_list", d["archivo_url"], "PurchaseOrders", po_id,
+                         referencia=" · ".join(x for x in (estado.get("po_nombre", ""), estado.get("proveedor", "")) if x),
+                         detalle=("Order confirmation" if d.get("tipo") == "order_confirmation" else "Packing list") + ".",
+                         nombre_sugerido=d.get("archivo_nombre", ""))
 
 
-def _marcar_en_transito(stream_id: str, po_id: str, tracking: str) -> None:
+def _marcar_en_transito(stream_id: str, po_id: str, tracking: str, file_url: str = "") -> None:
     """Registra el tracking y mueve el receiving a 'en tránsito' — reemitiendo el [RECEIVING_ESTADO]
     con los datos que ya tenía (packing list de referencia incluido)."""
     activos = {a["po_id"]: a for a in _receivings_activos(stream_id)}
@@ -4904,6 +4981,10 @@ def _marcar_en_transito(stream_id: str, po_id: str, tracking: str) -> None:
         "procesado": True, "metadata": {"receiving_estado": True},
     }).execute()
     _log_stream(stream_id, f"Tracking registrado — {estado.get('po_nombre','')} en tránsito", "ok")
+    _etq = file_url or _archivo_reciente(stream_id, "[RECEIVING_COTEJO]", lambda p: p.get("archivo_url"))
+    if _etq:
+        _guardar_doc_crm(stream_id, "guia_envio", _etq, "PurchaseOrders", po_id,
+                         referencia=" · ".join(x for x in (f"Guía {tracking}" if tracking else "", estado.get("po_nombre", "")) if x))
 
 
 def _iniciar_recepcion(stream_id: str, po_id: str, guia: str = "") -> None:
@@ -4939,6 +5020,10 @@ def _iniciar_recepcion(stream_id: str, po_id: str, guia: str = "") -> None:
         linea["cantidad_sugerida"] = sug
         linea["recibido"] = sug > 0  # precheck si se espera recibir algo
 
+    _foto = _archivo_reciente(stream_id, "[RECEIVING_COTEJO]", lambda p: (p.get("doc") or {}).get("archivo_url"))
+    if _foto:
+        _guardar_doc_crm(stream_id, "evidencia_recepcion", _foto, "PurchaseOrders", po_id,
+                         referencia=" · ".join(x for x in (po_rec.get("name", ""), f"Guía {guia}" if guia else "") if x))
     payload = {"po_id": po_id, "guia": guia, "lineas": esperadas, "estado_anterior": estado_anterior}
     supabase.table("mensajes").insert({
         "stream_id": stream_id, "role": "assistant",
@@ -5303,7 +5388,7 @@ def _cuenta_del_stream(stream_id: str) -> dict | None:
     return None
 
 
-def _procesar_tracking_envio(stream_id: str, tracking: str = "") -> None:
+def _procesar_tracking_envio(stream_id: str, tracking: str = "", file_url: str = "") -> None:
     """Llegó un tracking de salida -> muestra los Sales Orders pendientes de enviar para elegir a
     cuál corresponde. Emite [SHIPPING_COTEJO] modo elegir_so."""
     try:
@@ -5324,6 +5409,7 @@ def _procesar_tracking_envio(stream_id: str, tracking: str = "") -> None:
         "stream_id": stream_id, "role": "assistant",
         "content": "[SHIPPING_COTEJO]" + json.dumps({
             "modo": "elegir_so", "tracking": tracking, "candidatos": sos, "sin_match": len(sos) > 1,
+            "archivo_url": file_url,
         }, ensure_ascii=False),
         "procesado": True, "metadata": {"shipping_cotejo": True},
     }).execute()
@@ -5366,6 +5452,12 @@ def _crear_shipping_confirmado(stream_id: str, so_id: str, lineas: list, datos: 
         "content": "[SHIPPING_CREADO]" + json.dumps(res, ensure_ascii=False),
         "procesado": True, "metadata": {"shipping_creado": True},
     }).execute()
+    if res.get("ok") and res.get("shipping_id"):
+        _guia = _archivo_reciente(stream_id, "[SHIPPING_COTEJO]", lambda p: p.get("archivo_url"))
+        if _guia:
+            _trk = (datos or {}).get("tracking") or ""
+            _guardar_doc_crm(stream_id, "guia_envio", _guia, "Shipping", res["shipping_id"],
+                             referencia=" · ".join(x for x in (f"Guía {_trk}" if _trk else "", res.get("so_numero", "") or "") if x))
     _log_stream(stream_id, "Envío creado en preparación — teclea «shipped» cuando salga" if res.get("ok") else "No se pudo crear el envío",
                 "ok" if res.get("ok") else "error")
 
@@ -5589,7 +5681,7 @@ def _manejar_ordenes(msg: dict, stream_id: str, contenido: str, _md0: dict) -> b
                 log.warning(f"No se pudo clasificar la imagen de ventas: {e}")
                 _ev = {"tipo": "orden_compra"}
             if _ev.get("tipo") == "tracking":
-                _procesar_tracking_envio(stream_id, _ev.get("tracking", "") or (contenido or "").strip())
+                _procesar_tracking_envio(stream_id, _ev.get("tracking", "") or (contenido or "").strip(), _file_url)
                 return True
         # orden de compra del cliente (flujo existente).
         _procesar_orden_compra(stream_id, _file_url, _file_name or "orden", _file_mime)
