@@ -616,6 +616,25 @@ def crear_po_y_ap(draft: dict) -> dict:
         return {"error": f"Purchase Order creado ({po_id}) pero no se pudo crear la cuenta por pagar: {rb}",
                 "po_id": po_id}
 
+    # Reafirmar términos (y vencimiento del Bill): 1CRM puede copiar los de la SO ligada (from_so_id) en vez de los
+    # que mandamos, así que se verifica lo realmente guardado y, si no coincide, se corrige (igual que en la SO).
+    terms_fin = draft.get("terminos_pago", "")
+    terms_guardados = {"po": terms_fin, "bill": terms_fin}
+    if terms_fin:
+        for modelo, rec_id, esperado, clave in (
+                ("PurchaseOrder", po_id, {"terms": terms_fin}, "po"),
+                ("Bill", bill_id, {"terms": terms_fin, "due_date": bill_payload["due_date"]}, "bill")):
+            try:
+                act = sales_order._crm_get(f"data/{modelo}/{rec_id}").get("record", {})
+                parche = {k: v for k, v in esperado.items() if (act.get(k) or "") != v}
+                if parche:
+                    antes = {k: act.get(k) for k in parche}
+                    sales_order._crm_patch(modelo, rec_id, parche)
+                    log.info(f"{modelo} {rec_id}: reafirmado {parche} (1CRM había dejado {antes})")
+                    terms_guardados[clave] = sales_order._crm_get(f"data/{modelo}/{rec_id}").get("record", {}).get("terms", "")
+            except Exception as e:
+                log.warning(f"No se pudieron reafirmar los términos de {modelo} {rec_id}: {e}")
+
     return {
         "ok": True,
         "po_id": po_id,
@@ -626,6 +645,9 @@ def crear_po_y_ap(draft: dict) -> dict:
         "so_url": f"{CRM_BASE}/index.php?module=SalesOrders&action=DetailView&record={so_id}" if so_id else None,
         "proveedor": draft.get("proveedor_nombre", ""),
         "total": total,
+        "terms": terms_guardados["po"],
+        "bill_terms": terms_guardados["bill"],
+        "bill_due_date": bill_payload["due_date"],
     }
 
 
