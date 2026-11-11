@@ -1067,18 +1067,104 @@ def numero_parte(mfr: str, nombre: str = "") -> str:
     return nombre[:40]
 
 
-def titulo_so(lineas: list, maximo: int = 200) -> str:
-    """ASUNTO (nombre) de la Sales Order: los números de parte de las líneas que VAN en la SO — 1, 2, 3… según
-    corresponda —, separados por coma, en el orden de las líneas y sin repetir (ver numero_parte). Si no caben todos
-    en `maximo` caracteres, se corta en un límite de número de parte y se agrega «+N más».
-    Ej.: «CSMD-20BT3ATT3», «ZK22, MGP806N», «NI4U-EG08-AN6X-H1341, 55UA7510, 1763-L16BWA»."""
+_SUFIJOS_LEGALES = re.compile(
+    r"[\s,.]+(?:(?:usa|us|llc|l\.l\.c|inc|incorporated|ltd|limited|corp|corporation|co|gmbh|ag|sa|s\.a|de|cv|c\.v|"
+    r"s\.?\s*de\s*r\.?\s*l|sapi|sas|bv|plc)\.?)+$", re.I)
+_CACHE_FABRICANTE: dict = {}
+
+
+def limpiar_marca(nombre: str) -> str:
+    """Nombre comercial de un fabricante: sin razón social («RS Automation USA LLC» → «RS Automation»)."""
+    n = re.sub(r"\s+", " ", (nombre or "")).strip()
+    for _ in range(3):
+        nuevo = _SUFIJOS_LEGALES.sub("", n).strip(" ,.")
+        if nuevo == n or not nuevo:
+            break
+        n = nuevo
+    return n
+
+
+def _marca_de_fabricante(fab_id: str) -> str:
+    """Nombre del fabricante (en 1CRM es una Account de tipo Manufacturer). Con caché por proceso."""
+    if not fab_id:
+        return ""
+    if fab_id not in _CACHE_FABRICANTE:
+        try:
+            _CACHE_FABRICANTE[fab_id] = limpiar_marca(_crm_get(f"data/Account/{fab_id}").get("record", {}).get("name", ""))
+        except Exception:
+            return ""
+    return _CACHE_FABRICANTE[fab_id]
+
+
+def marca_de_linea(ln: dict) -> str:
+    """Marca de una línea de SO. 1) Si el nombre viene como «MODELO / Marca / descripción» (así publica el catálogo),
+    la marca es el 2º segmento. 2) Si no, la marca del producto del catálogo cuyo número de parte coincide. Sin ninguna
+    de las dos → '' (no se inventa: el título lleva solo el modelo)."""
+    partes = [s.strip() for s in (ln.get("name") or "").split(" / ")]
+    if len(partes) >= 3 and partes[1] and len(partes[1]) <= 40:
+        return limpiar_marca(partes[1])
+    pn = numero_parte(ln.get("mfr_part_no"), ln.get("name"))
+    k = _compact(pn)
+    if len(k) < 4:
+        return ""
+    try:
+        for r in _crm_get("data/Product", {"filter_text": pn, "limit": 10}).get("records", []):
+            p = _crm_get(f"data/Product/{r['id']}").get("record", {})
+            if _compact(p.get("manufacturers_part_no") or "") == k and p.get("manufacturer_id"):
+                return _marca_de_fabricante(p["manufacturer_id"])
+    except Exception as e:
+        log.warning(f"marca_de_linea({pn}): {e}")
+    return _marca_por_ia(ln.get("name") or "", pn)
+
+
+def _marca_por_ia(nombre: str, modelo: str = "") -> str:
+    """Último recurso: la marca escrita en el NOMBRE de la línea («APC SMART-UPS SRT1000XLI» → APC; «BOMBA… WILDEN
+    T4/…» → Wilden), leída con Haiku (barato). Anti-invención: solo vale si la marca devuelta aparece LITERALMENTE en
+    el nombre; si no aparece (o falla algo) → ''."""
+    nombre = re.sub(r"\s+", " ", nombre or "").strip()
+    if len(nombre) < 4 or os.environ.get("MARCA_IA", "on").lower() in ("off", "0", "false", "no"):
+        return ""
+    try:
+        import anthropic
+        resp = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", "")).messages.create(
+            model=os.environ.get("PO_MODEL", "claude-haiku-4-5-20251001"), max_tokens=30, temperature=0,
+            messages=[{"role": "user", "content":
+                       "Del nombre de este producto industrial, dime SOLO la MARCA/fabricante si está escrita en el texto "
+                       "(ej. APC, Wilden, LG, Turck, Siemens). Si no está escrita, responde exactamente NINGUNA. "
+                       "No adivines ni uses conocimiento externo. Sin explicaciones.\n\nProducto: " + nombre}])
+        marca = limpiar_marca((resp.content[0].text if resp.content else "").strip().strip(".\"'"))
+        if not marca or marca.upper().startswith("NINGUNA") or len(marca) > 40:
+            return ""
+        if _compact(marca) and _compact(marca) in _compact(nombre):
+            return marca
+        return ""
+    except Exception as e:
+        log.warning(f"_marca_por_ia({modelo}): {e}")
+        return ""
+
+
+def titulo_so(lineas: list, maximo: int = 200, marca=None) -> str:
+    """ASUNTO (nombre) de la Sales Order: «Marca Modelo» de cada producto distinto que VA en la SO — 1, 2, 3… según
+    corresponda —, separados por coma, en el orden de las líneas. NUNCA lleva cantidades: 3 piezas del mismo producto
+    son UNA sola mención. Si no se conoce la marca de una línea, solo va el modelo (no se inventa). Si no caben todos
+    en `maximo` caracteres, se corta en un límite de producto y se agrega «+N más».
+    `marca(linea) -> str` es opcional (por defecto marca_de_linea).
+    Ej.: «RS Automation CSMD-20BT3ATT3», «ZK22, MGP806N», «Turck NI4U-EG08-AN6X-H1341, Rockwell Automation 1763-L16BWA»."""
+    marca = marca or marca_de_linea
     partes, vistos = [], set()
     for ln in (lineas or []):
         pn = numero_parte(ln.get("mfr_part_no"), ln.get("name"))
         k = _compact(pn)
         if pn and k not in vistos:
             vistos.add(k)
-            partes.append(pn)
+            mk = ""
+            try:
+                mk = (marca(ln) or "").strip()
+            except Exception as e:
+                log.warning(f"titulo_so: marca de «{pn}» falló: {e}")
+            if mk and _compact(mk) in k:      # la marca ya va dentro del modelo
+                mk = ""
+            partes.append(f"{mk} {pn}" if mk else pn)
     if not partes:
         return ""
     out, usados = "", 0
