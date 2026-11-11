@@ -95,6 +95,15 @@ def sales_orders_abiertas(limite: int = 150) -> list[dict]:
     return out
 
 
+def vencimiento_bill(terminos: str, hoy: str) -> str:
+    """Vencimiento de la cuenta por pagar = fecha de la cuenta + días de crédito de los términos del proveedor
+    ('Net 15' → +15; anticipo/COD/sin términos → el mismo día). Antes siempre era el mismo día."""
+    t = sales_order.terminos_so(terminos)
+    if not t:
+        return hoy
+    return sales_order.fecha_vencimiento(t, datetime.date.fromisoformat(hoy))
+
+
 def _terminos_para_po(cuenta_full: dict) -> str:
     """Condiciones de pago del PROVEEDOR para el PO/Bill. Prioridad: `default_purchase_terms`
     (Condiciones de la Compra) y luego `payment_terms` (así viene configurado eBay:
@@ -593,7 +602,7 @@ def crear_po_y_ap(draft: dict) -> dict:
         "currency_id": currency_id,
         "amount": total,
         "bill_date": hoy,
-        "due_date": hoy,
+        "due_date": vencimiento_bill(draft.get("terminos_pago", ""), hoy),   # hoy + días de crédito del proveedor
         **({"terms": draft["terminos_pago"]} if draft.get("terminos_pago") else {}),
         "line_items": [{
             "name": ln.get("name") or ln.get("nombre") or "Producto",

@@ -61,6 +61,13 @@ check("sin payment_terms se usa default_terms de la cuenta", p.get("terms") == "
 p, parches, est = correr("Net_30", "Net 30", so.fecha_vencimiento("Net 30"))
 check("si ya quedó bien no se hace PATCH de más", not any(m == "SalesOrder" and ("terms" in d or "due_date" in d) for m, d in parches), str(parches))
 
+print("Cuenta por pagar (Bill): vencimiento según los términos del proveedor")
+import compra_proveedor as cp
+check("Net 15 → +15 días", cp.vencimiento_bill("Net 15", "2026-11-10") == "2026-11-25")
+check("Net 30 → +30 días", cp.vencimiento_bill("Net 30", "2026-11-10") == "2026-12-10")
+check("100% Advance → el mismo día", cp.vencimiento_bill("100% Advance", "2026-11-10") == "2026-11-10")
+check("sin términos → el mismo día", cp.vencimiento_bill("", "2026-11-10") == "2026-11-10")
+
 if _fallos:
     print(f"\n❌ {len(_fallos)} fallo(s): {_fallos}"); raise SystemExit(1)
 print("\n✅ Todo bien")
