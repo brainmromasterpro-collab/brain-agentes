@@ -1002,6 +1002,50 @@ def cotejar(po: dict, forzar_quote_id: str = "") -> dict:
 # ─────────────────────────────────────────────────────────────
 # 4. ESCRITURA (Fase 2) — crear la Sales Order convirtiendo la cotización
 # ─────────────────────────────────────────────────────────────
+def numero_parte(mfr: str, nombre: str = "") -> str:
+    """Número de parte de una línea. 1) el campo `mfr_part_no` si está lleno. 2) Si está vacío (pasa mucho: en 1CRM
+    el modelo viene dentro del nombre, ej. «Sensor, Inductivo, NI4U-EG08-AN6X-H1341») se extrae del nombre: el token
+    MÁS LARGO que mezcle letras y dígitos (descarta medidas «5/16-18», años «2025», «4K», palabras sin dígitos).
+    3) Sin nada que parezca modelo: la descripción corta."""
+    mfr = (mfr or "").strip()
+    if mfr:
+        return mfr
+    nombre = re.sub(r"\s+", " ", (nombre or "")).strip()
+    cands = []
+    for tok in re.split(r"[\s,;()\[\]]+", nombre):
+        tok = tok.strip(".,:;\"'")
+        if len(tok) >= 4 and re.search(r"[A-Za-z]", tok) and re.search(r"\d", tok) and not re.fullmatch(r"\d+[A-Za-z]{1,2}", tok):
+            cands.append(tok)
+    if cands:
+        return max(cands, key=len)          # empate → el primero (max conserva el primero)
+    return nombre[:40]
+
+
+def titulo_so(lineas: list, maximo: int = 200) -> str:
+    """ASUNTO (nombre) de la Sales Order: los números de parte de las líneas que VAN en la SO — 1, 2, 3… según
+    corresponda —, separados por coma, en el orden de las líneas y sin repetir (ver numero_parte). Si no caben todos
+    en `maximo` caracteres, se corta en un límite de número de parte y se agrega «+N más».
+    Ej.: «CSMD-20BT3ATT3», «ZK22, MGP806N», «NI4U-EG08-AN6X-H1341, 55UA7510, 1763-L16BWA»."""
+    partes, vistos = [], set()
+    for ln in (lineas or []):
+        pn = numero_parte(ln.get("mfr_part_no"), ln.get("name"))
+        k = _compact(pn)
+        if pn and k not in vistos:
+            vistos.add(k)
+            partes.append(pn)
+    if not partes:
+        return ""
+    out, usados = "", 0
+    for i, pn in enumerate(partes):
+        cand = pn if not out else f"{out}, {pn}"
+        faltan = len(partes) - (i + 1)
+        if len(cand) + (len(f" +{faltan} más") if faltan else 0) > maximo and out:
+            break
+        out, usados = cand, i + 1
+    resto = len(partes) - usados
+    return out + (f" +{resto} más" if resto else "")
+
+
 def crear_sales_order(draft: dict) -> dict:
     """Crea la Sales Order a partir del draft aprobado. NO se llama sin aprobación del usuario.
 
@@ -1079,6 +1123,17 @@ def crear_sales_order(draft: dict) -> dict:
         sub = sum(_num(l.get("ext_price")) or 0 for l in fresh)
         iva = sum((_num(l.get("ext_price")) or 0) * ((_num(l.get("line_tax_perc")) or 0) / 100) for l in fresh)
         _crm_patch("SalesOrder", so_id, {"subtotal": f"{sub:.2f}", "amount": f"{sub + iva:.2f}"})
+
+    # 2c) ASUNTO de la SO = números de parte de las líneas que quedaron en ella. 1CRM hereda el nombre de la
+    # cotización al crearla con related_quote_id; si el PO pidió menos líneas (o distintas), el nombre quedaba
+    # con los productos de la cotización y no con los de la SO.
+    try:
+        lineas_fin = (_crm_get(f"data/SalesOrder/{so_id}").get("record", {}).get("line_items") or [])
+        nuevo_titulo = titulo_so(lineas_fin)
+        if nuevo_titulo:
+            _crm_patch("SalesOrder", so_id, {"name": nuevo_titulo})
+    except Exception as e:
+        log.warning(f"No se pudo poner el asunto de la SO {so_id}: {e}")
 
     # 3) Reafirmar cotización aceptada (normalmente ya quedó 'Closed Accepted' sola; si no, enforce).
     q = _crm_get(f"data/Quote/{quote_id}").get("record", {})
