@@ -175,6 +175,44 @@ def cuenta_por_id(cuenta_id: str) -> dict | None:
             "url": f"{CRM_BASE}/index.php?module=Accounts&action=DetailView&record={rec['id']}"}
 
 
+# Valores válidos de SalesOrder.terms (verificado en meta/fields/SalesOrder). La cuenta usa OTRO vocabulario
+# (Account.payment_terms: 'Net_30', 'advance_100%', 'advance_50%'...), y 1CRM acepta cualquier texto en `terms` sin
+# validar (probado: 'Net_30' se guarda literal y la pantalla no lo reconoce), así que hay que TRADUCIR.
+_DIAS_NET = (7, 15, 30, 45, 60, 90)
+
+
+def terminos_so(valor_cuenta: str) -> str:
+    """Traduce el término de pago de la CUENTA (payment_terms: 'Net_30', 'advance_100%', 'Net 30 Days'…) al valor de
+    SalesOrder.terms ('Net 30', '100% Advance', …). '' si no hay término o no se reconoce (no se inventa uno)."""
+    low = re.sub(r"[_\s]+", " ", (valor_cuenta or "").strip().lower())
+    if not low:
+        return ""
+    if "advance" in low or "anticipo" in low:
+        return "Advance 50% / 50%" if re.search(r"\b50\b", low) else "100% Advance"
+    if low in ("cod", "contra reembolso"):
+        return "COD"
+    if "receipt" in low or "vista" in low or "contado" in low:
+        return "Due on Receipt"
+    m = re.search(r"net\s*(\d+)", low) or re.search(r"(\d+)\s*d[ií]as?", low)
+    if m and int(m.group(1)) in _DIAS_NET:
+        return f"Net {int(m.group(1))}"
+    return ""
+
+
+def dias_credito_so(terms_so: str) -> int:
+    """Días de crédito de un valor de SalesOrder.terms: 'Net 30' → 30; anticipo/COD/a la vista → 0."""
+    m = re.fullmatch(r"Net (\d+)(?: Days)?", terms_so or "")
+    return int(m.group(1)) if m else 0
+
+
+def fecha_vencimiento(terms_so: str, desde: date | None = None) -> str:
+    """Fecha de vencimiento de la SO = día de creación (hora de México) + días de crédito de los términos."""
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+    base = desde or datetime.now(ZoneInfo("America/Mexico_City")).date()
+    return (base + timedelta(days=dias_credito_so(terms_so))).isoformat()
+
+
 def _terminos_y_moneda(cuenta_id: str) -> dict:
     """Trae los TÉRMINOS DE PAGO y la MONEDA de la cuenta — específicos del cliente.
     Van en la Sales Order: terms y currency_id.
@@ -184,7 +222,8 @@ def _terminos_y_moneda(cuenta_id: str) -> dict:
     # payment_terms es el campo real en 1CRM Cloud; default_terms siempre llega vacío.
     terminos = rec.get("payment_terms") or rec.get("default_terms") or ""
     return {
-        "terminos_pago": terminos,
+        "terminos_pago": terminos,                 # tal como lo tiene la cuenta ('Net_30', 'advance_100%'…)
+        "terminos_so": terminos_so(terminos),      # traducido al vocabulario de la Sales Order ('Net 30', '100% Advance')
         "currency_id":   rec.get("currency_id") or "",
         "moneda":        rec.get("currency") or "",
     }
@@ -611,7 +650,9 @@ def _armar_draft(cuenta: dict, tm: dict, po: dict, items_out: list,
         "quote_vigente": ref.get("vigente"), "quote_stage": ref.get("quote_stage"),
         "quote_referenciada": ref.get("referenciada", False),
         "currency_id": tm["currency_id"], "moneda": po.get("moneda", "") or tm["moneda"],
-        "terms": tm["terminos_pago"],
+        "terms": tm["terminos_so"],                 # valor ya traducido: es el que se escribe en la SO
+        "terms_cuenta": tm["terminos_pago"],
+        "vence": fecha_vencimiento(tm["terminos_so"]) if tm["terminos_so"] else "",
         "po_number": po.get("po_number", ""),
         "file_url": po.get("file_url", ""),  # para subir el PO a Documentos/Notas al crear la SO
         "para_nosotros": para_nosotros,
@@ -620,7 +661,12 @@ def _armar_draft(cuenta: dict, tm: dict, po: dict, items_out: list,
         "origen": {
             "cuenta": "cliente del CRM" + (" (derivado de la cotización citada)" if ref.get("referenciada") else ""),
             "cotizacion": ref["nombre"] + (" · citada en el PO" if ref.get("referenciada") else " · mayor cobertura"),
-            "terminos": "términos de pago de la cuenta" if tm["terminos_pago"] else "⚠ la cuenta no tiene términos configurados",
+            "terminos": (
+                f"términos de pago de la cuenta ({tm['terminos_pago']}) · vence {fecha_vencimiento(tm['terminos_so'])}"
+                if tm["terminos_so"] else
+                (f"⚠ no reconozco los términos de la cuenta («{tm['terminos_pago']}»): la SO conservará los de la cotización"
+                 if tm["terminos_pago"] else
+                 "⚠ la cuenta no tiene términos configurados: la SO conservará los de la cotización")),
             "moneda": "moneda de la cuenta",
             "po_number": "número de la orden de compra del cliente",
             "cantidades": "cantidades del PO (lo que ordenó el cliente)",
@@ -1074,8 +1120,12 @@ def crear_sales_order(draft: dict) -> dict:
     }
     if draft.get("currency_id"):
         payload["currency_id"] = draft["currency_id"]
-    if draft.get("terms"):
-        payload["terms"] = draft["terms"]
+    # TÉRMINOS DE PAGO: los de la cuenta del cliente, traducidos al vocabulario de la SO (se releen aquí: fuente de
+    # verdad, no lo que venga en el borrador). Sin términos en la cuenta → la SO conserva los de la cotización.
+    terms_final = terminos_so(_terminos_y_moneda(cuenta_id).get("terminos_pago", "")) or terminos_so(draft.get("terms", ""))
+    if terms_final:
+        payload["terms"] = terms_final
+        payload["due_date"] = fecha_vencimiento(terms_final)
     r = _crm_post("SalesOrder", payload)
     so_id = r.get("id")
     if not so_id:
@@ -1124,6 +1174,21 @@ def crear_sales_order(draft: dict) -> dict:
         iva = sum((_num(l.get("ext_price")) or 0) * ((_num(l.get("line_tax_perc")) or 0) / 100) for l in fresh)
         _crm_patch("SalesOrder", so_id, {"subtotal": f"{sub:.2f}", "amount": f"{sub + iva:.2f}"})
 
+    # 2b-bis) Reafirmar términos y vencimiento: al crear con related_quote_id 1CRM copia los de la cotización y puede
+    # pisar lo del POST. Se verifica y, si no quedó, se corrige.
+    if terms_final:
+        try:
+            act = _crm_get(f"data/SalesOrder/{so_id}").get("record", {})
+            patch_t = {}
+            if (act.get("terms") or "") != terms_final:
+                patch_t["terms"] = terms_final
+            if (act.get("due_date") or "") != payload["due_date"]:
+                patch_t["due_date"] = payload["due_date"]
+            if patch_t:
+                _crm_patch("SalesOrder", so_id, patch_t)
+        except Exception as e:
+            log.warning(f"No se pudieron reafirmar los términos de la SO {so_id}: {e}")
+
     # 2c) ASUNTO de la SO = números de parte de las líneas que quedaron en ella. 1CRM hereda el nombre de la
     # cotización al crearla con related_quote_id; si el PO pidió menos líneas (o distintas), el nombre quedaba
     # con los productos de la cotización y no con los de la SO.
@@ -1147,6 +1212,8 @@ def crear_sales_order(draft: dict) -> dict:
         "so_id": so_id,
         "so_numero": fin.get("so_number"),
         "nombre": fin.get("name", ""),
+        "terms": fin.get("terms", ""),
+        "due_date": fin.get("due_date", ""),
         "lineas_finales": len(fin.get("line_items") or []),
         "ajustadas": ajustadas,
         "quitadas": quitadas,
