@@ -915,8 +915,10 @@ def procesar_job_publicador(job: dict) -> None:
             "titulo":    titulo,
             "mensaje":   mensaje,
             "rfq_id":    rfq_uuid,
-            # solo se liga a un stream cuyo contrato incluye el pipeline de búsqueda (si no, sin stream: no aparece en otro proceso)
-            "stream_id": (rfq.get("stream_id") if stream_contracts.stream_permite_proceso(supabase, rfq.get("stream_id"), "pipeline_rfq", log) else None),
+            # solo se liga a un stream cuyo contrato incluye el pipeline de búsqueda O la publicación de productos (el stream
+            # «Productos» publica por link: sin esto el aviso «Publicado…» no aparecía en su chat). Otro proceso → sin stream.
+            "stream_id": (rfq.get("stream_id") if (stream_contracts.stream_permite_proceso(supabase, rfq.get("stream_id"), "pipeline_rfq", log)
+                                                   or stream_contracts.stream_permite_proceso(supabase, rfq.get("stream_id"), "publicar_producto", log)) else None),
             "leida":     False,
         }).execute()
 

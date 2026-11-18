@@ -214,6 +214,23 @@ _comp = {p: ts for p, ts in _reg.items() if len(ts) > 1}
 _decl = {p: ts for p, (ts, _m) in sc.PROCESOS_COMPARTIDOS_DECLARADOS.items()}
 check("solo se comparten los procesos declarados", _comp == _decl, f"{_comp} vs {_decl}")
 
+print("El aviso «Publicado…» del publicador llega al chat de Productos (regresión del 5-nov)")
+import re as _re
+class _FakeSB:
+    def __init__(s, tipo): s.tipo = tipo
+    def table(s, n): return s
+    def select(s, *a): return s
+    def eq(s, *a): return s
+    def single(s): return s
+    def execute(s): return type("R", (), {"data": {"tipo": s.tipo}})()
+def _liga(tipo):
+    return any(sc.stream_permite_proceso(_FakeSB(tipo), "S1", pr) for pr in ("pipeline_rfq", "publicar_producto"))
+check("stream Productos (publicacion) recibe el aviso", _liga("publicacion"))
+check("stream Buscar prods recibe el aviso", _liga("busquedas"))
+check("Sales Order / Pagos / Oportunidad NO reciben avisos del publicador", not any(_liga(x) for x in ("ordenes", "pagos", "rfq", "compras", "correo")))
+_src = open("agente_publicador.py", encoding="utf-8").read()
+check("el publicador usa AMBOS procesos al ligar la notificación", '"publicar_producto"' in _src and '"pipeline_rfq"' in _src)
+
 if _fallos:
     print(f"\n❌ {len(_fallos)} fallo(s): {_fallos}")
     raise SystemExit(1)
