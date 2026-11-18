@@ -26,6 +26,7 @@ Variables de entorno (mismas que agente_buscador):
 
 import stream_contracts
 import os
+import re
 import time
 import json
 import logging
@@ -638,6 +639,18 @@ def _nombre_archivo(nombre: str, fallback: str = "producto", max_len: int = 70) 
 
 
 def subir_imagen_a_crm(product_id: str, foto_url: str, nombre: str = "") -> bool:
+    """Sube la imagen con hasta 3 intentos. True SOLO si 1CRM confirmó el archivo (image_filename lleno); si no, False
+    (el producto se avisa «publicado SIN imagen», nunca «con imagen» en falso)."""
+    import time as _t
+    for intento in (1, 2, 3):
+        if _subir_imagen_a_crm_intento(product_id, foto_url, nombre):
+            return True
+        log.warning(f"Imagen de {product_id}: intento {intento}/3 sin confirmar en 1CRM")
+        _t.sleep(3)
+    return False
+
+
+def _subir_imagen_a_crm_intento(product_id: str, foto_url: str, nombre: str = "") -> bool:
     """
     Sube la imagen del producto a 1CRM usando Playwright (browser headless).
 
@@ -731,7 +744,19 @@ def subir_imagen_a_crm(product_id: str, foto_url: str, nombre: str = "") -> bool
                 "() => { var btn = document.querySelector('button[name=\"DetailForm_save\"]'); "
                 "if (btn) btn.click(); }"
             )
-            page.wait_for_load_state("networkidle", timeout=30000)
+            # NO basta con esperar networkidle: se cumple ANTES de que arranque el guardado y el navegador se
+            # cerraba a media operación (imagen intermitente sin guardar). Se espera a que 1CRM confirme el archivo.
+            try:
+                page.wait_for_url(re.compile(r"action=DetailView"), timeout=20000)
+            except Exception:
+                pass
+            _mod_poll = discover_product_module()
+            for _ in range(10):
+                _rp = httpx.get(f"{crm_url}/api.php/data/{_mod_poll}/{product_id}", auth=(crm_user, crm_pass),
+                                params={"fields[]": ["image_filename"]}, timeout=15)
+                if (_rp.json().get("record") or {}).get("image_filename"):
+                    break
+                page.wait_for_timeout(2000)
             log.info(f"Playwright: guardado — URL: {page.url}")
 
             browser.close()
@@ -749,8 +774,7 @@ def subir_imagen_a_crm(product_id: str, foto_url: str, nombre: str = "") -> bool
             log.info(f"✓ Imagen confirmada en 1CRM: {img_fn}")
             return True
         else:
-            log.warning("Playwright completó pero image_filename sigue vacío")
-            return True   # no hubo excepción — considerar éxito
+            raise RuntimeError("Playwright completó pero image_filename sigue vacío (la imagen NO quedó en 1CRM)")
 
     except Exception as e:
         log.error(f"Error Playwright subiendo imagen: {e}")

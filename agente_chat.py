@@ -2397,6 +2397,30 @@ def _resumen_corto(texto: str, max_len: int = 100) -> str:
     return texto[:max_len].rsplit(" ", 1)[0].rstrip(".,;:") + "…"
 
 
+def _descripcion_sin_modelo(descripcion: str, part_number: str = "", marca: str = "") -> str:
+    """La descripción de muchos sitios arranca con el propio modelo y la marca («GS-51PC, Signal Release Type…, GS Series,
+    KEYENCE, Mexico.»): en el título ya van como 1º y 2º segmento, así que se quitan de la descripción (si no, el modelo
+    salía dos veces). Quita un prefijo «modelo»/«marca» pegado al inicio y los segmentos separados por coma que SEAN el
+    modelo o la marca. No toca el resto del texto."""
+    d = re.sub(r"\s+", " ", descripcion or "").strip()
+    if not d:
+        return ""
+    ruido = [s.strip().lower() for s in (part_number, marca) if (s or "").strip()]
+    if not ruido:
+        return d
+    for _ in range(3):                       # prefijos: «GS-51PC / KEYENCE / …», «GS-51PC - …», «Acme ABC-1 …»
+        for r in ruido:
+            m = re.match(r"^\s*" + re.escape(r) + r"\s*(?:[,;:/|\-–—]\s*|\s+(?=\S))", d, re.I)
+            if m and len(d) > len(m.group(0)):
+                d = d[m.end():]
+                break
+        else:
+            break
+    limpio = [s for s in re.split(r",\s*", d) if s.strip().strip(".").lower() not in ruido]
+    out = ", ".join(limpio).strip(" ,;")
+    return out if out else d
+
+
 def _construir_titulo_producto(part_number: str, marca: str = "", descripcion: str = "", nombre_fallback: str = "") -> str:
     """Título para 1CRM en el ORDEN pedido por Gabriel: modelo (part number) / marca / descripción
     CORTA — SIN el 'nombre' que trae el extractor (se descarta a propósito: mezclar el nombre del
@@ -2409,7 +2433,7 @@ def _construir_titulo_producto(part_number: str, marca: str = "", descripcion: s
     PUBLICAR — así preview y resultado real siempre coinciden."""
     _seen: set = set()
     _partes: list = []
-    for _p in (part_number, marca, _resumen_corto(descripcion)):
+    for _p in (part_number, marca, _resumen_corto(_descripcion_sin_modelo(descripcion, part_number, marca))):
         _p = (_p or "").strip()
         if _p and _p.lower() not in _seen:
             _seen.add(_p.lower())
