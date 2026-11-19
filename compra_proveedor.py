@@ -336,6 +336,81 @@ def captura_a_links(datos: dict) -> list[dict]:
     return out
 
 # ─────────────────────────────────────────────────────────────
+# 1c. MATCH SEMÁNTICO (otro idioma / otra redacción) — último recurso del cotejo
+# ─────────────────────────────────────────────────────────────
+_RE_ESPEC = re.compile(r"\d+(?:[/.,\-]\d+)+[a-z]*|\d+[a-z]+|[a-z]+\d+[a-z0-9]*")
+
+
+def _especificaciones(texto: str) -> set:
+    """Especificaciones literales de un texto (medidas, roscas, voltajes, modelos): '5/16-18', '1/2', '24t', '220vac'…
+    Sirven de barrera: el producto de un documento y la línea de una venta solo se comparan con IA si comparten alguna,
+    así el modelo no puede «inventar» coincidencias entre productos sin relación."""
+    t = (texto or "").lower().replace('"', " ").replace("″", " ").replace("”", " ")
+    return {m for m in _RE_ESPEC.findall(t) if len(m) >= 2}
+
+
+def _llm_json(prompt: str, max_tokens: int = 400) -> dict:
+    """Llamada de texto a Haiku que devuelve JSON ({} si falla). Aparte para poder simularla en pruebas."""
+    import json as _json
+    import anthropic
+    try:
+        resp = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", "")).messages.create(
+            model=os.environ.get("PO_MODEL", "claude-haiku-4-5-20251001"), max_tokens=max_tokens, temperature=0,
+            messages=[{"role": "user", "content": prompt}])
+        raw = (resp.content[0].text if resp.content else "").strip()
+        i, j = raw.find("{"), raw.rfind("}")
+        return _json.loads(raw[i:j + 1]) if i >= 0 and j > i else {}
+    except Exception as e:
+        log.warning(f"_llm_json: {e}")
+        return {}
+
+
+def match_semantico(link: dict, sos: list, max_candidatas: int = 40) -> list:
+    """El producto del documento (p. ej. «Alloy Steel Set Screws, Brass Tip, 5/16-18 x 1/2"», eBay) puede ser la MISMA cosa
+    que la línea de una venta escrita en español y sin su número de parte («Tornillo opresor 5/16-18 x 1/2" Acero con punta
+    de latón»): ni el modelo ni las palabras coinciden. Barrera determinista: solo se consideran las líneas que comparten al
+    menos una especificación literal con el producto; entre ellas decide Haiku cuáles son el mismo producto (solo si está
+    seguro). Devuelve [(so, línea)]; [] si no hay o si algo falla. Siempre queda marcado «≈ verificar» para que el usuario lo apruebe."""
+    texto = " ".join(str(link.get(k) or "") for k in ("nombre", "marca", "part_number", "descripcion"))
+    esp = _especificaciones(texto)
+    if not esp:
+        return []
+    cand = []
+    for so in sos:
+        for ln in so["lines"]:
+            comunes = esp & _especificaciones(f"{ln.get('part_number', '')} {ln.get('descripcion', '')}")
+            if comunes:
+                cand.append((len(comunes), so, ln))
+    cand.sort(key=lambda t: -t[0])
+    cand = cand[:max_candidatas]
+    if not cand:
+        return []
+    lineas = "\n".join(f"{i}: [{c[1]['nombre'][:40]}] {c[2].get('part_number', '')} | {str(c[2].get('descripcion', ''))[:140]}"
+                       for i, c in enumerate(cand))
+    prompt = (
+        "Eres analista de compras. Un documento de un proveedor trae este producto:\n"
+        f"«{texto.strip()[:300]}»\n\n"
+        "Estas son líneas de ventas (Sales Orders) abiertas, a veces escritas en otro idioma (español) y sin número de parte:\n"
+        f"{lineas}\n\n"
+        "¿Cuáles líneas son EXACTAMENTE el mismo producto (mismo tipo de artículo y mismas especificaciones: medidas, rosca, "
+        "material, punta, voltaje…)? Traduce mentalmente entre idiomas. Si no estás seguro de una línea, NO la incluyas; es "
+        "preferible no devolver ninguna. Responde SOLO un JSON: "
+        '{"coincidencias": [{"i": <número de línea>, "evidencia": "qué especificaciones coinciden"}]}'
+    )
+    data = _llm_json(prompt)
+    out, vistos = [], set()
+    for c in (data.get("coincidencias") or []):
+        try:
+            i = int(c.get("i"))
+        except (TypeError, ValueError):
+            continue
+        if 0 <= i < len(cand) and i not in vistos:
+            vistos.add(i)
+            out.append((cand[i][1], cand[i][2]))
+    return out
+
+
+# ─────────────────────────────────────────────────────────────
 # 2. COTEJO — agrupa los links por la Sales Order que machearon
 # ─────────────────────────────────────────────────────────────
 def buscar_sales_orders_candidatas(links_data: list[dict]) -> dict:
@@ -431,6 +506,14 @@ def buscar_sales_orders_candidatas(links_data: list[dict]) -> dict:
                 candidatos.append((so, ln))
                 tipo_match = "descripcion"
 
+        # Respaldo 4: el mismo producto escrito en otro idioma / sin número de parte (eBay en inglés ↔ venta en español).
+        # Último recurso, con barrera de especificaciones literales; siempre sale «≈ verificar».
+        if not candidatos:
+            sem = match_semantico(link, sos)
+            if sem:
+                candidatos = list(sem)
+                tipo_match = "ia"
+
         if not candidatos:
             sin_match.append({**link, "motivo": "ningún producto de una Sales Order abierta coincide"})
             continue
@@ -448,7 +531,7 @@ def buscar_sales_orders_candidatas(links_data: list[dict]) -> dict:
                 "descripcion_so": ln["descripcion"],
                 "cantidad_so": ln.get("quantity"),
                 "tipo_match": tipo_match,
-                "match_parcial": tipo_match in ("parcial", "descripcion"),
+                "match_parcial": tipo_match in ("parcial", "descripcion", "ia"),
             })
 
     mapa_comprado = _mapa_ya_comprado()
