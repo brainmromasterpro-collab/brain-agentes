@@ -1178,6 +1178,51 @@ def titulo_so(lineas: list, maximo: int = 200, marca=None) -> str:
     return out + (f" +{resto} más" if resto else "")
 
 
+def recalcular_totales_so(so_id: str) -> dict:
+    """Recalcula y guarda los totales de la SO y de cada uno de sus grupos de líneas a partir de las líneas que
+    tiene AHORA. Verificado en vivo (SO 307): al borrar líneas de la cotización copiada, el SalesOrderLineGroup
+    conservaba subtotal/total/costo de la cotización completa y la pantalla de 1CRM mostraba esos.
+    Devuelve {subtotal, iva, total, grupos}; verifica releyendo y registra si algo no quedó."""
+    rec = _crm_get(f"data/SalesOrder/{so_id}").get("record", {})
+    lineas = rec.get("line_items") or []
+    tc = _num(rec.get("exchange_rate")) or 1.0
+    envio = _num(rec.get("total_shipping")) or 0.0
+    descuento = _num(rec.get("total_discount")) or 0.0
+
+    def _tot(ls):
+        sub = sum(_num(l.get("ext_price")) or 0 for l in ls)
+        iva = sum((_num(l.get("ext_price")) or 0) * ((_num(l.get("line_tax_perc")) or 0) / 100) for l in ls)
+        costo = sum((_num(l.get("cost_price")) or 0) * (_num(l.get("quantity")) or 0) for l in ls)
+        return sub, iva, costo
+
+    por_grupo: dict = {}
+    for l in lineas:
+        por_grupo.setdefault(l.get("line_group_id"), []).append(l)
+    for gid, ls in por_grupo.items():
+        if not gid:
+            continue
+        sub, iva, costo = _tot(ls)
+        _crm_patch("SalesOrderLineGroup", gid, {
+            "subtotal": f"{sub:.2f}", "subtotal_usd": f"{sub / tc:.5f}",
+            "total": f"{sub + iva:.2f}", "total_usd": f"{(sub + iva) / tc:.5f}",
+            "cost": f"{costo:.2f}", "cost_usd": f"{costo / tc:.5f}",
+        })
+    sub, iva, _ = _tot(lineas)
+    total = sub + iva + envio - descuento
+    _crm_patch("SalesOrder", so_id, {
+        "subtotal": f"{sub:.2f}", "subtotal_usd": f"{sub / tc:.5f}",
+        "pretax": f"{sub - descuento:.2f}", "pretax_usd": f"{(sub - descuento) / tc:.5f}",
+        "total_tax": f"{iva:.2f}",
+        "amount": f"{total:.2f}", "amount_usdollar": f"{total / tc:.5f}",
+    })
+    # Verificación: releer y avisar si 1CRM no lo guardó.
+    chk = _crm_get(f"data/SalesOrder/{so_id}").get("record", {})
+    if abs((_num(chk.get("subtotal")) or 0) - sub) > 0.01 or abs((_num(chk.get("amount")) or 0) - total) > 0.01:
+        log.warning(f"Totales de la SO {so_id} no quedaron: subtotal={chk.get('subtotal')} (esperado {sub:.2f}) "
+                    f"amount={chk.get('amount')} (esperado {total:.2f})")
+    return {"subtotal": round(sub, 2), "iva": round(iva, 2), "total": round(total, 2), "grupos": len(por_grupo)}
+
+
 def crear_sales_order(draft: dict) -> dict:
     """Crea la Sales Order a partir del draft aprobado. NO se llama sin aprobación del usuario.
 
@@ -1252,13 +1297,11 @@ def crear_sales_order(draft: dict) -> dict:
                 patch["ext_price"] = f"{q_final * u_final:.2f}"  # la API no recalcula la línea sola
             _crm_patch("SalesOrderLine", li["id"], patch); ajustadas += 1
 
-    # 2b) La API no recalcula los totales de la SO al editar líneas: se recalculan (subtotal + IVA
-    # por línea) y se parchan amount/subtotal (verificado en vivo que son editables).
+    # 2b) La API no recalcula los totales al editar/borrar líneas. 1CRM muestra el Subtotal/IVA/Total de la
+    # pantalla desde el GRUPO de líneas (SalesOrderLineGroup) y desde la SO: se recalculan ambos con las líneas
+    # que de verdad quedaron (antes solo se parchaba la SO y el grupo seguía con el total de TODA la cotización).
     if ajustadas or quitadas:
-        fresh = (_crm_get(f"data/SalesOrder/{so_id}").get("record", {}).get("line_items") or [])
-        sub = sum(_num(l.get("ext_price")) or 0 for l in fresh)
-        iva = sum((_num(l.get("ext_price")) or 0) * ((_num(l.get("line_tax_perc")) or 0) / 100) for l in fresh)
-        _crm_patch("SalesOrder", so_id, {"subtotal": f"{sub:.2f}", "amount": f"{sub + iva:.2f}"})
+        recalcular_totales_so(so_id)
 
     # 2b-bis) Reafirmar términos y vencimiento: al crear con related_quote_id 1CRM copia los de la cotización y puede
     # pisar lo del POST. Se verifica y, si no quedó, se corrige.
