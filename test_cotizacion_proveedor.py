@@ -43,6 +43,51 @@ INSERTS.clear()
 cp.leer_captura_compra = lambda imgs, model_id="": {"tipo": "comprobante_pago", "items": []}
 assert ac._procesar_captura_compra("S1", "http://x/c.pdf", "c.pdf", "application/pdf") is False and not INSERTS
 
+# ── 1b) Se identifica por EVIDENCIA, no por el tipo que diga el lector ───────────────────────────
+ITEMS2 = [{"nombre": "Sensor A", "part_number": "AAA-111", "cantidad": 2, "precio_unitario": 10.0},
+          {"nombre": "Sensor B", "part_number": "BBB-222", "cantidad": 1, "precio_unitario": 20.0}]
+# lector dudoso («otro») pero con productos y precios → es algo que se compra → cotejo (con 2 productos)
+INSERTS.clear(); VISTO.clear()
+cp.leer_captura_compra = lambda imgs, model_id="": {"tipo": "otro", "tienda": "Acme", "moneda": "USD", "items": ITEMS2}
+assert ac._procesar_captura_compra("S1", "u", "x.pdf", "application/pdf") is True and len(VISTO["links"]) == 2, VISTO
+# «otro» sin productos → no lo atiende (el router pregunta)
+cp.leer_captura_compra = lambda imgs, model_id="": {"tipo": "otro", "items": []}
+assert ac._procesar_captura_compra("S1", "u", "x.pdf", "application/pdf") is False
+# packing/tracking nunca se toma por compra aunque traiga renglones
+cp.leer_captura_compra = lambda imgs, model_id="": {"tipo": "packing_tracking", "items": ITEMS2}
+assert ac._procesar_captura_compra("S1", "u", "x.pdf", "application/pdf") is False
+# el usuario dijo «es una cotización» → se procesa aunque el lector dudara; sin productos avisa y no se queda callado
+cp.leer_captura_compra = lambda imgs, model_id="": {"tipo": "otro", "items": ITEMS2}
+VISTO.clear(); assert ac._procesar_captura_compra("S1", "u", "x.pdf", "application/pdf", forzar=True) is True and VISTO.get("links")
+INSERTS.clear()
+cp.leer_captura_compra = lambda imgs, model_id="": {"tipo": "otro", "items": []}
+assert ac._procesar_captura_compra("S1", "u", "x.pdf", "application/pdf", forzar=True) is True and "no encontré productos" in INSERTS[-1]["content"]
+
+# Router del stream de compras: cada tipo a su flujo; lo dudoso se pregunta (ya NO cae a «comprobante de pago»)
+LLAMADAS = []
+for nombre_fn in ("_procesar_comprobante_pago", "_procesar_evidencia_receiving", "_preguntar_tipo_archivo", "_procesar_link_proveedor"):
+    setattr(ac, nombre_fn, (lambda n: (lambda *a, **k: LLAMADAS.append(n)))(nombre_fn))
+
+
+def enviar(tipo_lector, contenido="Archivo subido: doc.pdf", archivo=True, items=None):
+    LLAMADAS.clear()
+    ac._leer_archivo_compras = lambda *a, **k: ({"error": "x"} if tipo_lector == "error" else {"tipo": tipo_lector, "items": items or []})
+    md = {"file_url": "http://x/doc.pdf", "file_name": "doc.pdf", "file_mime": "application/pdf"} if archivo else {}
+    ac._manejar_compras({}, "S1", contenido, md)
+    return list(LLAMADAS)
+
+
+assert enviar("comprobante_pago") == ["_procesar_comprobante_pago"]
+assert enviar("packing_tracking") == ["_procesar_evidencia_receiving"]
+assert enviar("otro") == ["_preguntar_tipo_archivo"], "lo dudoso se pregunta, no se asume pago"
+assert enviar("error") == ["_preguntar_tipo_archivo"]
+INSERTS.clear()
+assert enviar("otro", items=ITEMS2) == [] and INSERTS[-1]["content"].startswith("[COTEJO_PROVEEDOR]"), "con productos y precios → cotejo, sin pago/recepción/pregunta"
+# respuesta del botón → usa el último archivo subido
+ac._ultimo_archivo_stream = lambda sid: {"file_url": "http://x/doc.pdf", "file_name": "doc.pdf", "file_mime": "application/pdf"}
+assert enviar(None, contenido=ac._OPC_PAGO, archivo=False) == ["_procesar_comprobante_pago"]
+assert enviar(None, contenido=ac._OPC_RECEP, archivo=False) == ["_procesar_evidencia_receiving"]
+
 # ── 2) Términos del documento al crear el PO ─────────────────────────────────────────────────────
 REG = {}
 so._crm_post = lambda m, d: REG.setdefault((m, f"{m}-1"), dict(d)) and {"id": f"{m}-1"}

@@ -4504,28 +4504,47 @@ def _procesar_link_proveedor(stream_id: str, urls: list[str]) -> None:
     log.info(f"Cotejo proveedor emitido | {cotejo.get('resumen','')}")
 
 
-def _procesar_captura_compra(stream_id: str, file_url: str, nombre: str = "", mime: str = "") -> bool:
-    """Captura/PDF de una compra en línea (checkout, carrito, resumen de pedido de eBay/Amazon/etc.)
-    en el stream 'compras': lee tienda + productos + precios y los manda al MISMO cotejo que un link
-    (Sales Orders abiertas → borrador de PO para aprobar). Devuelve True si lo atendió; False si el
-    archivo NO es una compra (comprobante de pago, packing list/tracking, otro) para que el router
-    siga con su flujo de siempre. Antes TODO archivo sin palabras clave caía a comprobante de pago
-    y respondía "no encontré cuenta por pagar" cuando la compra aún no tiene PO. NO escribe al CRM."""
+def _leer_archivo_compras(file_url: str, nombre: str = "", mime: str = "") -> dict:
+    """UNA sola lectura con visión de un archivo del stream 'compras': clasifica (compra en línea, cotización de
+    proveedor, order confirmation, comprobante de pago, packing/tracking, otro) y extrae proveedor + productos +
+    costos. Hasta 6 páginas de PDF (una cotización puede traer varios productos en varias hojas). {'error': …} si falla."""
+    try:
+        import compra_proveedor
+        return compra_proveedor.leer_captura_compra(_bajar_imagenes(file_url, nombre, mime, max_paginas=6))
+    except Exception as e:
+        log.error(f"_leer_archivo_compras: {e}")
+        return {"error": str(e)}
+
+
+def _tiene_productos_con_precio(datos: dict) -> bool:
+    """¿El documento trae productos (nombre o modelo) CON precio? Es la evidencia de que es algo que se compra
+    (cotización, proforma, carrito…) y no un recibo de pago ni una guía, sea cual sea el tipo que haya dicho el lector."""
+    import sales_order
+    return any((it.get("nombre") or it.get("part_number")) and sales_order._num(it.get("precio_unitario"))
+               for it in (datos.get("items") or []))
+
+
+def _procesar_captura_compra(stream_id: str, file_url: str, nombre: str = "", mime: str = "",
+                             datos: dict | None = None, forzar: bool = False) -> bool:
+    """Archivo del stream 'compras' que trae PRODUCTOS (captura/PDF de una compra en línea, cotización o proforma de
+    proveedor…): lee proveedor + productos + costos (uno o varios) y los manda al MISMO cotejo que un link (Sales
+    Orders abiertas → borrador de PO para aprobar). Devuelve True si lo atendió; False si el archivo NO trae productos
+    para comprar (comprobante de pago, packing list/tracking) para que el router siga con su flujo.
+    `datos`: lectura ya hecha (evita leer dos veces). `forzar`: el usuario dijo que ES una cotización → se procesa
+    aunque el lector dudara del tipo. NO escribe al CRM."""
     try:
         import compra_proveedor
     except Exception as e:
         log.error(f"compra_proveedor no disponible: {e}")
         return False
-    try:
-        imgs = _bajar_imagenes(file_url, nombre, mime)
-        datos = compra_proveedor.leer_captura_compra(imgs)
-    except Exception as e:
-        log.error(f"_procesar_captura_compra: {e}")
-        return False
+    if datos is None:
+        datos = _leer_archivo_compras(file_url, nombre, mime)
     if datos.get("error"):
         return False
     tipo = datos.get("tipo", "otro")
-    if tipo == "order_confirmation":
+    if forzar:
+        pass
+    elif tipo == "order_confirmation":
         # Un order confirmation con compras ya en tránsito = activar receiving (flujo existente);
         # sin ninguna en tránsito es la compra que aún no tiene PO.
         try:
@@ -4533,10 +4552,19 @@ def _procesar_captura_compra(stream_id: str, file_url: str, nombre: str = "", mi
                 return False
         except Exception:
             return False
-    elif tipo not in ("compra_online", "cotizacion_proveedor"):
+    elif tipo in ("comprobante_pago", "packing_tracking"):
         return False
+    elif tipo not in ("compra_online", "cotizacion_proveedor") and not _tiene_productos_con_precio(datos):
+        return False   # tipo dudoso y sin productos con precio: no se adivina (el router pregunta)
     links = compra_proveedor.captura_a_links(datos)
     if not links:
+        if forzar:
+            supabase.table("mensajes").insert({
+                "stream_id": stream_id, "role": "assistant", "procesado": True, "metadata": {},
+                "content": "Lo revisé como cotización pero no encontré productos con nombre o modelo en ese archivo. "
+                           "Mándame el modelo y el costo a mano, o una imagen más legible.",
+            }).execute()
+            return True
         return False
     _que = "Cotización/proforma de" if tipo == "cotizacion_proveedor" else "Captura de compra en"
     _log_stream(stream_id, f"{_que} {datos.get('tienda') or 'proveedor'}: "
@@ -4605,7 +4633,7 @@ def _crear_po_confirmado(stream_id: str, grupos: list) -> None:
     log.info(f"PO(s) creado(s): {ok_n}/{len(resultados)}")
 
 
-def _bajar_imagenes(file_url: str, nombre: str = "", mime: str = "") -> list:
+def _bajar_imagenes(file_url: str, nombre: str = "", mime: str = "", max_paginas: int = 3) -> list:
     """Baja un archivo (imagen o PDF) y lo devuelve como lista de imágenes PNG en bytes — si es
     PDF lo rasteriza (reusa orden_compra), si ya es imagen lo regresa tal cual. Mismo patrón que
     el fallback a visión de orden_compra.leer_po."""
@@ -4613,7 +4641,7 @@ def _bajar_imagenes(file_url: str, nombre: str = "", mime: str = "") -> list:
     data = orden_compra.descargar(file_url)
     ext = orden_compra._ext(nombre, mime)
     if ext == "pdf":
-        return orden_compra._pdf_a_imagenes(data)
+        return orden_compra._pdf_a_imagenes(data, max_pages=max_paginas)
     return [data]
 
 
@@ -5743,6 +5771,58 @@ def _manejar_ordenes(msg: dict, stream_id: str, contenido: str, _md0: dict) -> b
     return False  # nada operativo: el llamador lo pasa al modelo (con SUS herramientas)
 
 
+_OPC_COTIZ = "Es una cotización o proforma de proveedor"
+_OPC_PAGO = "Es un comprobante de pago"
+_OPC_RECEP = "Es una guía, packing list o recepción"
+
+
+def _preguntar_tipo_archivo(stream_id: str, datos: dict | None = None, nombre: str = "") -> None:
+    """El archivo no trae productos con precio, ni se reconoció como recibo de pago ni como guía/packing: se pregunta
+    con botones qué es en vez de adivinar (adivinar «comprobante de pago» fue lo que confundía las cotizaciones)."""
+    visto = ""
+    if datos and not datos.get("error") and datos.get("tienda"):
+        visto = f" Alcancé a ver un documento de «{datos['tienda']}»."
+    pregunta = {"pregunta": "¿Qué es este archivo?", "opciones": [_OPC_COTIZ, _OPC_PAGO, _OPC_RECEP]}
+    supabase.table("mensajes").insert({
+        "stream_id": stream_id, "role": "assistant", "procesado": True, "metadata": {},
+        "content": (f"No pude identificar con certeza qué es «{nombre or 'el archivo'}» (no vi productos con precio, "
+                    f"ni un comprobante de pago claro, ni una guía).{visto}\n[OPCIONES]" + json.dumps(pregunta, ensure_ascii=False)),
+    }).execute()
+
+
+def _ultimo_archivo_stream(stream_id: str) -> dict:
+    """Metadata (file_url/file_name/file_mime) del archivo más reciente que el usuario subió a este stream."""
+    rows = (supabase.table("mensajes").select("metadata,created_at").eq("stream_id", stream_id).eq("role", "user")
+            .order("created_at", desc=True).limit(15).execute().data or [])
+    for r in rows:
+        md = r.get("metadata") or {}
+        if md.get("file_url"):
+            return md
+    return {}
+
+
+def _resolver_tipo_archivo(stream_id: str, eleccion: str) -> None:
+    """El usuario eligió qué es el último archivo subido: se procesa por ese flujo."""
+    md = _ultimo_archivo_stream(stream_id)
+    url, nombre, mime = md.get("file_url", ""), md.get("file_name", ""), md.get("file_mime", "")
+    if not url:
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant", "procesado": True, "metadata": {},
+            "content": "No encuentro el archivo al que te refieres. Súbelo de nuevo y lo reviso.",
+        }).execute()
+        return
+    if eleccion == _OPC_COTIZ:
+        if not _procesar_captura_compra(stream_id, url, nombre, mime, forzar=True):
+            supabase.table("mensajes").insert({
+                "stream_id": stream_id, "role": "assistant", "procesado": True, "metadata": {},
+                "content": "No pude leer ese archivo como cotización. Mándame una imagen más legible o el modelo y el costo a mano.",
+            }).execute()
+    elif eleccion == _OPC_PAGO:
+        _procesar_comprobante_pago(stream_id, url, nombre, mime)
+    else:
+        _procesar_evidencia_receiving(stream_id, "", url, nombre, mime)
+
+
 def _manejar_compras(msg: dict, stream_id: str, contenido: str, _md0: dict) -> bool:
     """Manejador determinista del stream 'compras' (Purchase Order). Siempre atiende."""
     _file_url  = _md0.get("file_url", "")
@@ -5805,16 +5885,27 @@ def _manejar_compras(msg: dict, stream_id: str, contenido: str, _md0: dict) -> b
                           bool(re.search(r'tracking|gu[ií]a|rastreo|n[uú]mero de env[ií]o', _low) or
                                re.search(r'\b[A-Z0-9]{8,30}\b', contenido or "")))
 
-    if _urls:
+    if not _file_url and not _urls and (contenido or "").strip() in (_OPC_COTIZ, _OPC_PAGO, _OPC_RECEP):
+        _resolver_tipo_archivo(stream_id, (contenido or "").strip())   # respuesta a «¿qué es este archivo?»
+    elif _urls:
         _procesar_link_proveedor(stream_id, _urls)
-    elif _file_url and _procesar_captura_compra(stream_id, _file_url, _file_name, _file_mime):
-        pass  # captura de compra en línea → ya emitió el cotejo contra Sales Orders
-    elif _file_url and re.search(r'paquete|lleg|recib|contenido|packing|confirmation|confirmaci[oó]n|order\s*conf|gu[ií]a|tracking|env[ií]o|recepci[oó]n|receiving', _low + " " + (_file_name or "").lower()):
-        _procesar_evidencia_receiving(stream_id, contenido, _file_url, _file_name, _file_mime)
     elif _file_url:
-        # Default para un archivo sin más contexto: comprobante de pago (el caso más común
-        # del transcript — "pagué algo, saco una foto").
-        _procesar_comprobante_pago(stream_id, _file_url, _file_name, _file_mime)
+        # Se identifica QUÉ ES el archivo con evidencia (una sola lectura con visión) y cada tipo va a su flujo:
+        #  · trae productos con precio (cotización, proforma, carrito…) → cotejo contra Sales Orders abiertas → PO
+        #  · comprobante de pago → pagos · guía / packing list / confirmación con compras en tránsito → recepción
+        # Antes, todo lo no reconocido caía a «comprobante de pago» por defecto: así se confundían las cotizaciones.
+        _datos = _leer_archivo_compras(_file_url, _file_name, _file_mime)
+        _tipo = _datos.get("tipo") if not _datos.get("error") else ""
+        if _procesar_captura_compra(stream_id, _file_url, _file_name, _file_mime, datos=_datos):
+            pass  # ya emitió el cotejo contra Sales Orders
+        elif _tipo == "comprobante_pago":
+            _procesar_comprobante_pago(stream_id, _file_url, _file_name, _file_mime)
+        elif _tipo in ("packing_tracking", "order_confirmation") or re.search(
+                r'paquete|lleg|recib|contenido|packing|confirmation|confirmaci[oó]n|order\s*conf|gu[ií]a|tracking|env[ií]o|recepci[oó]n|receiving',
+                _low + " " + (_file_name or "").lower()):
+            _procesar_evidencia_receiving(stream_id, contenido, _file_url, _file_name, _file_mime)
+        else:
+            _preguntar_tipo_archivo(stream_id, _datos, _file_name)   # no se adivina: se pregunta
     elif _es_estado:
         _procesar_estado_operativo(stream_id)
     elif _es_tracking_texto:

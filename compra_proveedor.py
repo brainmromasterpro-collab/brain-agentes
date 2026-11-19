@@ -295,6 +295,9 @@ _INSTR_CAPTURA = (
     "CON lista de productos y precios emitido por un proveedor NO es comprobante_pago: es cotizacion_proveedor); "
     "packing_tracking = packing list, guía o foto de paquete. Si hay varios productos, lista todos. "
     "El precio_unitario es por pieza (si solo ves el total de la línea, divídelo entre la cantidad). "
+    "Extrae los productos SIEMPRE que el documento los traiga, sea del tipo que sea (aunque no estés seguro del "
+    "tipo): una lista de productos con precios no es un comprobante de pago. El documento puede tener varias "
+    "páginas/imágenes: junta los productos de todas, uno por renglón, sin omitir ninguno. "
     "NO inventes: si algo no es legible usa \"\" o null."
 )
 
@@ -302,7 +305,9 @@ _INSTR_CAPTURA = (
 def leer_captura_compra(imagenes: list[bytes], model_id: str = "") -> dict:
     """Clasifica una captura/PDF del flujo de compras y, si es una compra en línea, extrae tienda,
     productos, cantidades y precios (visión de Claude)."""
-    datos = _leer_con_vision(imagenes, _INSTR_CAPTURA, model_id, max_tokens=1500)
+    # 4000 tokens: con 1500 una cotización de ~10 renglones se cortaba a media JSON, no se podía leer y el archivo
+    # caía al flujo de comprobante de pago.
+    datos = _leer_con_vision(imagenes, _INSTR_CAPTURA, model_id, max_tokens=4000)
     if datos.get("error"):
         return datos
     datos.setdefault("tipo", "otro")
