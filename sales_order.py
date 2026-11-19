@@ -921,7 +921,12 @@ def cotejar(po: dict, forzar_quote_id: str = "") -> dict:
                 mejor_q, mejor_ln, precio_ok = q, ln, ok
         if (mejor_q["id"], id(mejor_ln)) in extras:
             tipo_match, parcial = "precio", True
-        base = {"exacto": 6, "parcial": 4, "descripcion": 4, "similar": 0, "precio": 2}.get(tipo_match, 1)
+        # El cliente usó SU código interno (PIN.140242) pero el número de parte REAL de la cotización aparece
+        # literalmente en la descripción del PO y el precio coincide: eso ES coincidencia de parte y precio
+        # (pedido de Gabriel). Ya no se marca «Verificar»; el previo sigue mostrando «cotiz.: <parte real>».
+        if tipo_match == "descripcion" and precio_ok:
+            parcial = False
+        base = {"exacto": 6, "parcial": 4, "descripcion": 6 if precio_ok else 4, "similar": 0, "precio": 2}.get(tipo_match, 1)
         for (q, _ln) in candidatos:
             cobertura[q["id"]] = cobertura.get(q["id"], 0) + 1
             p_ok = _precio_coincide(po_precio, _ln["unit_price"])
@@ -946,7 +951,7 @@ def cotejar(po: dict, forzar_quote_id: str = "") -> dict:
             "cotizacion": {"id": mejor_q["id"], "nombre": mejor_q["nombre"]},
             "en_varias": len({q["id"] for q, _ in candidatos}) > 1,
         })
-        if tipo_match == "descripcion":
+        if tipo_match == "descripcion" and not precio_ok:
             discrepancias.append(
                 f"«{pn}» parece ser el código interno del cliente; el número real «{mejor_ln['part_number']}» "
                 f"aparece en la descripción (cot. {mejor_q['nombre'][:30]}) — confirma que es el mismo producto."
@@ -1011,13 +1016,20 @@ def cotejar(po: dict, forzar_quote_id: str = "") -> dict:
     # el usuario elige primero (ver cotejar(..., forzar_quote_id=...) para la segunda vuelta).
     candidata_citada = any(c["referenciada"] for c in candidatas)
     con_cobertura = [c for c in candidatas if c["items_cubiertos"] > 0]
-    ambiguo = (not candidata_citada) and len(con_cobertura) >= 1 and not todo_ok
+    # UNA sola cotización que cubre TODOS los renglones con parte (exacta, o el modelo real literal en la descripción)
+    # y precio coincidentes: es la respuesta; no hay nada que elegir aunque esté cerrada o vencida (eso solo advierte).
+    _n_it = len(items_out)
+    firmes = (_n_it > 0 and encontrados == _n_it
+              and all(i["estado"] == "ok" and not i.get("match_parcial") for i in items_out))
+    completas = [c for c in candidatas if c["items_cubiertos"] >= _n_it and c["items_precio_ok"] >= _n_it]
+    firme_unica = firmes and len(completas) == 1
+    ambiguo = (not candidata_citada) and len(con_cobertura) >= 1 and not todo_ok and not firme_unica
 
     # DRAFT de la Sales Order (para el PREVIO). Referencia = candidata top (citada o mayor cobertura).
     so_draft = None if ambiguo else _armar_draft(cuenta, tm, po, items_out, candidatas, quotes, para_nosotros)
-    if so_draft and forzar_quote_id:
-        # El usuario eligió esta cotización a mano: una cotización vencida/draft solo ADVIERTE, no bloquea
-        # (él decide; el previo y la confirmación siguen siendo obligatorios).
+    if so_draft and (forzar_quote_id or (firme_unica and so_draft.get("quote_id") == completas[0]["id"])):
+        # El usuario eligió esta cotización a mano (o es la única que coincide en parte y precio): una cotización
+        # vencida/draft solo ADVIERTE, no bloquea (él decide; el previo y la confirmación siguen siendo obligatorios).
         so_draft["puede_crear"] = para_nosotros is not False
         so_draft["aviso_vigencia"] = bool(so_draft.get("quote_vigente") is False)
 
@@ -1041,7 +1053,10 @@ def cotejar(po: dict, forzar_quote_id: str = "") -> dict:
         "resumen": (f"{encontrados}/{len(items_out)} productos ubicados en cotizaciones; "
                     f"{len(candidatas)} cotización(es) candidata(s); "
                     f"{len(discrepancias)} discrepancia(s)."
-                    + (" Ninguna cotización coincide exacto (parte y precio) — elige cuál es, ordenadas de mayor a menor coincidencia." if ambiguo else "")),
+                    + (" Hay más de una cotización posible y ninguna es claramente la única que coincide en parte y precio "
+                       "— elige cuál es, ordenadas de mayor a menor coincidencia." if ambiguo else "")
+                    + (" Coincide en parte y precio con una sola cotización (revisa su vigencia en el previo)."
+                       if (firme_unica and not todo_ok) else "")),
     }
 
 
