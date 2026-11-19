@@ -1,10 +1,10 @@
-"""Una cotización/proforma de proveedor subida al stream de compras entra al cotejo contra Sales Orders abiertas (y de ahí al
-PO para ese proveedor), en vez de tomarse por comprobante de pago (caso real: «Revised PI.pdf», ELECTRAPOTHIKI, 1,335 EUR)."""
+"""Archivos del stream de compras: se identifican por EVIDENCIA y, si no hay, se PREGUNTA (nunca un default silencioso).
+Casos reales: «Revised PI.pdf» (proforma de ELECTRAPOTHIKI → debe ir a cotejo con SO, no a pago) y un pedido de eBay (tornillos
+Kmac, sin coincidencia con ningún PO ni SO → debe preguntar, no abrir «tracking» con POs al azar)."""
 import agente_chat as ac
 import compra_proveedor as cp
 import sales_order as so
 
-# ── 1) Enrutamiento: tipo cotizacion_proveedor → [COTEJO_PROVEEDOR] ──────────────────────────────
 INSERTS = []
 
 
@@ -25,68 +25,111 @@ class _SB:
 ac.supabase = _SB()
 ac._bajar_imagenes = lambda *a, **k: [b"img"]
 ac._log_stream = lambda *a, **k: None
-DATOS = {"tipo": "cotizacion_proveedor", "tienda": "ELECTRAPOTHIKI S.A.", "orden_numero": "PO2026-0828-235", "moneda": "EUR",
-         "total": 1335.0, "terminos_pago": "100% in advance (T/T in advance)",
-         "items": [{"nombre": "Servo Motor 2kW", "marca": "", "part_number": "CSMD-20BT3ATT3", "cantidad": 1, "precio_unitario": 1335.0}]}
-cp.leer_captura_compra = lambda imgs, model_id="": dict(DATOS)
+
+ITEM_PI = {"nombre": "Servo Motor 2kW", "marca": "", "part_number": "CSMD-20BT3ATT3", "cantidad": 1, "precio_unitario": 1335.0}
+ITEMS2 = [{"nombre": "Sensor A", "part_number": "AAA-111", "cantidad": 2, "precio_unitario": 10.0},
+          {"nombre": "Sensor B", "part_number": "BBB-222", "cantidad": 1, "precio_unitario": 20.0}]
+KMAC = {"nombre": "Kmac Alloy Steel Set Screws, Brass Tip, 5/16-18 x 1/2 Thread Length, 20 Pcs", "part_number": "111730686870",
+        "cantidad": 4, "precio_unitario": 20.0}
+
+POS = []          # POs en tránsito (con sus líneas)
+GRUPOS = []       # resultado del cotejo contra SO abiertas
+cp.pos_esperando_recepcion = lambda *a, **k: list(POS)
+cp.buscar_sales_orders_candidatas = lambda links: {"ok": True, "grupos": list(GRUPOS), "sin_match": [], "resumen": "ok"}
+
+
+def destino(tipo, items, tienda="Acme", **extra):
+    return ac._destino_archivo_compras({"tipo": tipo, "tienda": tienda, "items": items, **extra})
+
+
+# ── 1) Cada tipo a su flujo ──────────────────────────────────────────────────────────────────────
+assert destino("cotizacion_proveedor", [ITEM_PI])[0] == "cotejo", "la proforma va a cotejo (caso real Revised PI.pdf)"
+assert destino("compra_online", ITEMS2)[0] == "cotejo"
+assert destino("comprobante_pago", [])[0] == "pago"
+assert destino("packing_tracking", [])[0] == "recepcion"
+assert ac._destino_archivo_compras({"error": "x"}) == ("preguntar", {"motivo": "sin_evidencia"})
+assert destino("otro", []) == ("preguntar", {"motivo": "sin_evidencia"}), "lo dudoso y sin productos se pregunta"
+
+# otro con productos+precio y coincidencia en una SO → cotejo; con 2 productos se mandan los 2 al cotejo
+GRUPOS[:] = [{"so_numero": "309", "ya_comprado": None}]
+assert destino("otro", ITEMS2)[0] == "cotejo"
+
+# ── 2) Caso de hoy: pedido de eBay (order_confirmation) sin coincidencia con ningún PO ni SO → PREGUNTA ─────
+GRUPOS[:] = []
+POS[:] = [{"id": "PO1", "nombre": "CSMD — Compra", "lineas": [{"name": "Servo Motor 2kW, 220VAC", "mfr_part_no": "CSMD-20BT3ATT3"}]},
+          {"id": "PO2", "nombre": "TEST BRAIN MOCK", "lineas": [{"name": "1N4001 Rectifier Diode", "mfr_part_no": "1N4001"}]}]
+d, info = destino("order_confirmation", [KMAC], tienda="eBay")
+assert d == "preguntar" and info["motivo"] == "ninguno", (d, info)
+
+# ── 3) Coincide con un PO en tránsito (y sus SO ya tienen compra) → recepción ──────────────────────────
+POS[:] = [{"id": "PO1", "nombre": "x", "lineas": [{"name": "Kmac Alloy Steel Set Screws, Brass Tip, 5/16-18 x 1/2 Thread Length, 20 Pcs",
+                                                    "mfr_part_no": ""}]}]
+GRUPOS[:] = [{"so_numero": "300", "ya_comprado": {"id": "PO1"}}]
+assert destino("order_confirmation", [KMAC], tienda="eBay")[0] == "recepcion"
+# ... pero si además hay una venta sin comprar con ese producto → hay dos lecturas posibles → pregunta
+GRUPOS[:] = [{"so_numero": "300", "ya_comprado": {"id": "PO1"}}, {"so_numero": "311", "ya_comprado": None}]
+d, info = destino("order_confirmation", [KMAC], tienda="eBay")
+assert d == "preguntar" and info["motivo"] == "ambos", (d, info)
+# una confirmación que coincide con una SO sin compra y con ningún PO → cotejo para crear el PO
+POS[:] = []
+GRUPOS[:] = [{"so_numero": "311", "ya_comprado": None}]
+assert destino("order_confirmation", [KMAC], tienda="eBay")[0] == "cotejo"
+
+# ── 4) El widget de cotejo se emite con proveedor, moneda, términos y todos los productos ────────────────
 VISTO = {}
 cp.buscar_sales_orders_candidatas = lambda links: VISTO.setdefault("links", links) and {"ok": True, "grupos": [], "resumen": "ok"}
-
-assert ac._procesar_captura_compra("S1", "http://x/pi.pdf", "Revised PI.pdf", "application/pdf") is True
-assert INSERTS and INSERTS[-1]["content"].startswith("[COTEJO_PROVEEDOR]"), INSERTS
+DATOS = {"tipo": "cotizacion_proveedor", "tienda": "ELECTRAPOTHIKI S.A.", "orden_numero": "PO2026-0828-235", "moneda": "EUR",
+         "total": 1335.0, "terminos_pago": "100% in advance (T/T in advance)", "items": [ITEM_PI]}
+assert ac._procesar_captura_compra("S1", "http://x/pi.pdf", "Revised PI.pdf", "application/pdf", datos=DATOS) is True
+assert INSERTS[-1]["content"].startswith("[COTEJO_PROVEEDOR]")
 l0 = VISTO["links"][0]
 assert l0["proveedor"] == "ELECTRAPOTHIKI S.A." and l0["part_number"] == "CSMD-20BT3ATT3" and l0["moneda"] == "EUR", l0
 assert l0["terminos_documento"] == "100% in advance (T/T in advance)", l0
-
-# un comprobante de pago sigue yendo a su flujo (el cotejo de compras NO lo atiende)
+VISTO.clear()
+assert ac._procesar_captura_compra("S1", "u", "x.pdf", "application/pdf", datos={"tipo": "otro", "tienda": "Acme", "moneda": "USD", "items": ITEMS2}) is True
+assert len(VISTO["links"]) == 2, "con 2 productos se cotejan los 2"
 INSERTS.clear()
-cp.leer_captura_compra = lambda imgs, model_id="": {"tipo": "comprobante_pago", "items": []}
-assert ac._procesar_captura_compra("S1", "http://x/c.pdf", "c.pdf", "application/pdf") is False and not INSERTS
+assert ac._procesar_captura_compra("S1", "u", "x.pdf", "application/pdf", datos={"tipo": "otro", "items": []}) is True
+assert "No encontré productos" in INSERTS[-1]["content"]
 
-# ── 1b) Se identifica por EVIDENCIA, no por el tipo que diga el lector ───────────────────────────
-ITEMS2 = [{"nombre": "Sensor A", "part_number": "AAA-111", "cantidad": 2, "precio_unitario": 10.0},
-          {"nombre": "Sensor B", "part_number": "BBB-222", "cantidad": 1, "precio_unitario": 20.0}]
-# lector dudoso («otro») pero con productos y precios → es algo que se compra → cotejo (con 2 productos)
-INSERTS.clear(); VISTO.clear()
-cp.leer_captura_compra = lambda imgs, model_id="": {"tipo": "otro", "tienda": "Acme", "moneda": "USD", "items": ITEMS2}
-assert ac._procesar_captura_compra("S1", "u", "x.pdf", "application/pdf") is True and len(VISTO["links"]) == 2, VISTO
-# «otro» sin productos → no lo atiende (el router pregunta)
-cp.leer_captura_compra = lambda imgs, model_id="": {"tipo": "otro", "items": []}
-assert ac._procesar_captura_compra("S1", "u", "x.pdf", "application/pdf") is False
-# packing/tracking nunca se toma por compra aunque traiga renglones
-cp.leer_captura_compra = lambda imgs, model_id="": {"tipo": "packing_tracking", "items": ITEMS2}
-assert ac._procesar_captura_compra("S1", "u", "x.pdf", "application/pdf") is False
-# el usuario dijo «es una cotización» → se procesa aunque el lector dudara; sin productos avisa y no se queda callado
-cp.leer_captura_compra = lambda imgs, model_id="": {"tipo": "otro", "items": ITEMS2}
-VISTO.clear(); assert ac._procesar_captura_compra("S1", "u", "x.pdf", "application/pdf", forzar=True) is True and VISTO.get("links")
-INSERTS.clear()
-cp.leer_captura_compra = lambda imgs, model_id="": {"tipo": "otro", "items": []}
-assert ac._procesar_captura_compra("S1", "u", "x.pdf", "application/pdf", forzar=True) is True and "no encontré productos" in INSERTS[-1]["content"]
-
-# Router del stream de compras: cada tipo a su flujo; lo dudoso se pregunta (ya NO cae a «comprobante de pago»)
+# ── 5) Router del stream: cada destino llama a su flujo; lo dudoso pregunta y NO cae a pago ─────────────
+_REAL_PREGUNTAR = ac._preguntar_tipo_archivo
 LLAMADAS = []
 for nombre_fn in ("_procesar_comprobante_pago", "_procesar_evidencia_receiving", "_preguntar_tipo_archivo", "_procesar_link_proveedor"):
     setattr(ac, nombre_fn, (lambda n: (lambda *a, **k: LLAMADAS.append(n)))(nombre_fn))
 
 
-def enviar(tipo_lector, contenido="Archivo subido: doc.pdf", archivo=True, items=None):
+def enviar(destino_fijo, contenido="Archivo subido: doc.pdf", archivo=True):
     LLAMADAS.clear()
-    ac._leer_archivo_compras = lambda *a, **k: ({"error": "x"} if tipo_lector == "error" else {"tipo": tipo_lector, "items": items or []})
+    ac._leer_archivo_compras = lambda *a, **k: {"tipo": "x", "items": []}
+    ac._destino_archivo_compras = lambda datos: (destino_fijo, {"motivo": "ninguno"} if destino_fijo == "preguntar" else None)
     md = {"file_url": "http://x/doc.pdf", "file_name": "doc.pdf", "file_mime": "application/pdf"} if archivo else {}
     ac._manejar_compras({}, "S1", contenido, md)
     return list(LLAMADAS)
 
 
-assert enviar("comprobante_pago") == ["_procesar_comprobante_pago"]
-assert enviar("packing_tracking") == ["_procesar_evidencia_receiving"]
-assert enviar("otro") == ["_preguntar_tipo_archivo"], "lo dudoso se pregunta, no se asume pago"
-assert enviar("error") == ["_preguntar_tipo_archivo"]
-INSERTS.clear()
-assert enviar("otro", items=ITEMS2) == [] and INSERTS[-1]["content"].startswith("[COTEJO_PROVEEDOR]"), "con productos y precios → cotejo, sin pago/recepción/pregunta"
+assert enviar("pago") == ["_procesar_comprobante_pago"]
+assert enviar("recepcion") == ["_procesar_evidencia_receiving"]
+assert enviar("preguntar") == ["_preguntar_tipo_archivo"], "lo dudoso se pregunta, no se asume pago"
 # respuesta del botón → usa el último archivo subido
 ac._ultimo_archivo_stream = lambda sid: {"file_url": "http://x/doc.pdf", "file_name": "doc.pdf", "file_mime": "application/pdf"}
 assert enviar(None, contenido=ac._OPC_PAGO, archivo=False) == ["_procesar_comprobante_pago"]
 assert enviar(None, contenido=ac._OPC_RECEP, archivo=False) == ["_procesar_evidencia_receiving"]
+INSERTS.clear()
+ac._leer_archivo_compras = lambda *a, **k: dict(DATOS)
+LLAMADAS.clear(); ac._manejar_compras({}, "S1", ac._OPC_COTIZ, {})
+assert INSERTS and INSERTS[-1]["content"].startswith("[COTEJO_PROVEEDOR]") and not LLAMADAS, "«es una compra» → cotejo del último archivo"
+
+# la pregunta lleva botones y dice por qué
+import json as _j
+INSERTS.clear()
+_REAL_PREGUNTAR("S1", {"tipo": "order_confirmation", "tienda": "eBay", "items": [KMAC]}, "image.png", "ninguno")
+c = INSERTS[-1]["content"]
+assert "ninguna Sales Order abierta" in c and "1 producto(s)" in c, c
+assert set(_j.loads(c.split("[OPCIONES]")[1])["opciones"]) == {ac._OPC_COTIZ, ac._OPC_RECEP, ac._OPC_PAGO}, c
+INSERTS.clear()
+_REAL_PREGUNTAR("S1", None, "doc.pdf", "ambos")
+assert "ya está en tránsito" in INSERTS[-1]["content"] and "[OPCIONES]" in INSERTS[-1]["content"]
 
 # ── 2) Términos del documento al crear el PO ─────────────────────────────────────────────────────
 REG = {}
