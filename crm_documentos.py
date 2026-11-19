@@ -151,6 +151,25 @@ def _ligar(doc_id: str, parent_type: str, parent_id: str) -> None:
         raise RuntimeError(f"no se pudo ligar el documento a {parent_type}: {r.status_code} {r.text[:160]}")
 
 
+def referenciar_en_so(so_id: str, doc_id: str) -> dict:
+    """Llena el campo «SalesOrder» de la Sales Order (campo personalizado OBLIGATORIO, relate a Documentos:
+    `SalesOrder_id`) con el PO del cliente, además de ligar el documento por parent_type/parent_id. Verifica releyendo.
+    Devuelve {ok, error?}."""
+    base = _cfg()[0]
+    try:
+        r = httpx.patch(f"{base}/api.php/data/SalesOrder/{so_id}", json={"data": {"SalesOrder_id": doc_id}},
+                        auth=_crm_auth(), timeout=40)
+        if r.status_code >= 300:
+            return {"ok": False, "error": f"{r.status_code} {r.text[:160]}"}
+        s = httpx.get(f"{base}/api.php/data/SalesOrder/{so_id}", auth=_crm_auth(), timeout=40).json()
+        s = s.get("record", s)
+        if s.get("SalesOrder_id") != doc_id:
+            return {"ok": False, "error": f"1CRM no guardó el campo (quedó {s.get('SalesOrder_id')!r})"}
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:200]}
+
+
 def _verificar(doc_id: str, parent_type: str, parent_id: str) -> dict:
     """Verifica en 1CRM que el Documento quedó con ARCHIVO real y con la relación puesta (no se da por hecho)."""
     base = _cfg()[0]
@@ -202,7 +221,10 @@ def guardar_documento(*, tipo: str, file_url: str = "", contenido: bytes | None 
         dup = _buscar_duplicado(nombre, parent_id)
         if dup:
             log.info(f"Documento ya existía ({nombre}) → {dup}")
-            return {"ok": True, "doc_id": dup, "nombre": nombre, "url": url_documento(dup), "duplicado": True}
+            res_dup = {"ok": True, "doc_id": dup, "nombre": nombre, "url": url_documento(dup), "duplicado": True}
+            if tipo == "orden_compra_cliente" and parent_type == "SalesOrders":
+                res_dup["campo_so"] = referenciar_en_so(parent_id, dup)
+            return res_dup
 
         desc = f"{etiqueta}. Ligado a {PARENT_LABEL.get(parent_type, parent_type)}" + (f" {referencia}" if referencia else "") + "."
         if detalle:
@@ -215,7 +237,15 @@ def guardar_documento(*, tipo: str, file_url: str = "", contenido: bytes | None 
             return {"ok": False, "doc_id": doc_id, "nombre": nombre, "url": url_documento(doc_id),
                     "error": f"el documento se creó pero no quedó completo en 1CRM (archivo={v['archivo']!r}, relación={v['relacion']})"}
         log.info(f"Documento guardado en 1CRM: {nombre} → {parent_type}/{parent_id} ({doc_id})")
-        return {"ok": True, "doc_id": doc_id, "nombre": nombre, "url": url_documento(doc_id), "archivo": v["archivo"]}
+        res = {"ok": True, "doc_id": doc_id, "nombre": nombre, "url": url_documento(doc_id), "archivo": v["archivo"]}
+        if tipo == "orden_compra_cliente" and parent_type == "SalesOrders":
+            # El PO del cliente también va en el campo «SalesOrder» de la SO (obligatorio en su pantalla de edición).
+            res["campo_so"] = referenciar_en_so(parent_id, doc_id)
+            if not res["campo_so"]["ok"]:
+                res["ok"] = False
+                res["error"] = ("el documento quedó guardado y ligado, pero no pude llenar el campo «SalesOrder» de la SO: "
+                                + res["campo_so"].get("error", ""))
+        return res
     except Exception as e:
         log.warning(f"guardar_documento falló ({tipo}): {e}")
         return {"ok": False, "error": str(e)[:300]}
