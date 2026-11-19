@@ -4533,12 +4533,13 @@ def _procesar_captura_compra(stream_id: str, file_url: str, nombre: str = "", mi
                 return False
         except Exception:
             return False
-    elif tipo != "compra_online":
+    elif tipo not in ("compra_online", "cotizacion_proveedor"):
         return False
     links = compra_proveedor.captura_a_links(datos)
     if not links:
         return False
-    _log_stream(stream_id, f"Captura de compra en {datos.get('tienda') or 'tienda en línea'}: "
+    _que = "Cotización/proforma de" if tipo == "cotizacion_proveedor" else "Captura de compra en"
+    _log_stream(stream_id, f"{_que} {datos.get('tienda') or 'proveedor'}: "
                            f"{len(links)} producto(s). Buscando Sales Orders…", "info")
     cotejo = compra_proveedor.buscar_sales_orders_candidatas(links)
     supabase.table("mensajes").insert({

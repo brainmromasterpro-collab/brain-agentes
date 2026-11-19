@@ -30,6 +30,7 @@ import os
 import re
 import logging
 import datetime
+import difflib
 from urllib.parse import urlparse
 
 import sales_order  # reusa _crm_get/_crm_post/_crm_delete, _compact, _norm, _num, _match_item
@@ -143,6 +144,54 @@ def _terminos_proveedor(nombre: str) -> str:
     return ""
 
 
+_PALABRAS_LEGALES = {"SA", "S", "A", "DE", "CV", "RL", "SAPI", "LLC", "INC", "LTD", "GMBH", "CO", "CORP", "AG", "BV", "SRL",
+                     "SPA", "OF", "THE", "AND", "ET", "OE", "EE", "AE", "LIMITED", "CORPORATION", "COMPANY"}
+
+
+def _clave_proveedor(nombre: str) -> str:
+    """Forma comparable de un nombre de proveedor: sin acentos ni sufijos legales y con la transliteración más común
+    (C→K, PH→F, Y→I) — el mismo proveedor aparece como «ELECTRAPOTHIKI S.A.» en su documento y «ELEKTRAPOTHEKA OF
+    THESSALONIKI» en el CRM."""
+    n = sales_order._norm(nombre or "").upper()
+    palabras = [w for w in re.findall(r"[A-Z0-9]+", n) if w not in _PALABRAS_LEGALES]
+    k = "".join(palabras).replace("PH", "F").replace("C", "K").replace("Y", "I")
+    return k
+
+
+def proveedor_en_crm(nombre: str) -> str:
+    """Nombre EXACTO de la cuenta Supplier del CRM que corresponde a `nombre` (el que leyó la visión o el que trae un
+    link): coincidencia exacta, o muy parecida (≥0.85 y claramente la mejor, con ≥8 letras). '' si no hay. Solo
+    lectura; el resultado se muestra en el previo y el usuario puede cambiarlo."""
+    nombre = (nombre or "").strip()
+    if not nombre:
+        return ""
+    n_exacto = sales_order._norm(nombre)
+    clave = _clave_proveedor(nombre)
+    puntajes = []
+    try:
+        offset = 0
+        while offset < 1000:
+            page = sales_order._crm_get("data/Account", {"filters[account_type]": "Supplier", "limit": 100, "offset": offset}).get("records", [])
+            for r in page:
+                nom = r.get("name", "")
+                if not nom:
+                    continue
+                if sales_order._norm(nom) == n_exacto:
+                    return nom
+                if len(clave) >= 8:
+                    puntajes.append((difflib.SequenceMatcher(None, clave, _clave_proveedor(nom)).ratio(), nom))
+            if len(page) < 100:
+                break
+            offset += 100
+    except Exception as e:
+        log.warning(f"proveedor_en_crm({nombre!r}): {e}")
+        return ""
+    puntajes.sort(reverse=True)
+    if puntajes and puntajes[0][0] >= 0.85 and (len(puntajes) == 1 or puntajes[0][0] - puntajes[1][0] >= 0.05):
+        return puntajes[0][1]
+    return ""
+
+
 _MONEDAS_NOMBRE = {"USD": "US Dollar", "MXN": "Mexican Peso", "EUR": "Euro", "CAD": "Canadian Dollar",
                    "GBP": "UK Pound", "CNY": "Chinese Yuan Renminbi", "JPY": "Japanese Yen"}
 _monedas_cache: dict = {}
@@ -229,16 +278,21 @@ def _mapa_ya_comprado(limite: int = 30) -> dict:
 _INSTR_CAPTURA = (
     "Clasifica esta imagen del flujo de compras de una empresa y extrae datos. Devuelve SOLO un JSON "
     "(sin ``` ni explicaciones) con el esquema exacto:\n"
-    '{"tipo": "compra_online"|"order_confirmation"|"comprobante_pago"|"packing_tracking"|"otro", '
-    '"tienda": "nombre de la tienda/vendedor a quien se le compra (eBay, Amazon, Mercado Libre, '
-    'Grainger, etc.) o \"\"", '
+    '{"tipo": "compra_online"|"cotizacion_proveedor"|"order_confirmation"|"comprobante_pago"|"packing_tracking"|"otro", '
+    '"tienda": "nombre de la tienda/vendedor/proveedor que EMITE el documento y a quien se le compra (eBay, '
+    'Amazon, Mercado Libre, Grainger, un distribuidor, etc.) o \"\" — NUNCA el cliente/destinatario del documento", '
+    '"terminos_pago": "condiciones de pago que indique el documento (ej. 100% in advance) o \"\"", '
     '"orden_numero": "número de pedido si aparece o \"\"", "moneda": "USD"|"MXN"|"EUR"|"", '
     '"total": number o null, "envio": number o null, '
     '"items": [{"nombre": "título del producto tal cual", "marca": "", "part_number": "modelo/SKU/MPN '
     'si aparece, o \"\"", "cantidad": number, "precio_unitario": number o null}]}\n'
     "Definiciones: compra_online = carrito, checkout, resumen de pedido o página de pago de una TIENDA "
-    "EN LÍNEA con productos y precios (aunque aún no se pague); order_confirmation = correo/página de "
-    "pedido ya confirmado; comprobante_pago = recibo/transferencia bancaria sin lista de productos; "
+    "EN LÍNEA con productos y precios (aunque aún no se pague); cotizacion_proveedor = cotización, proforma "
+    "invoice (PI), factura proforma, pedido/orden de venta o factura que un PROVEEDOR le emite a nuestra empresa "
+    "(MRO / MRO Master Pro / MRO Online 4U) con productos, cantidades y precios que aún hay que comprar o pagar "
+    "(en cualquier idioma); order_confirmation = correo/página de "
+    "pedido ya confirmado; comprobante_pago = recibo/transferencia bancaria sin lista de productos (un documento "
+    "CON lista de productos y precios emitido por un proveedor NO es comprobante_pago: es cotizacion_proveedor); "
     "packing_tracking = packing list, guía o foto de paquete. Si hay varios productos, lista todos. "
     "El precio_unitario es por pieza (si solo ves el total de la línea, divídelo entre la cantidad). "
     "NO inventes: si algo no es legible usa \"\" o null."
@@ -271,6 +325,7 @@ def captura_a_links(datos: dict) -> list[dict]:
             "moneda": (datos.get("moneda") or "").upper(),
             "descripcion": "", "cantidad": sales_order._num(it.get("cantidad")) or 1,
             "proveedor": (datos.get("tienda") or "").strip(),
+            "terminos_documento": (datos.get("terminos_pago") or "").strip(),   # lo que dice el documento del proveedor
             "origen": "captura",
         })
     return out
@@ -404,8 +459,17 @@ def buscar_sales_orders_candidatas(links_data: list[dict]) -> dict:
         proveedor_sugerido = (links[0].get("proveedor") or _proveedor_de_url(links[0].get("url", ""))) if links else ""
         cods = {(l.get("moneda") or "").upper() for l in links if l.get("moneda")}
         moneda_po = _monedas_crm().get(next(iter(cods))) if len(cods) == 1 else None
+        proveedor_leido = proveedor_sugerido
+        # El proveedor puede estar en el CRM con otro nombre (el documento dice «ELECTRAPOTHIKI S.A.», la cuenta se
+        # llama «ELEKTRAPOTHEKA OF THESSALONIKI»): se propone la cuenta existente (se ve en el previo, editable).
+        proveedor_sugerido = proveedor_en_crm(proveedor_sugerido) or proveedor_sugerido
         terminos_prov = _terminos_proveedor(proveedor_sugerido)
         terminos_g = terminos_prov
+        terminos_doc = sales_order.terminos_so(links[0].get("terminos_documento", "")) if links else ""
+        # Proveedor sin términos en 1CRM (o que aún no existe) pero el documento que mandó (cotización/proforma) los
+        # trae: se proponen esos, y se ven en el previo marcados como «del documento».
+        if not terminos_g and terminos_doc:
+            terminos_g = terminos_doc
         lineas_sugeridas = [{
             "name": l.get("nombre") or l.get("descripcion_so") or "Producto",
             "mfr_part_no": l.get("part_number") or l.get("part_number_so") or _modelo_en_titulo(l),
@@ -426,7 +490,10 @@ def buscar_sales_orders_candidatas(links_data: list[dict]) -> dict:
             "moneda_so_id": detalle["currency_id"],
             "monedas_opciones": list(_monedas_crm().values()),
             "terminos_pago": terminos_g,
-            "terminos_origen": "proveedor",
+            "terminos_origen": "proveedor" if terminos_prov else ("documento" if terminos_doc else "proveedor"),
+            "terminos_documento": terminos_doc,
+            "proveedor_documento": proveedor_sugerido,
+            "proveedor_leido": proveedor_leido if proveedor_leido != proveedor_sugerido else "",   # lo que decía el documento, si difiere
             "tax_code_id": detalle["tax_code_id"],
             # Condiciones de pago es un campo OBLIGATORIO en 1CRM (pedido explícito de Gabriel:
             # nunca crear el PO en silencio sin esto) — se avisa aquí para que el usuario lo
@@ -553,6 +620,12 @@ def crear_po_y_ap(draft: dict) -> dict:
     # con el PROVEEDOR: si él tiene términos, esos mandan (el usuario pudo cambiar el proveedor en
     # el widget). Los del cliente de la SO NO se usan. Solo se exige cuando hay SO de por medio.
     terminos = _terminos_proveedor(draft.get("proveedor_nombre", ""))
+    if not terminos:
+        # Sin términos en 1CRM: valen los que trae el documento del proveedor (cotización/proforma), pero solo si el
+        # proveedor del PO sigue siendo el del documento (si el usuario lo cambió en el widget, no se arrastran).
+        td = sales_order.terminos_so(draft.get("terminos_documento", ""))
+        if td and sales_order._norm(draft.get("proveedor_nombre", "")) == sales_order._norm(draft.get("proveedor_documento", "")):
+            terminos = td
     draft = {**draft, "terminos_pago": terminos}
     if draft.get("so_id") and not terminos:
         return {"error": f"El proveedor «{draft.get('proveedor_nombre','')}» no tiene Condiciones de pago "
