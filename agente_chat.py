@@ -4708,10 +4708,15 @@ def _pagado_previo_map() -> dict:
     return acumulado
 
 
-def _procesar_comprobante_pago(stream_id: str, file_url: str, nombre: str = "", mime: str = "") -> None:
-    """Lee el comprobante subido y lo coteja contra las Bills/Invoices abiertas por monto (saldo
+_OPC_ES_PAGO = "Sí, es un comprobante de pago"
+_OPC_NO_PAGO = "No, no es un pago"
+
+
+def _procesar_comprobante_pago(stream_id: str, file_url: str, nombre: str = "", mime: str = "", forzar: bool = False) -> None:
+    """Lee el comprobante subido y lo coteja contra las Bills/Invoices abiertas por monto Y moneda (saldo
     ya ajustado por pagos previos registrados en cualquier stream). Emite [COTEJO_PAGO]. NO
-    escribe al CRM."""
+    escribe al CRM. Si la lectura dice que el archivo NO es evidencia de un pago (pedido, carrito, cotización…) y el usuario
+    no lo afirmó (`forzar`), pregunta en vez de cotejar."""
     import pagos
     _log_stream(stream_id, "Leyendo comprobante de pago…", "info")
     try:
@@ -4731,6 +4736,23 @@ def _procesar_comprobante_pago(stream_id: str, file_url: str, nombre: str = "", 
             "content": f"No pude leer el comprobante: {comprobante['error']}",
             "procesado": True, "metadata": {},
         }).execute()
+        return
+    if comprobante.get("es_pago") is False and not forzar:
+        _log_stream(stream_id, f"«{nombre}» no parece un comprobante de pago: {comprobante.get('notas', '')}", "info")
+        try:
+            _tipo_stream, _ = _resolver_tipo_stream(stream_id)
+        except Exception:
+            _tipo_stream = ""
+        if _tipo_stream == "compras":
+            _preguntar_tipo_archivo(stream_id, comprobante, nombre, "no_pago")
+        else:
+            supabase.table("mensajes").insert({
+                "stream_id": stream_id, "role": "assistant", "procesado": True, "metadata": {},
+                "content": (f"«{nombre or 'El archivo'}» no parece un comprobante de pago"
+                            + (f" ({comprobante['notas']})" if comprobante.get("notas") else "") + ".\n[OPCIONES]"
+                            + json.dumps({"pregunta": "¿Lo trato como comprobante de pago?",
+                                          "opciones": [_OPC_ES_PAGO, _OPC_NO_PAGO]}, ensure_ascii=False)),
+            }).execute()
         return
     comprobante["archivo_url"] = file_url      # viaja con el comprobante hasta que se confirme el pago
     comprobante["archivo_nombre"] = nombre
@@ -5816,6 +5838,9 @@ def _preguntar_tipo_archivo(stream_id: str, datos: dict | None = None, nombre: s
                  f"todavía no tiene compra.{visto}")
     elif motivo == "ninguno":
         texto = (f"{nom}: los productos no coinciden con ningún PO en tránsito ni con ninguna Sales Order abierta.{visto}")
+    elif motivo == "no_pago":
+        texto = (f"{nom} se leyó como comprobante de pago, pero la lectura dice que no demuestra un pago"
+                 + (f" ({datos['notas']})" if datos and datos.get("notas") else "") + ".")
     else:
         texto = f"No pude identificar con certeza qué es {nom} (no vi productos con precio, ni un comprobante de pago, ni una guía).{visto}"
     pregunta = {"pregunta": "¿Qué es este archivo?", "opciones": [_OPC_COTIZ, _OPC_RECEP, _OPC_PAGO]}
@@ -5853,7 +5878,7 @@ def _resolver_tipo_archivo(stream_id: str, eleccion: str) -> None:
                 "content": "No pude leer ese archivo como cotización. Mándame una imagen más legible o el modelo y el costo a mano.",
             }).execute()
     elif eleccion == _OPC_PAGO:
-        _procesar_comprobante_pago(stream_id, url, nombre, mime)
+        _procesar_comprobante_pago(stream_id, url, nombre, mime, forzar=True)   # el usuario dijo que es un pago
     else:
         _procesar_evidencia_receiving(stream_id, "", url, nombre, mime)
 
@@ -5980,7 +6005,21 @@ def _manejar_pagos(msg: dict, stream_id: str, contenido: str, _md0: dict) -> boo
             "procesado": True, "metadata": {},
         }).execute()
         return True
-    if _file_url:
+    if not _file_url and (contenido or "").strip() == _OPC_ES_PAGO:
+        _md = _ultimo_archivo_stream(stream_id)
+        if _md.get("file_url"):
+            _procesar_comprobante_pago(stream_id, _md["file_url"], _md.get("file_name", ""), _md.get("file_mime", ""), forzar=True)
+        else:
+            supabase.table("mensajes").insert({
+                "stream_id": stream_id, "role": "assistant", "procesado": True, "metadata": {},
+                "content": "No encuentro el archivo al que te refieres. Súbelo de nuevo y lo reviso.",
+            }).execute()
+    elif not _file_url and (contenido or "").strip() == _OPC_NO_PAGO:
+        supabase.table("mensajes").insert({
+            "stream_id": stream_id, "role": "assistant", "procesado": True, "metadata": {},
+            "content": "Entendido, no hice nada con ese archivo.",
+        }).execute()
+    elif _file_url:
         _procesar_comprobante_pago(stream_id, _file_url, _file_name, _file_mime)
     else:
         supabase.table("mensajes").insert({

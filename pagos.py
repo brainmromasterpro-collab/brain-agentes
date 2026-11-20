@@ -36,6 +36,17 @@ log = logging.getLogger("pagos")
 CRM_BASE = sales_order.CRM_BASE
 
 
+def codigo_moneda(currency_id: str) -> str:
+    """Código ISO ('MXN', 'USD', 'EUR'…) de un currency_id de 1CRM; '' si no se conoce."""
+    try:
+        for codigo, m in compra_proveedor._monedas_crm().items():
+            if m.get("id") == currency_id:
+                return codigo
+    except Exception as e:
+        log.warning(f"codigo_moneda({currency_id}): {e}")
+    return ""
+
+
 # ─────────────────────────────────────────────────────────────
 # 1. CUENTAS ABIERTAS (Bill + Invoice combinadas)
 # ─────────────────────────────────────────────────────────────
@@ -57,7 +68,7 @@ def bills_abiertas(limite: int = 40) -> list[dict]:
         out.append({
             "id": bid, "tipo": "bill", "direccion": "outgoing",
             "nombre": rec.get("name", ""),
-            "amount_due": due, "currency_id": rec.get("currency_id", ""),
+            "amount_due": due, "currency_id": rec.get("currency_id", ""), "moneda": codigo_moneda(rec.get("currency_id", "")),
             "cuenta": (cuenta or {}).get("nombre", ""), "cuenta_id": rec.get("supplier_id", ""),
             "url": f"{CRM_BASE}/index.php?module=Bills&action=DetailView&record={bid}",
         })
@@ -84,7 +95,7 @@ def invoices_abiertas(limite: int = 40) -> list[dict]:
         out.append({
             "id": iid, "tipo": "invoice", "direccion": "incoming",
             "nombre": rec.get("name", ""),
-            "amount_due": due, "currency_id": rec.get("currency_id", ""),
+            "amount_due": due, "currency_id": rec.get("currency_id", ""), "moneda": codigo_moneda(rec.get("currency_id", "")),
             "cuenta": (cuenta or {}).get("nombre", ""), "cuenta_id": rec.get("billing_account_id", ""),
             "url": f"{CRM_BASE}/index.php?module=Invoice&action=DetailView&record={iid}",
         })
@@ -114,11 +125,14 @@ def cuentas_abiertas(pagado_previo: dict | None = None, limite: int = 40) -> lis
 # 2. LEER COMPROBANTE (visión) + COTEJAR contra cuentas abiertas
 # ─────────────────────────────────────────────────────────────
 _INSTR_COMPROBANTE = (
-    "Esta imagen es un COMPROBANTE DE PAGO/TRANSFERENCIA. Devuelve SOLO un JSON "
+    "Esta imagen debería ser un COMPROBANTE DE PAGO/TRANSFERENCIA. Devuelve SOLO un JSON "
     "(sin ``` ni explicaciones) con el esquema exacto:\n"
-    '{"monto": number o null, "moneda": "MXN"|"USD"|"", "fecha": "YYYY-MM-DD" o "", '
+    '{"es_pago": true|false, "monto": number o null, "moneda": "MXN"|"USD"|"EUR"|"", "fecha": "YYYY-MM-DD" o "", '
     '"referencia": "folio/referencia/beneficiario tal cual aparece, o \\"\\"", '
     '"notas": "cualquier dato dudoso"}\n'
+    "es_pago = true SOLO si es evidencia de un pago ya hecho (transferencia, recibo de pago, ficha de depósito, "
+    "confirmación de pago). Es false si es un pedido/orden, carrito, cotización, proforma, factura por pagar, guía de envío o "
+    "cualquier documento que NO demuestre que se pagó algo; en ese caso explica en notas qué es. "
     "NO inventes cifras: si el monto no es legible con claridad, usa null."
 )
 
@@ -130,6 +144,7 @@ def leer_comprobante(imagenes: list[bytes], model_id: str = "") -> dict:
     datos.setdefault("monto", None)
     datos.setdefault("moneda", "")
     datos.setdefault("referencia", "")
+    datos.setdefault("es_pago", True)   # si el lector no lo dijo, se comporta como antes
     return datos
 
 
@@ -145,11 +160,20 @@ def buscar_candidata(comprobante: dict, cuentas: list[dict] | None = None,
     parcial, calculado contra su `amount_due` YA AJUSTADO por `cuentas_abiertas`."""
     todas = cuentas if cuentas is not None else cuentas_abiertas(pagado_previo)
     monto = sales_order._num(comprobante.get("monto"))
+    mon_comp = (comprobante.get("moneda") or "").upper()
+
+    def _misma_moneda(c: dict) -> bool:
+        # Sin moneda en el comprobante o en la cuenta no hay con qué comparar: no se bloquea.
+        return not mon_comp or not c.get("moneda") or c["moneda"] == mon_comp
+
+    todas = [{**c, "moneda_coincide": _misma_moneda(c)} for c in todas]
     if monto is None:
         return {"candidatas": todas, "multiples": len(todas) > 1, "por_monto": False}
-    cands = [c for c in todas if abs(c["amount_due"] - monto) <= max(1.0, 0.01 * c["amount_due"])]
+    # Coincidencia automática = monto Y moneda (1,335 EUR no es 1,335 MXN).
+    cands = [c for c in todas if c["moneda_coincide"] and abs(c["amount_due"] - monto) <= max(1.0, 0.01 * c["amount_due"])]
     finales = cands or todas
-    finales = [{**c, "completo": monto >= c["amount_due"] * 0.99} for c in finales]
+    finales = [{**c, "completo": monto >= c["amount_due"] * 0.99,
+                "excede": round(monto - c["amount_due"], 2) if monto > c["amount_due"] * 1.01 else 0} for c in finales]
     return {"candidatas": finales, "multiples": len(finales) > 1, "por_monto": bool(cands)}
 
 
@@ -171,6 +195,12 @@ def registrar_pago(tipo: str, registro_id: str, monto: float, datos_comprobante:
         return {"error": f"no encontré {modulo} {registro_id}"}
     cuenta_id = rec.get("supplier_id") if tipo == "bill" else rec.get("billing_account_id")
     extra = datos_comprobante or {}
+    # Defensa en el servidor (aunque el widget ya lo bloquea): el Payment se guarda en la moneda de la cuenta, así que un
+    # comprobante en otra moneda registraría un monto sin sentido.
+    mon_comp, mon_cta = (extra.get("moneda") or "").upper(), codigo_moneda(rec.get("currency_id", ""))
+    if mon_comp and mon_cta and mon_comp != mon_cta:
+        return {"error": f"el comprobante está en {mon_comp} y {modulo} {rec.get('name', registro_id)!s} está en {mon_cta}: "
+                         f"no registro el pago (el monto no es comparable)."}
     payload = {
         "amount": monto,
         "currency_id": rec.get("currency_id") or "",
