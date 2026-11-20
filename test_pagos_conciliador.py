@@ -4,6 +4,15 @@ import agente_chat as ac
 import pagos
 import sales_order as so
 
+# ── 0) Monedas que se manejan: MXN, USD y de vez en cuando EUR ───────────────────────────────────
+import compra_proveedor as _cp
+n = _cp.normalizar_moneda
+assert [n(x) for x in ("MXN", "mxn", "M.N.", "MN", "pesos", "Pesos", "MXP")] == ["MXN"] * 7, "pesos"
+assert [n(x) for x in ("USD", "us$", "US$", "dólares", "Dolares", "DLLS", "USD$")] == ["USD"] * 7
+assert [n(x) for x in ("EUR", "€", "euros", "Euro")] == ["EUR"] * 4
+assert n("$") == "" and n("") == "" and n(None) == "" and n("???") == "", "«$» solo NO decide la moneda"
+assert n("cad") == "CAD" and n("GBP") == "GBP", "otro código ISO se respeta"
+
 # ── 1) Cotejo: monto Y moneda ────────────────────────────────────────────────────────────────────
 CUENTAS = [
     {"id": "B1", "tipo": "bill", "nombre": "AP — ELEKTRAPOTHEKA", "amount_due": 1335.0, "moneda": "EUR", "cuenta": "ELEKTRAPOTHEKA"},
@@ -102,6 +111,12 @@ import compra_proveedor as cp
 cp._leer_con_vision = lambda imgs, instr, model_id="", max_tokens=500: {"monto": 5}
 pagos2 = __import__("importlib").reload(pagos)
 assert pagos2.leer_comprobante([b"x"])["es_pago"] is True
+cp._leer_con_vision = lambda imgs, instr, model_id="", max_tokens=500: {"monto": 5, "moneda": "M.N."}
+assert pagos2.leer_comprobante([b"x"])["moneda"] == "MXN", "la moneda leída se normaliza"
+cp._leer_con_vision = lambda imgs, instr, model_id="", max_tokens=500: {"monto": 5, "moneda": "$"}
+assert pagos2.leer_comprobante([b"x"])["moneda"] == "", "«$» solo no se adivina"
+# la captura de compra (carrito/cotización) también normaliza
+assert cp.captura_a_links({"moneda": "dólares", "tienda": "T", "items": [{"nombre": "X", "precio_unitario": 1}]})[0]["moneda"] == "USD"
 
 # ── 5) Respuestas de los botones en el stream «Pagos» ─────────────────────────────────────────────
 LL = []

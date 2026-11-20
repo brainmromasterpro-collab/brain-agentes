@@ -133,6 +133,9 @@ _INSTR_COMPROBANTE = (
     "es_pago = true SOLO si es evidencia de un pago ya hecho (transferencia, recibo de pago, ficha de depósito, "
     "confirmación de pago). Es false si es un pedido/orden, carrito, cotización, proforma, factura por pagar, guía de envío o "
     "cualquier documento que NO demuestre que se pagó algo; en ese caso explica en notas qué es. "
+    "MONEDA: solo se manejan MXN (pesos, M.N.), USD (dólares, US$) y, de vez en cuando, EUR (euros, €). El símbolo «$» solo NO "
+    "basta: si dice pesos/M.N./MXN o es un banco/recibo mexicano → MXN; si dice USD/US$/dólares o es una tienda de EE.UU. "
+    "(eBay, Amazon.com) → USD; € → EUR. Si de verdad no se puede saber, usa \\\"\\\" (no adivines). "
     "NO inventes cifras: si el monto no es legible con claridad, usa null."
 )
 
@@ -142,7 +145,7 @@ def leer_comprobante(imagenes: list[bytes], model_id: str = "") -> dict:
     Claude. Extrae SOLO lo que esté claramente legible — NO inventa cifras."""
     datos = compra_proveedor._leer_con_vision(imagenes, _INSTR_COMPROBANTE, model_id)
     datos.setdefault("monto", None)
-    datos.setdefault("moneda", "")
+    datos["moneda"] = compra_proveedor.normalizar_moneda(datos.get("moneda"))   # 'M.N.'/'pesos'/'US$'/'€' → MXN/USD/EUR
     datos.setdefault("referencia", "")
     datos.setdefault("es_pago", True)   # si el lector no lo dijo, se comporta como antes
     return datos

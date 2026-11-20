@@ -192,6 +192,25 @@ def proveedor_en_crm(nombre: str) -> str:
     return ""
 
 
+_ALIAS_MONEDA = {
+    "MXN": "MXN", "MN": "MXN", "M.N.": "MXN", "MXP": "MXN", "PESO": "MXN", "PESOS": "MXN", "MX$": "MXN", "$MXN": "MXN",
+    "USD": "USD", "US$": "USD", "USD$": "USD", "U$S": "USD", "DLLS": "USD", "DLS": "USD", "DOLAR": "USD", "DOLARES": "USD",
+    "DOLLAR": "USD", "DOLLARS": "USD", "EUR": "EUR", "€": "EUR", "EURO": "EUR", "EUROS": "EUR",
+}
+
+
+def normalizar_moneda(valor) -> str:
+    """Código de moneda a partir de lo que lea la visión: 'MXN', 'USD' o 'EUR' (las que se manejan; con alias como 'M.N.',
+    'pesos', 'US$', 'dólares', '€'). Un código ISO de 3 letras distinto se respeta; el símbolo «$» solo NO decide nada
+    (puede ser pesos o dólares) → ''."""
+    v = sales_order._norm(str(valor or "")).replace(" ", "")
+    if not v or v == "$":
+        return ""
+    if v in _ALIAS_MONEDA:
+        return _ALIAS_MONEDA[v]
+    return v if re.fullmatch(r"[A-Z]{3}", v) else ""
+
+
 _MONEDAS_NOMBRE = {"USD": "US Dollar", "MXN": "Mexican Peso", "EUR": "Euro", "CAD": "Canadian Dollar",
                    "GBP": "UK Pound", "CNY": "Chinese Yuan Renminbi", "JPY": "Japanese Yen"}
 _monedas_cache: dict = {}
@@ -282,7 +301,9 @@ _INSTR_CAPTURA = (
     '"tienda": "nombre de la tienda/vendedor/proveedor que EMITE el documento y a quien se le compra (eBay, '
     'Amazon, Mercado Libre, Grainger, un distribuidor, etc.) o \"\" — NUNCA el cliente/destinatario del documento", '
     '"terminos_pago": "condiciones de pago que indique el documento (ej. 100% in advance) o \"\"", '
-    '"orden_numero": "número de pedido si aparece o \"\"", "moneda": "USD"|"MXN"|"EUR"|"", '
+    '"orden_numero": "número de pedido si aparece o \"\"", "moneda": "USD"|"MXN"|"EUR"|"" '
+    '(solo esas tres; el símbolo $ solo no basta: pesos/M.N./proveedor mexicano → MXN, dólares/US$/tienda de EE.UU. → USD, '
+    '€ → EUR; si no se puede saber, \"\"), '
     '"total": number o null, "envio": number o null, '
     '"items": [{"nombre": "título del producto tal cual", "marca": "", "part_number": "modelo/SKU/MPN '
     'si aparece, o \"\"", "cantidad": number, "precio_unitario": number o null}]}\n'
@@ -327,7 +348,7 @@ def captura_a_links(datos: dict) -> list[dict]:
             "ok": True, "url": "", "nombre": nombre, "marca": it.get("marca") or "",
             "part_number": (it.get("part_number") or "").strip(),
             "precio_costo": sales_order._num(it.get("precio_unitario")) or 0,
-            "moneda": (datos.get("moneda") or "").upper(),
+            "moneda": normalizar_moneda(datos.get("moneda")),
             "descripcion": "", "cantidad": sales_order._num(it.get("cantidad")) or 1,
             "proveedor": (datos.get("tienda") or "").strip(),
             "terminos_documento": (datos.get("terminos_pago") or "").strip(),   # lo que dice el documento del proveedor
